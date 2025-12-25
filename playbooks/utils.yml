@@ -1,0 +1,40 @@
+#
+# Installs a curated collection of modern and common command-line utilities
+# to enhance shell productivity.
+#
+# This playbook installs the following packages:
+#   - fd-find: A simple, fast, and user-friendly alternative to 'find'.
+#   - fzf: A general-purpose command-line fuzzy finder.
+#   - jq: A lightweight and flexible command-line JSON processor.
+#   - hyperfine: A command-line benchmarking tool.
+#   - parallel: A shell tool for executing jobs in parallel.
+#   - pigz: A parallel implementation of gzip.
+#   - ripgrep: A line-oriented search tool that recursively searches the
+#     current directory for a regex pattern.
+#   - unzip: Utility for extracting ZIP archives.
+#   - vim: A highly configurable text editor.
+#   - yq: A portable command-line YAML processor.
+#
+
+- name: Install common CLI tools
+  hosts: all
+  become: true
+  become_exe: sudo.ws
+  vars:
+    util_packages:
+      - fd-find
+      - fzf
+      - jq
+      - hyperfine
+      - parallel
+      - pigz
+      - ripgrep
+      - unzip
+      - vim
+      - yq
+  tasks:
+    - name: Install common CLI tool packages
+      ansible.builtin.apt:
+        name: "{{ util_packages }}"
+        state: present
+        update_cache: true

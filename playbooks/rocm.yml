@@ -1,0 +1,91 @@
+#
+# Installs the AMDGPU kernel driver and the ROCm (Radeon Open Compute) stack
+# for AMD GPUs.
+#
+# This playbook performs the following actions:
+#   - Ensures 'video' and 'render' groups exist and adds the user to them.
+#   - Downloads and installs the 'amdgpu-install' utility.
+#   - Runs 'amdgpu-install' with the 'rocm' use case to set up the driver
+#     and ROCm components.
+#   - Installs additional ROCm and Python development packages.
+#
+# The AMDGPU installer version can be specified by setting the
+# 'amdgpu_install_version' variable.
+#
+
+- name: Install AMDGPU driver and ROCm stack
+  hosts: all
+  become: true
+  become_exe: sudo.ws
+  vars:
+    amdgpu_install_version: "7.1.1.70101-1"
+    amdgpu_deb_url: >-
+      https://repo.radeon.com/amdgpu-install/7.1.1/ubuntu/noble/amdgpu-install_{{ amdgpu_install_version }}_all.deb
+    amdgpu_deb_path: "/tmp/amdgpu-install.deb"
+  tasks:
+    - name: Ensure video and render groups exist
+      ansible.builtin.group:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - video
+        - render
+
+    - name: Add user to video and render groups
+      ansible.builtin.user:
+        name: "{{ ansible_user_id }}"
+        groups: video,render
+        append: true
+
+    - name: Enable ADD_EXTRA_GROUPS in adduser.conf
+      ansible.builtin.lineinfile:
+        path: /etc/adduser.conf
+        regexp: "^ADD_EXTRA_GROUPS="
+        line: "ADD_EXTRA_GROUPS=1"
+        state: present
+
+    - name: Set EXTRA_GROUPS to 'video' in adduser.conf
+      ansible.builtin.lineinfile:
+        path: /etc/adduser.conf
+        regexp: "^EXTRA_GROUPS="
+        line: 'EXTRA_GROUPS="video"'
+        state: present
+
+    - name: Check if amdgpu-install is installed
+      ansible.builtin.stat:
+        path: /usr/bin/amdgpu-install
+      register: amdgpu_install_stat
+
+    - name: Download and install amdgpu-install package
+      when: not amdgpu_install_stat.stat.exists
+      block:
+        - name: Download AMDGPU installer package
+          ansible.builtin.get_url:
+            url: "{{ amdgpu_deb_url }}"
+            dest: "{{ amdgpu_deb_path }}"
+            mode: "0644"
+
+        - name: Install AMDGPU installer package
+          ansible.builtin.apt:
+            deb: "{{ amdgpu_deb_path }}"
+            state: present
+
+        - name: Clean up AMDGPU installer package
+          ansible.builtin.file:
+            path: "{{ amdgpu_deb_path }}"
+            state: absent
+
+    - name: Run AMDGPU installer for ROCm
+      ansible.builtin.command:
+        cmd: "amdgpu-install -y --usecase=rocm"
+      register: amdgpu_install_result
+      changed_when: "'successfully' in amdgpu_install_result.stdout"
+
+    - name: Install ROCm and Python development packages
+      ansible.builtin.apt:
+        name:
+          - rocm
+          - python3-setuptools
+          - python3-wheel
+        state: present
+        update_cache: true

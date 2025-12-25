@@ -1,0 +1,13 @@
+*
+
+!playbooks
+!playbooks/*.yml
+!.gitignore
+!.pre-commit-config.yaml
+!GEMINI.md
+!justfile
+!README.md
+!justfile
+!README.md
+!LICENSE
+!requirements.yml

@@ -1,0 +1,4 @@
+---
+# This file is needed for ansible linting
+collections:
+  - name: ansible.posix

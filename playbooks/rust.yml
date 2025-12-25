@@ -1,0 +1,90 @@
+#
+# Installs the Rust programming language, toolchain, and common utilities
+# for system-wide use.
+#
+# This playbook performs the following actions:
+#   - Downloads and runs the rustup-init script to install 'rustup' and 'cargo'
+#     to /usr/local.
+#   - Sets the default Rust toolchain to 'stable'.
+#   - Adds Cargo's bin directory to the system-wide PATH.
+#   - Installs the 'rust-analyzer' language server component.
+#   - Installs a set of common and useful cargo packages:
+#     - cargo-edit
+#     - cargo-watch
+#     - cargo-update
+#     - bacon
+#
+
+- name: Install Rust and common tools system-wide
+  hosts: all
+  become: true
+  become_exe: sudo.ws
+  vars:
+    rustup_home: /usr/local/rustup
+    cargo_home: /usr/local/cargo
+    rust_packages:
+      - { name: "cargo-edit", binary: "cargo-add" }
+      - { name: "cargo-watch", binary: "cargo-watch" }
+      - { name: "cargo-update", binary: "cargo-install-update" }
+      - { name: "bacon", binary: "bacon" }
+
+  tasks:
+    - name: Check if Rust is installed
+      ansible.builtin.stat:
+        path: "{{ cargo_home }}/bin/rustc"
+      register: rustc_stat
+
+    - name: Install Rustup for system-wide use
+      when: not rustc_stat.stat.exists
+      block:
+        - name: Download rustup-init script
+          ansible.builtin.get_url:
+            url: https://sh.rustup.rs
+            dest: /tmp/rustup-init.sh
+            mode: "0755"
+          become: false
+
+        - name: Run rustup-init script
+          ansible.builtin.command:
+            cmd: "/tmp/rustup-init.sh -y --no-modify-path"
+            creates: "{{ cargo_home }}/bin/rustc"
+          environment:
+            RUSTUP_HOME: "{{ rustup_home }}"
+            CARGO_HOME: "{{ cargo_home }}"
+
+        - name: Clean up rustup-init script
+          ansible.builtin.file:
+            path: /tmp/rustup-init.sh
+            state: absent
+          become: false
+
+    - name: Set default Rust toolchain to stable
+      ansible.builtin.command:
+        cmd: "{{ cargo_home }}/bin/rustup default stable"
+      environment:
+        RUSTUP_HOME: "{{ rustup_home }}"
+        CARGO_HOME: "{{ cargo_home }}"
+      changed_when: false
+
+    - name: Add Cargo bin to system-wide PATH
+      ansible.builtin.copy:
+        dest: /etc/profile.d/rust.sh
+        content: "export PATH={{ cargo_home }}/bin:$PATH"
+        mode: "0644"
+
+    - name: Install rust-analyzer component
+      ansible.builtin.command:
+        cmd: "{{ cargo_home }}/bin/rustup component add rust-analyzer"
+      environment:
+        RUSTUP_HOME: "{{ rustup_home }}"
+        CARGO_HOME: "{{ cargo_home }}"
+      changed_when: false
+
+    - name: Install common Rust cargo packages
+      ansible.builtin.command:
+        cmd: "{{ cargo_home }}/bin/cargo install {{ item.name }}"
+        creates: "{{ cargo_home }}/bin/{{ item.binary }}"
+      environment:
+        RUSTUP_HOME: "{{ rustup_home }}"
+        CARGO_HOME: "{{ cargo_home }}"
+      loop: "{{ rust_packages }}"

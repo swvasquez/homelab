@@ -1,0 +1,12 @@
+# .pre-commit-config.yaml
+repos:
+  - repo: local
+    hooks:
+      # Lint everything before each commit
+      - id: ansible-lint
+        name: Run 'just lint'
+        entry: just lint
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

@@ -1,0 +1,84 @@
+#
+# Installs and configures the Go programming language and common tooling.
+#
+# This playbook dynamically finds the latest Go version from go.dev and
+# performs the following actions:
+#   - Compares the latest version with the installed version.
+#   - If a new version is available, it downloads and installs it system-wide
+#     to /usr/local/go.
+#   - Sets up the system-wide PATH to include Go's bin directory.
+#   - Installs common Go development tools ('gopls', 'dlv') into /usr/local/bin.
+#
+
+- name: Manage golang installation
+  hosts: all
+  become: true
+  become_exe: sudo.ws
+
+  vars:
+    go_arch: "amd64"
+
+  tasks:
+    - name: Get latest Go version string from go.dev
+      ansible.builtin.uri:
+        url: "https://go.dev/VERSION?m=text"
+        return_content: true
+      register: go_version_raw
+
+    - name: Set latest Go version
+      ansible.builtin.set_fact:
+        go_version: "{{ (go_version_raw.content.split('\n') | first) | regex_replace('^go', '') }}"
+
+    - name: Check installed Go version
+      ansible.builtin.command:
+        cmd: /usr/local/go/bin/go version
+      register: go_version_output
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Install Go
+      when: go_version is defined and go_version_output.stdout is not search("go" + go_version)
+      vars:
+        go_archive: "go{{ go_version }}.linux-{{ go_arch }}.tar.gz"
+        go_download_url: "https://go.dev/dl/{{ go_archive }}"
+        go_tmp_path: "/tmp/{{ go_archive }}"
+      block:
+        - name: Download Go binary
+          ansible.builtin.get_url:
+            url: "{{ go_download_url }}"
+            dest: "{{ go_tmp_path }}"
+            mode: "0644"
+
+        - name: Remove previous Go installation
+          ansible.builtin.file:
+            path: /usr/local/go
+            state: absent
+
+        - name: Unpack Go binary
+          ansible.builtin.unarchive:
+            src: "{{ go_tmp_path }}"
+            dest: /usr/local
+            remote_src: true
+
+        - name: Clean up downloaded Go tarball
+          ansible.builtin.file:
+            path: "{{ go_tmp_path }}"
+            state: absent
+
+    - name: Set Go path for all users
+      ansible.builtin.copy:
+        content: "export PATH=$PATH:/usr/local/go/bin"
+        dest: /etc/profile.d/go.sh
+        mode: "0755"
+
+    - name: Install common Go tools
+      ansible.builtin.command:
+        cmd: "go install {{ item }}"
+        creates: "/usr/local/bin/{{ item | split('/') | last | split('@') | first }}"
+      loop:
+        - golang.org/x/tools/gopls@latest
+        - github.com/go-delve/delve/cmd/dlv@latest
+      environment:
+        PATH: "/usr/local/go/bin:{{ ansible_env.PATH }}"
+        GOBIN: "/usr/local/bin"

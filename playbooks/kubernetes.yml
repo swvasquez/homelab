@@ -1,0 +1,102 @@
+#
+# Installs and configures Kubernetes components (kubelet, kubeadm, kubectl).
+#
+# This playbook performs the following actions:
+#   - Installs prerequisite packages (ca-certificates, curl, gnupg).
+#   - Adds the official Kubernetes GPG key and APT repository.
+#   - Installs kubelet, kubeadm, and kubectl.
+#   - Places a hold on the installed packages to prevent accidental upgrades.
+#   - Disables swap, a requirement for kubelet.
+#   - Starts and enables the kubelet service.
+#
+# The Kubernetes version can be specified by setting the 'kube_version'
+# variable. If not set, it defaults to "v1.28".
+#
+
+- name: Install and configure Kubernetes
+  hosts: all
+  become: true
+  become_exe: sudo.ws
+  vars:
+    kube_version: "v1.28"
+    keyring_path: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    kube_packages:
+      - kubelet
+      - kubeadm
+      - kubectl
+  tasks:
+    - name: Install prerequisite packages for Kubernetes repository
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+        state: present
+        update_cache: true
+
+    - name: Ensure /etc/apt/keyrings directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Stat Kubernetes GPG key
+      ansible.builtin.stat:
+        path: "{{ keyring_path }}"
+      register: k8s_keyring_stat
+
+    - name: Download and dearmor Kubernetes GPG key
+      when: not k8s_keyring_stat.stat.exists
+      block:
+        - name: Download Kubernetes GPG key
+          ansible.builtin.get_url:
+            url: "https://pkgs.k8s.io/core:/stable:/{{ kube_version }}/deb/Release.key"
+            dest: "/tmp/k8s-release.key"
+            mode: "0644"
+
+        - name: Dearmor Kubernetes GPG key
+          ansible.builtin.command:
+            cmd: gpg --dearmor -o {{ keyring_path }} /tmp/k8s-release.key
+          args:
+            creates: "{{ keyring_path }}"
+
+        - name: Clean up temporary GPG key file
+          ansible.builtin.file:
+            path: /tmp/k8s-release.key
+            state: absent
+
+    - name: Add Kubernetes APT repository
+      ansible.builtin.apt_repository:
+        repo: >
+          deb [signed-by={{ keyring_path }}]
+          https://pkgs.k8s.io/core:/stable:/{{ kube_version }}/deb/ /
+        state: present
+        filename: kubernetes
+        update_cache: true
+
+    - name: Install Kubernetes components
+      ansible.builtin.apt:
+        name: "{{ kube_packages }}"
+        state: present
+
+    - name: Hold Kubernetes packages from accidental upgrades
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop: "{{ kube_packages }}"
+
+    - name: Disable swap if active
+      ansible.builtin.command: swapon --noheadings --raw
+      register: swap_status
+      changed_when: false
+
+    - name: Turn off swap
+      ansible.builtin.command: swapoff -a
+      when: swap_status.stdout != ""
+      changed_when: true
+
+    - name: Start and enable kubelet service
+      ansible.builtin.service:
+        name: kubelet
+        state: started
+        enabled: true

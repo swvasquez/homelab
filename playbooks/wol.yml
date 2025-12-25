@@ -1,0 +1,51 @@
+#
+# Configures Wake-on-LAN (WoL) for a specified network interface using Netplan.
+#
+# This playbook performs the following actions:
+#   - Installs 'ethtool' and 'wakeonlan' utilities.
+#   - Creates a Netplan configuration file (/etc/netplan/50-wol.yaml) to
+#     enable WoL on the specified interface.
+#   - Notifies a handler to apply the Netplan configuration.
+#
+# This playbook requires the following variables to be defined:
+#   - network_interface: The name of the network interface to configure (e.g., eno1).
+#   - mac_address: The MAC address of the interface.
+#
+
+- name: Configure Wake-on-LAN (WoL)
+  hosts: all
+  become: true
+  become_exe: sudo.ws
+  vars:
+    network_interface: "eno1"
+    mac_address: "00:11:22:33:44:55"
+  tasks:
+    - name: Install WoL and networking utilities
+      ansible.builtin.apt:
+        name:
+          - ethtool
+          - wakeonlan
+        state: present
+        update_cache: true
+
+    - name: Deploy Netplan configuration for WoL
+      ansible.builtin.copy:
+        dest: /etc/netplan/50-wol.yaml
+        mode: "0644"
+        content: |
+          network:
+            version: 2
+            renderer: networkd
+            ethernets:
+              {{ network_interface }}:
+                match:
+                  macaddress: "{{ mac_address }}"
+                wakeonlan: true
+                dhcp4: true
+      notify: Apply Netplan configuration
+
+  handlers:
+    - name: Apply Netplan configuration
+      ansible.builtin.command:
+        cmd: netplan apply
+      changed_when: false

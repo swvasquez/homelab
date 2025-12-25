@@ -1,0 +1,64 @@
+#
+# Installs and configures the Tailscale mesh VPN client.
+#
+# This playbook performs the following actions:
+#   - Enables IP forwarding to allow the host to act as a subnet router or
+#     exit node.
+#   - Adds the official Tailscale GPG key and APT repository.
+#   - Installs the Tailscale package.
+#   - Attempts to connect the machine to the Tailscale network using 'tailscale up'.
+#
+# Note: The 'tailscale up' command may require interactive browser-based
+# authentication. For a non-interactive setup, an auth key must be provided
+# as a command-line argument.
+#
+
+- name: Install and configure Tailscale
+  hosts: all
+  become: true
+  become_exe: sudo.ws
+  tasks:
+    - name: Enable IP forwarding for subnet routing or exit node
+      ansible.posix.sysctl:
+        name: "{{ item }}"
+        value: "1"
+        state: present
+        sysctl_set: true
+        reload: true
+      loop:
+        - net.ipv4.ip_forward
+        - net.ipv6.conf.all.forwarding
+
+    - name: Check for Tailscale's official GPG key
+      ansible.builtin.stat:
+        path: /usr/share/keyrings/tailscale-archive-keyring.gpg
+      register: tailscale_keyring_stat
+
+    - name: Add Tailscale's official GPG key
+      ansible.builtin.get_url:
+        url: "https://pkgs.tailscale.com/stable/ubuntu/{{ ansible_distribution_release }}.noarmor.gpg"
+        dest: /usr/share/keyrings/tailscale-archive-keyring.gpg
+        mode: "0644"
+      when: not tailscale_keyring_stat.stat.exists
+
+    - name: Add Tailscale APT repository
+      ansible.builtin.apt_repository:
+        repo: >
+          deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg]
+          https://pkgs.tailscale.com/stable/ubuntu
+          {{ ansible_distribution_release }} main
+        state: present
+        filename: tailscale
+        update_cache: true
+
+    - name: Install Tailscale package
+      ansible.builtin.apt:
+        name: tailscale
+        state: present
+
+    - name: Connect to Tailscale network
+      ansible.builtin.command:
+        cmd: tailscale up
+      changed_when: false
+      # This may require interactive authentication.
+      # For non-interactive setup, pass '--authkey' and other flags.

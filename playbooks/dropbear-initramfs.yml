@@ -1,0 +1,70 @@
+#
+# Configures remote unlocking of LUKS-encrypted drives using Dropbear SSH
+# within the initramfs environment.
+#
+# This setup involves two parts:
+#   1. On localhost: Generates a dedicated Dropbear SSH keypair.
+#   2. On target hosts:
+#      - Installs the 'dropbear-initramfs' package.
+#      - Authorizes the generated public key for initramfs login.
+#      - Configures Dropbear server options (port, command).
+#      - Sets a static IP address for the initramfs environment.
+#      - Rebuilds the initramfs to apply all changes.
+#
+# Requires the following variables to be defined for the target hosts:
+#   - private_ip: The static IP address for the initramfs environment.
+#   - router_private_ip: The gateway IP address for the initramfs environment.
+#
+
+- name: Generate Dropbear SSH key on localhost
+  hosts: localhost
+  connection: local
+  tasks:
+    - name: Generate Dropbear ED25519 keypair locally
+      ansible.builtin.command: "ssh-keygen -t ed25519 -f ~/.ssh/dropbear -N ''"
+      args:
+        creates: ~/.ssh/dropbear
+
+- name: Install and configure Dropbear for initramfs
+  hosts: all
+  become: true
+  become_exe: sudo.ws
+  vars:
+    private_ip: "192.168.1.100"
+    router_private_ip: "192.168.1.1"
+    dropbear_port: "1234"
+    network_interface: "eth0"
+  tasks:
+    - name: Install dropbear-initramfs package
+      ansible.builtin.apt:
+        name: dropbear-initramfs
+        state: present
+        update_cache: true
+
+    - name: Authorize Dropbear public key for initramfs
+      ansible.builtin.lineinfile:
+        path: /etc/dropbear/initramfs/authorized_keys
+        line: "{{ lookup('file', '~/.ssh/dropbear.pub') }}"
+        create: true
+        mode: "0644"
+
+    - name: Configure Dropbear server options for initramfs
+      ansible.builtin.lineinfile:
+        path: /etc/dropbear/initramfs/dropbear.conf
+        line: 'DROPBEAR_OPTIONS="-I 180 -j -k -p {{ dropbear_port }} -s -c cryptroot-unlock"'
+        state: present
+        create: true
+        mode: "0644"
+
+    - name: Configure static IP for initramfs
+      ansible.builtin.lineinfile:
+        path: /etc/initramfs-tools/initramfs.conf
+        line: "IP={{ private_ip }}::{{ router_private_ip }}:255.255.255.0:{{ ansible_host }}:{{ network_interface }}"
+        state: present
+        create: true
+        mode: "0644"
+
+    - name: Rebuild initramfs to apply changes
+      ansible.builtin.command: update-initramfs -u -k all
+      register: update_initramfs_result
+      changed_when: update_initramfs_result.stdout != ""

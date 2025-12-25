@@ -1,0 +1,33 @@
+#
+# Installs a collection of command-line utilities for system and network
+# monitoring.
+#
+# This playbook installs the following packages:
+#   - bmon: Bandwidth monitor and rate estimator.
+#   - btop: Modern resource monitor.
+#   - lm-sensors: Tools for monitoring hardware sensors.
+#   - iftop: Displays bandwidth usage on an interface.
+#   - net-tools: Classic networking utilities (e.g., ifconfig, netstat).
+#   - nmap: Network scanner and security auditor.
+#   - iproute2: Modern Linux networking utilities (e.g., ip, ss).
+#
+
+- name: Install monitoring utilities
+  hosts: all
+  become: true
+  become_exe: sudo.ws
+  vars:
+    monitoring_packages:
+      - bmon
+      - btop
+      - lm-sensors
+      - iftop
+      - net-tools
+      - nmap
+      - iproute2
+  tasks:
+    - name: Install monitoring utility packages
+      ansible.builtin.apt:
+        name: "{{ monitoring_packages }}"
+        state: present
+        update_cache: true
