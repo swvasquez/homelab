@@ -1,0 +1,27 @@
+#
+# Installs the Node.js JavaScript runtime and the npm package manager.
+#
+# This playbook performs the following actions:
+#   - Installs Node.js and npm from the system's default package manager.
+#   - Ensures that the installed tools are available system-wide.
+#
+# Note: This installs the version of Node.js available in the OS repositories.
+# For a specific or newer version, a repository configuration (like NodeSource)
+# would be required, but this playbook adheres to the standard package manager constraint.
+#
+
+- name: Install Node.js and npm
+  hosts: homelab
+  become: true
+  become_exe: sudo.ws
+  vars:
+    nodejs_packages:
+      - nodejs
+      - npm
+
+  tasks:
+    - name: Install Node.js and npm packages
+      ansible.builtin.apt:
+        name: "{{ nodejs_packages }}"
+        state: present
+        update_cache: true
