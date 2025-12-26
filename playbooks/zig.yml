@@ -1,0 +1,71 @@
+#
+# Installs and configures the Zig programming language.
+#
+# This playbook performs the following actions:
+#   - Downloads and installs a specific development version of Zig from ziglang.org.
+#   - Installs Zig to /usr/local/zig.
+#   - Sets up the system-wide PATH to include Zig's bin directory.
+#
+
+- name: Manage Zig installation
+  hosts: homelab
+  become: true
+  become_exe: sudo.ws
+
+  vars:
+    zig_arch: "x86_64"
+    zig_os: "linux"
+    zig_archive: "zig-x86_64-linux-0.16.0-dev.1657+985a3565c.tar.xz"
+    zig_download_url: "https://ziglang.org/builds/{{ zig_archive }}"
+    # Extract version from archive name for idempotency checks
+    # Archive format: zig-<arch>-<os>-<version>.tar.xz
+    # We want <version>.
+    # split('-') -> ['zig', 'x86_64', 'linux', '0.16.0', 'dev.1657+985a3565c.tar.xz']?
+    # This is brittle. Let's just set the expected version manually or derive it simpler.
+    # Given the constraint to keep it simple and the specific variable request:
+    zig_version: "0.16.0-dev.1657+985a3565c"
+
+  tasks:
+    - name: Check installed Zig version
+      ansible.builtin.command:
+        cmd: /usr/local/zig/zig version
+      register: zig_installed_version
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Install Zig
+      when: zig_installed_version.rc != 0 or zig_installed_version.stdout != zig_version
+      vars:
+        zig_tmp_path: "/tmp/{{ zig_archive }}"
+      block:
+        - name: Download Zig archive
+          ansible.builtin.get_url:
+            url: "{{ zig_download_url }}"
+            dest: "{{ zig_tmp_path }}"
+            mode: "0644"
+
+        - name: Remove previous Zig installation
+          ansible.builtin.file:
+            path: /usr/local/zig
+            state: absent
+
+        - name: Unpack Zig archive
+          ansible.builtin.unarchive:
+            src: "{{ zig_tmp_path }}"
+            dest: /usr/local
+            remote_src: true
+            extra_opts:
+              - "--transform"
+              - "s/^{{ zig_archive | regex_replace('\\.tar\\.xz$', '') }}/zig/"
+
+        - name: Clean up Zig archive
+          ansible.builtin.file:
+            path: "{{ zig_tmp_path }}"
+            state: absent
+
+    - name: Set Zig path for all users
+      ansible.builtin.copy:
+        content: "export PATH=$PATH:/usr/local/zig"
+        dest: /etc/profile.d/zig.sh
+        mode: "0755"
