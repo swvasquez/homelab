@@ -6,10 +6,11 @@ When reviewing and updating requested playbooks in the `playbook` folder
 - Format consistently, including newlines between components
 - Use `become_exe: sudo.ws` when `become: true`
 - Add tasks, when missing, to clean up any temporary files created when downloading files from the internet
-- Ensure installed tools are usable by all users
+- Ensure installed tools, when possible, are usable by all users
 - All vars should be explicitly listed in the playbook with dummy values provided
 - Use double quotation marks when possible
-- Target line widths to be 100 characters or less (when possible)
+- Target line widths to be 100 characters or less when possible
+- Install packages via package manager when possible
 - Run `just lint` and resolve any linting issues that arise at the end
 
 When reviewing and updating `README.md`
