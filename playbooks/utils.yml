@@ -17,7 +17,7 @@
 #
 
 - name: Install common CLI tools
-  hosts: all
+  hosts: homelab
   become: true
   become_exe: sudo.ws
   vars:

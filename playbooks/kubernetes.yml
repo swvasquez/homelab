@@ -13,8 +13,8 @@
 # variable. If not set, it defaults to "v1.28".
 #
 
-- name: Install and configure Kubernetes
-  hosts: all
+- name: Install and configure MicroK8s
+  hosts: homelab
   become: true
   become_exe: sudo.ws
   vars:

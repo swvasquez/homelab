@@ -14,7 +14,7 @@
 #
 
 - name: Install and configure Tailscale
-  hosts: all
+  hosts: homelab
   become: true
   become_exe: sudo.ws
   tasks:

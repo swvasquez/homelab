@@ -11,7 +11,7 @@
 #
 
 - name: Manage golang installation
-  hosts: all
+  hosts: homelab
   become: true
   become_exe: sudo.ws
 

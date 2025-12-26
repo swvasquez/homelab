@@ -13,8 +13,8 @@
 # 'amdgpu_install_version' variable.
 #
 
-- name: Install AMDGPU driver and ROCm stack
-  hosts: all
+- name: Install ROCm (Radeon Open Compute)
+  hosts: homelab
   become: true
   become_exe: sudo.ws
   vars:

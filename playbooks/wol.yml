@@ -13,7 +13,7 @@
 #
 
 - name: Configure Wake-on-LAN (WoL)
-  hosts: all
+  hosts: homelab
   become: true
   become_exe: sudo.ws
   vars:

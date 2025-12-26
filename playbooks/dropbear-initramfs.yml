@@ -26,13 +26,11 @@
         creates: ~/.ssh/dropbear
 
 - name: Install and configure Dropbear for initramfs
-  hosts: all
+  hosts: homelab
   become: true
   become_exe: sudo.ws
   vars:
     private_ip: "192.168.1.100"
-    router_private_ip: "192.168.1.1"
-    dropbear_port: "1234"
     network_interface: "eth0"
   tasks:
     - name: Install dropbear-initramfs package
