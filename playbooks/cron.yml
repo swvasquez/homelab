@@ -1,0 +1,29 @@
+#
+# Configures system-wide cron jobs.
+#
+# This playbook creates and manages various cron jobs for system maintenance
+# and automation.
+#
+# Current tasks:
+#   - Scheduled System Shutdown: Shuts down the system at a configured time
+#     (default: 4:00 AM daily) using '/usr/sbin/shutdown -h now'.
+#
+# Variables:
+#   - shutdown_schedule: Cron schedule string for system shutdown.
+#     Must be in standard 5-field notation (e.g., "0 4 * * *").
+#
+
+- name: Configure system cron jobs
+  hosts: homelab
+  become: true
+  become_exe: sudo.ws
+  tasks:
+    - name: Create scheduled shutdown cron job
+      ansible.builtin.cron:
+        name: "Scheduled System Shutdown"
+        minute: "{{ shutdown_schedule.split(' ')[0] }}"
+        hour: "{{ shutdown_schedule.split(' ')[1] }}"
+        day: "{{ shutdown_schedule.split(' ')[2] }}"
+        month: "{{ shutdown_schedule.split(' ')[3] }}"
+        weekday: "{{ shutdown_schedule.split(' ')[4] }}"
+        job: "/usr/sbin/shutdown -h now"

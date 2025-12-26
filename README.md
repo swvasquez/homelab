@@ -27,6 +27,7 @@ Ansible Playbooks to configure Ubuntu machines.
     ```yaml
     dropbear_port: <DROPBEAR_PORT>
     router_private_ip: <ROUTER_IP>
+    shutdown_schedule: <SHUTDOWN_SCHEDULE>
     ```
 
 ## Usage
@@ -36,7 +37,7 @@ Ansible Playbooks to configure Ubuntu machines.
 To run a specific playbook on a subset of machines:
 
 ```sh
-just install <playbook> <subset>
+just install <PLAYBOOK> <SUBSET>
 ```
 
 **Example:**
@@ -50,7 +51,7 @@ just install docker homelab
 To ping a subset of machines:
 
 ```sh
-just ping <subset>
+just ping <SUBSET>
 ```
 
 ### Linting
