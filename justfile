@@ -15,7 +15,7 @@ lint:
 ping subset="homelab":
     #!/usr/bin/env sh
     set -euxo pipefail
-    uv run ansible {{ subset }} -m ping -i inventory.ini
+    uv run ansible {{ subset }} -m ping -i inventory.yml
 
 # Run a specific Ansible playbook on a subset of machines
 install playbook subset="homelab":
@@ -24,5 +24,5 @@ install playbook subset="homelab":
     uv run ansible-playbook \
         --ask-become-pass \
         --limit {{ subset }} \
-        -i inventory.ini \
+        -i inventory.yml \
         "playbooks/{{ playbook }}.yml"

@@ -1,6 +1,6 @@
 # Homelab
 
-Ansible Playbooks to configure Ubuntu machines.
+Ansible Playbooks to configure Ubuntu x86_64 machines.
 
 ## Prerequisites
 
@@ -15,11 +15,18 @@ Ansible Playbooks to configure Ubuntu machines.
     just venv
     ```
 
-2.  Create an `inventory.ini` file with the following structure:
+2.  Create an `inventory.yaml` file with the following structure:
 
-    ```ini
-    [homelab]
-    <HOSTNAME> ansible_user=<USER> private_ip=<IP> network_interface=<INTERFACE> mac_address=<MAC>
+    ```yaml
+    all:
+      children:
+        homelab:
+          hosts:
+            <HOSTNAME>:
+              ansible_user: <USER>
+              private_ip: <IP>
+              network_interface: <INTERFACE>
+              mac_address: <MAC>
     ```
 
 3.  Create a `group_vars/homelab.yml` file for group-level variables:
