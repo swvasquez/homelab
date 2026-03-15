@@ -4,7 +4,7 @@
 !playbooks/*.yml
 !.gitignore
 !.pre-commit-config.yaml
-!GEMINI.md
+!AGENTS.md
 !justfile
 !README.md
 !justfile
