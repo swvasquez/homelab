@@ -27,6 +27,7 @@ Ansible Playbooks to configure Ubuntu x86_64 machines.
               private_ip: <IP>
               network_interface: <INTERFACE>
               mac_address: <MAC>
+              nfs_server: <IS_NFS_SERVER>
     ```
 
 3.  Create a `group_vars/homelab.yml` file for group-level variables:

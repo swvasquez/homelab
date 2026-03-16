@@ -1,0 +1,245 @@
+#
+# Installs and configures an NFS server and client mount.
+#
+# This playbook performs the following actions:
+#
+#   Group play (all hosts):
+#     - Creates the nfs_users group with a consistent GID across all nodes.
+#     - Adds the ansible user to the nfs_users group.
+#
+#   Server play (host where nfs_server: true in inventory):
+#     - Installs nfs-kernel-server.
+#     - Mounts the LVM Logical Volume to the NFS export directory.
+#     - Optionally creates and formats a new Logical Volume if nfs_create_lvm is true.
+#     - Creates the export directory owned by root:nfs_users with mode 2775 (SGID).
+#       The SGID bit ensures new files and subdirectories inherit the group of the parent
+#       directory rather than the creating user's primary group, and subdirectories also
+#       inherit the SGID bit — keeping group ownership consistent throughout the tree.
+#     - Explicitly enables NFSv3 and NFSv4 in /etc/nfs.conf.
+#       Both versions are served simultaneously. Linux clients default to NFSv4;
+#       macOS clients should mount with nfsvers=3 for better compatibility.
+#     - Adds the export to /etc/exports.
+#     - Starts and enables the NFS server service.
+#
+#   Client play (all hosts, including the NFS server node):
+#     - Installs nfs-common.
+#     - Creates the mount point directory.
+#     - Mounts the NFS share and adds it to /etc/fstab for persistence.
+#     - The server address is resolved dynamically from hostvars.
+#
+# Inventory variables:
+#   nfs_server:       Boolean, set to true on the node that should run the NFS server.
+#
+# Playbook variables:
+#   nfs_group:        Group name for NFS access (default: "nfs_users").
+#   nfs_group_gid:    GID for the NFS group, must be consistent across nodes (default: 3000).
+#   nfs_export_path:  Directory to export from the server (e.g. /srv/nfs/data).
+#   nfs_export_opts:  Export options (default: "*(rw,sync,no_subtree_check)").
+#   nfs_mount_point:  Local directory to mount the NFS share on clients (e.g. /mnt/nfs).
+#   nfs_mount_opts:   Mount options for clients (default: "defaults").
+#   nfs_lvm_vg_name:  The name of the LVM Volume Group to use (required).
+#   nfs_lvm_lv_name:  The name of the LVM Logical Volume to mount for the export (required).
+#   nfs_create_lvm:   Boolean, whether to create and format a new LV (default: false).
+#                     Set to false when the LV already exists and only needs to be mounted.
+#   nfs_lvm_lv_size:  Size of the new Logical Volume, required when nfs_create_lvm is true (e.g., "50g").
+#
+
+# ------------------------------------------------------------------------------
+# GROUP PLAY: NFS Users Group Configuration
+# ------------------------------------------------------------------------------
+- name: Create NFS user group on all nodes
+  hosts: homelab
+  become: true
+  become_exe: sudo.ws
+  vars:
+    nfs_group: "nfs_users"
+    nfs_group_gid: 3000
+  tasks:
+    - name: Create NFS group with consistent GID
+      ansible.builtin.group:
+        name: "{{ nfs_group }}"
+        gid: "{{ nfs_group_gid }}"
+        state: present
+
+    - name: Add ansible user to NFS group
+      ansible.builtin.user:
+        name: "{{ ansible_user }}"
+        groups: "{{ nfs_group }}"
+        append: true
+
+# ------------------------------------------------------------------------------
+# SERVER PLAY: NFS Server Configuration
+# ------------------------------------------------------------------------------
+- name: Configure NFS server
+  hosts: homelab
+  become: true
+  become_exe: sudo.ws
+  vars:
+    nfs_group: "nfs_users"
+    nfs_export_path: "/srv/nfs/data"
+    nfs_export_opts: "*(rw,sync,no_subtree_check)"
+    nfs_lvm_vg_name: "ubuntu-vg"
+    nfs_lvm_lv_name: "nfs_lv"
+    nfs_create_lvm: false
+    nfs_lvm_lv_size: "50g"
+  tasks:
+    - name: Install nfs-kernel-server
+      ansible.builtin.apt:
+        name: "nfs-kernel-server"
+        state: present
+        update_cache: true
+      when: nfs_server | default(false)
+
+    - name: Ensure LVM packages are installed
+      ansible.builtin.apt:
+        name: "lvm2"
+        state: present
+        update_cache: true
+      when:
+        - nfs_server | default(false)
+        - nfs_create_lvm | default(false)
+
+    - name: Check if Logical Volume already exists
+      ansible.builtin.command: "lvs /dev/{{ nfs_lvm_vg_name }}/{{ nfs_lvm_lv_name }}"
+      register: lv_check
+      failed_when: false
+      changed_when: false
+      when:
+        - nfs_server | default(false)
+        - nfs_create_lvm | default(false)
+
+    - name: Assert enough unallocated space in Volume Group
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail &&
+          vgs "{{ nfs_lvm_vg_name }}" -o vg_free --units g --noheadings --nosuffix |
+          awk -v need="{{ nfs_lvm_lv_size | regex_replace('[^0-9.]', '') }}"
+              '{ if ($1 < need) { print "Need "need"g, only "$1"g free in VG {{ nfs_lvm_vg_name }}"; exit 1 } }'
+        executable: "/bin/bash"
+      changed_when: false
+      when:
+        - nfs_server | default(false)
+        - nfs_create_lvm | default(false)
+        - lv_check.rc != 0
+
+    - name: Create Logical Volume for NFS
+      community.general.lvol:
+        vg: "{{ nfs_lvm_vg_name }}"
+        lv: "{{ nfs_lvm_lv_name }}"
+        size: "{{ nfs_lvm_lv_size }}"
+        state: present
+      when:
+        - nfs_server | default(false)
+        - nfs_create_lvm | default(false)
+
+    - name: Format the Logical Volume with ext4
+      community.general.filesystem:
+        fstype: "ext4"
+        dev: "/dev/{{ nfs_lvm_vg_name }}/{{ nfs_lvm_lv_name }}"
+      when:
+        - nfs_server | default(false)
+        - nfs_create_lvm | default(false)
+
+    - name: Mount the Logical Volume to the NFS export directory
+      ansible.posix.mount:
+        path: "{{ nfs_export_path }}"
+        src: "/dev/{{ nfs_lvm_vg_name }}/{{ nfs_lvm_lv_name }}"
+        fstype: "ext4"
+        opts: "defaults"
+        state: mounted
+      when: nfs_server | default(false)
+
+    - name: Create NFS export directory
+      ansible.builtin.file:
+        path: "{{ nfs_export_path }}"
+        state: directory
+        owner: "root"
+        group: "{{ nfs_group }}"
+        mode: "2775"
+      when: nfs_server | default(false)
+
+    - name: Enable NFSv3 in /etc/nfs.conf
+      community.general.ini_file:
+        path: "/etc/nfs.conf"
+        section: "nfsd"
+        option: "vers3"
+        value: "y"
+        mode: "0644"
+        state: present
+      when: nfs_server | default(false)
+      notify: Restart NFS server
+
+    - name: Enable NFSv4 in /etc/nfs.conf
+      community.general.ini_file:
+        path: "/etc/nfs.conf"
+        section: "nfsd"
+        option: "vers4"
+        value: "y"
+        mode: "0644"
+        state: present
+      when: nfs_server | default(false)
+      notify: Restart NFS server
+
+    - name: Add export to /etc/exports
+      ansible.builtin.lineinfile:
+        path: "/etc/exports"
+        line: "{{ nfs_export_path }} {{ nfs_export_opts }}"
+        state: present
+      when: nfs_server | default(false)
+      notify: Re-export NFS shares
+
+    - name: Start and enable NFS server
+      ansible.builtin.systemd:
+        name: "nfs-kernel-server"
+        state: started
+        enabled: true
+      when: nfs_server | default(false)
+
+  handlers:
+    - name: Restart NFS server
+      ansible.builtin.systemd:
+        name: "nfs-kernel-server"
+        state: restarted
+
+    - name: Re-export NFS shares
+      ansible.builtin.command: "exportfs -ra"
+      changed_when: true
+
+# ------------------------------------------------------------------------------
+# CLIENT PLAY: NFS Client Mount Configuration
+# ------------------------------------------------------------------------------
+- name: Configure NFS client mount
+  hosts: homelab
+  become: true
+  become_exe: sudo.ws
+  vars:
+    nfs_export_path: "/srv/nfs/data"
+    nfs_mount_point: "/mnt/nfs"
+    nfs_mount_opts: "defaults"
+    _nfs_server_host: >-
+      {{ hostvars | dict2items
+         | selectattr('value.nfs_server', 'defined')
+         | selectattr('value.nfs_server', 'equalto', true)
+         | map(attribute='value.private_ip')
+         | first }}
+  tasks:
+    - name: Install nfs-common
+      ansible.builtin.apt:
+        name: "nfs-common"
+        state: present
+        update_cache: true
+
+    - name: Create NFS mount point  # noqa: risky-file-permissions
+      ansible.builtin.file:
+        path: "{{ nfs_mount_point }}"
+        state: directory
+        # mode is intentionally omitted: chmod on a live mount point returns
+        # EPERM, and mount point permissions are superseded by the server anyway.
+
+    - name: Mount NFS share and add to fstab
+      ansible.posix.mount:
+        path: "{{ nfs_mount_point }}"
+        src: "{{ _nfs_server_host }}:{{ nfs_export_path }}"
+        fstype: "nfs"
+        opts: "{{ nfs_mount_opts }}"
+        state: mounted
