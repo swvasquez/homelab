@@ -1,0 +1,17 @@
+{#
+# Managed by Ansible - do not edit manually.
+#
+# SLURM cgroup plugin configuration, rendered by slurm.yml.
+# Controls how slurmd uses Linux cgroups to enforce resource limits per job.
+#
+# Variables consumed by this template:
+#   slurm_cgroup_constrain_cores:    Restrict jobs to their allocated CPU cores.
+#   slurm_cgroup_constrain_ram:      Enforce memory limits; jobs exceeding their
+#                                    allocation are killed by the OOM killer.
+#   slurm_cgroup_constrain_devices:  Restrict device access (e.g. GPUs) to allocated
+#                                    devices only. Required for GPU isolation.
+#}
+CgroupPlugin=autodetect
+ConstrainCores={{ slurm_cgroup_constrain_cores | ternary("yes", "no") }}
+ConstrainRAMSpace={{ slurm_cgroup_constrain_ram | ternary("yes", "no") }}
+ConstrainDevices={{ slurm_cgroup_constrain_devices | ternary("yes", "no") }}

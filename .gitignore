@@ -2,6 +2,8 @@
 
 !playbooks
 !playbooks/*.yml
+!playbooks/templates
+!playbooks/templates/*.j2
 !.gitignore
 !.pre-commit-config.yaml
 !AGENTS.md

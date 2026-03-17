@@ -1,0 +1,12 @@
+{#
+# Managed by Ansible - do not edit manually.
+#
+# SLURM job_container/tmpfs plugin configuration, rendered by slurm.yml.
+# Creates a private bind-mount over the scratch directory for each job step,
+# giving each job an isolated /scratch that is automatically cleaned up on exit.
+#
+# Variables consumed by this template:
+#   slurm_scratch_dir: Base path for per-job scratch bind-mounts.
+#}
+AutoBasePath=yes
+BasePath={{ slurm_scratch_dir }}
