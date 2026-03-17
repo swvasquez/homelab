@@ -38,20 +38,32 @@ Ansible Playbooks to configure Ubuntu x86_64 machines.
     shutdown_schedule: <SHUTDOWN_SCHEDULE>
     ```
 
+## Directory Structure
+
+Playbooks are organized logically into categories, and each category maintains its own `templates/` folder (if applicable) to keep playbooks and their dependencies tightly coupled:
+
+- `infrastructure/`: OS-level configurations and bare-metal setup.
+- `cluster/`: Kubernetes cluster bootstrapping and core components.
+- `development/`: Language toolchains and development environments.
+
 ## Usage
 
 ### Run a Playbook
 
-To run a specific playbook on a subset of machines:
+To run a specific playbook on a subset of machines, specify the category and the playbook name:
 
 ```sh
-just install <PLAYBOOK> <SUBSET>
+just install <CATEGORY> <PLAYBOOK> [SUBSET]
 ```
 
 **Example:**
 
 ```sh
-just install docker homelab
+just install infrastructure docker
+```
+or 
+```sh
+just install cluster kubernetes homelab
 ```
 
 ### Verify Connectivity

@@ -1,14 +1,13 @@
 *
 
 !playbooks
-!playbooks/*.yml
-!playbooks/templates
-!playbooks/templates/*.j2
+!playbooks/*
+!playbooks/*/*.yml
+!playbooks/*/templates
+!playbooks/*/templates/*.j2
 !.gitignore
 !.pre-commit-config.yaml
 !AGENTS.md
-!justfile
-!README.md
 !justfile
 !README.md
 !LICENSE
