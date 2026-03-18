@@ -15,8 +15,9 @@
 #   - Optionally removes the NoSchedule taint from the control plane node to
 #     allow it to also schedule workloads (when `worker_node: true` is set on
 #     the control plane host in inventory).
+#   - Installs the Kubernetes Gateway API CRDs required by Cilium.
 #   - Removes kube-proxy and installs Cilium as the CNI plugin via Helm, with
-#     Cilium's eBPF kube-proxy replacement enabled.
+#     Cilium's eBPF kube-proxy replacement and Gateway API support enabled.
 #   - Installs the Cilium CLI on all nodes for inspecting and troubleshooting.
 #
 # Node roles are determined by host variables in inventory.yml:
@@ -40,18 +41,21 @@
 #                              (default: /home/<ansible_user>/.kube/config).
 #   - fetch_kubeconfig:        When true, fetches the kubeconfig from the control
 #                              plane to the machine running the playbook
-#                              (default: false).
+#                              (default: true).
 #   - local_kubeconfig_path:   Destination path for the kubeconfig on the local
 #                              machine (default: ~/.kube/config).
 #   - bootstrap_control_plane: The host in the homelab group with bootstrap_node:
 #                              true. Resolved automatically from inventory — do
 #                              not set manually.
 #   - cilium_version:          Version of Cilium to install via Helm
-#                              (default: 1.16.0).
+#                              (default: 1.19.1).
 #   - cilium_namespace:        Kubernetes namespace for the Cilium installation
 #                              (default: kube-system).
 #   - cilium_cli_version:      Version of the Cilium CLI to install
-#                              (default: 0.16.0).
+#                              (default: 0.19.1).
+#   - gateway_api_version:     Version of the Gateway API CRDs to install.
+#                              Must be compatible with the Cilium version in use
+#                              (default: 1.4.1).
 #
 
 - name: Initialize Kubernetes control plane
@@ -64,7 +68,7 @@
     kubeadm_cri_socket: 'unix:///var/run/cri-dockerd.sock'
     kubectl_config_dir: '/home/{{ ansible_user }}/.kube'
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
-    fetch_kubeconfig: false
+    fetch_kubeconfig: true
     local_kubeconfig_path: ~/.kube/config
 
   tasks:
@@ -237,17 +241,67 @@
   become_exe: sudo.ws
   vars:
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
-    cilium_version: 1.16.0
+    cilium_version: 1.19.1
     cilium_namespace: kube-system
-    cilium_cli_version: 0.16.0
+    cilium_cli_version: 0.19.1
+    # NOTE: Cilium 1.19.1 requires Gateway API v1.4.1. In v1.5.0, TLSRoute was
+    # promoted from v1alpha2 to v1 and v1alpha2 is no longer served. Cilium
+    # 1.19.1's operator expects TLSRoute at v1alpha2 and crashes on startup if
+    # it is absent or unserved. Use v1.4.1 until Cilium adds v1.5.0 support.
+    gateway_api_version: 1.4.1
 
   tasks:
+    # -------------------------------------------------------------------------
+    # Gateway API CRDs
+    # Installs the Kubernetes Gateway API Custom Resource Definitions required
+    # by Cilium's Gateway API implementation. These CRDs define GatewayClass,
+    # Gateway, HTTPRoute, GRPCRoute, and ReferenceGrant resources that enable
+    # advanced traffic routing. They must be present before Cilium starts, as
+    # Cilium validates their existence on startup when Gateway API is enabled.
+    # The standard install manifest is downloaded, applied, and then removed.
+    # -------------------------------------------------------------------------
+    - name: Check if Gateway API CRDs are already installed
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get crd gatewayclasses.gateway.networking.k8s.io
+      register: gateway_crd_check
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Download Gateway API CRD manifest
+      ansible.builtin.get_url:
+        url: https://github.com/kubernetes-sigs/gateway-api/releases/download/v{{ gateway_api_version }}/standard-install.yaml  # noqa: yaml[line-length]
+        dest: /tmp/gateway-api-install.yaml
+        mode: '0644'
+      when:
+        - bootstrap_node | default(false)
+        - (gateway_crd_check.rc | default(1)) != 0
+
+    - name: Apply Gateway API CRDs
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/gateway-api-install.yaml
+      when:
+        - bootstrap_node | default(false)
+        - (gateway_crd_check.rc | default(1)) != 0
+      changed_when: true
+
+    - name: Clean up Gateway API CRD manifest
+      ansible.builtin.file:
+        path: /tmp/gateway-api-install.yaml
+        state: absent
+      when: bootstrap_node | default(false)
+
     # -------------------------------------------------------------------------
     # Cilium Installation
     # Installs Cilium as the cluster CNI plugin via Helm. Cilium provides
     # eBPF-based networking, security, and observability for Kubernetes.
     # kube-proxy is removed and replaced by Cilium's eBPF-based implementation,
-    # which handles ClusterIP and NodePort routing without iptables. The Cilium
+    # which handles ClusterIP and NodePort routing without iptables. Gateway API
+    # support is enabled so Cilium acts as a Gateway API controller. The Cilium
     # Helm repository is registered before installation.
     # -------------------------------------------------------------------------
     - name: Remove kube-proxy DaemonSet
@@ -274,28 +328,16 @@
       changed_when: false
       when: bootstrap_node | default(false)
 
-    - name: Check if Cilium Helm release is already installed
+    - name: Install or upgrade Cilium via Helm
       ansible.builtin.command:
         cmd: >-
-          helm status cilium
-          --namespace {{ cilium_namespace }}
-          --kubeconfig {{ kubectl_config_path }}
-      register: cilium_helm_status
-      changed_when: false
-      failed_when: false
-      when: bootstrap_node | default(false)
-
-    - name: Install Cilium via Helm
-      ansible.builtin.command:
-        cmd: >-
-          helm install cilium cilium/cilium
+          helm upgrade --install cilium cilium/cilium
           --version {{ cilium_version }}
           --namespace {{ cilium_namespace }}
           --kubeconfig {{ kubectl_config_path }}
           --set kubeProxyReplacement=true
-      when:
-        - bootstrap_node | default(false)
-        - (cilium_helm_status.rc | default(1)) != 0
+          --set gatewayAPI.enabled=true
+      when: bootstrap_node | default(false)
       changed_when: true
 
     # -------------------------------------------------------------------------
