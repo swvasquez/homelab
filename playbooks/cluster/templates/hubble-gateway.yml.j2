@@ -1,3 +1,21 @@
+{#
+  Defines a Gateway API Gateway that exposes services on the homelab LAN via Cilium's
+  Gateway API controller. The Gateway provisions a LoadBalancer service that receives
+  a stable LAN IP from the Cilium IP pool.
+
+  Listeners:
+    - http  (port 80):  Accepts HTTP traffic. Used exclusively by the HTTP-to-HTTPS
+                        redirect HTTPRoute so that plain HTTP requests are upgraded.
+    - https (port 443): Terminates TLS using the wildcard certificate (wildcard-tls
+                        Secret in kube-system) and routes HTTPS traffic to backend
+                        services registered via HTTPRoutes attached to this listener.
+
+  To find the assigned LAN IP after deployment, run:
+    kubectl get svc -n kube-system cilium-gateway-hubble-gateway
+
+  Variables:
+    dns_zone: DNS zone served by Bind9 (e.g. homelab.lan). Read from group_vars.
+#}
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
@@ -9,3 +27,11 @@ spec:
     - name: http
       protocol: HTTP
       port: 80
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: '*.{{ dns_zone }}'
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: wildcard-tls

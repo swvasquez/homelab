@@ -1,0 +1,25 @@
+{#
+  Defines a cert-manager Certificate that issues a wildcard TLS secret for the homelab
+  DNS zone. The certificate covers both the apex domain ({{ dns_zone }}) and all
+  subdomains (*.{{ dns_zone }}), so any service exposed via a HTTPRoute gets TLS
+  automatically without requiring per-resource certificate configuration.
+
+  The resulting Secret (wildcard-tls) is stored in the kube-system namespace and
+  referenced by the hubble-gateway.yml.j2 HTTPS listener.
+
+  Variables:
+    dns_zone: DNS zone served by Bind9 (e.g. homelab.lan). Read from group_vars.
+#}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: wildcard-tls
+  namespace: kube-system
+spec:
+  secretName: wildcard-tls
+  issuerRef:
+    name: selfsigned-issuer
+    kind: ClusterIssuer
+  dnsNames:
+    - '*.{{ dns_zone }}'
+    - '{{ dns_zone }}'

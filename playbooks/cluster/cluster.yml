@@ -21,7 +21,10 @@
 #     observability enabled.
 #   - Configures a Cilium LoadBalancer IP pool for LAN-accessible services.
 #   - Configures L2 announcement so LoadBalancer IPs are reachable on the LAN.
-#   - Exposes the Hubble UI over the LAN via a Gateway and HTTPRoute.
+#   - Installs cert-manager and creates a self-signed ClusterIssuer for
+#     automatic TLS certificate provisioning.
+#   - Exposes the Hubble UI over the LAN via a Gateway and HTTPRoute with
+#     self-signed HTTPS support.
 #   - Deploys Bind9 as an authoritative DNS server for the homelab zone with
 #     its own LoadBalancer IP. Bind9 is configured with a TSIG key for
 #     RFC 2136 dynamic updates.
@@ -77,6 +80,10 @@
 #   - network_interface:       Primary network interface on each node used for
 #                              L2 announcement of LoadBalancer IPs (e.g. eth0).
 #                              Read from inventory host vars.
+#   - cert_manager_version:    Version of the cert-manager Helm chart
+#                              (default: 1.20.0).
+#   - cert_manager_namespace:  Kubernetes namespace for cert-manager
+#                              (default: cert-manager).
 #   - bind9_image:             Container image for the Bind9 DNS server
 #                              (default: internetsystemsconsortium/bind9:9.20).
 #   - bind9_namespace:         Kubernetes namespace for Bind9 and ExternalDNS
@@ -92,9 +99,9 @@
   vars:
     cluster_name: homelab-0
     pod_network_cidr: 10.244.0.0/16
-    kubeadm_cri_socket: "unix:///var/run/cri-dockerd.sock"
-    kubectl_config_dir: "/home/{{ ansible_user }}/.kube"
-    kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
+    kubeadm_cri_socket: 'unix:///var/run/cri-dockerd.sock'
+    kubectl_config_dir: '/home/{{ ansible_user }}/.kube'
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
     fetch_kubeconfig: true
     local_kubeconfig_path: ~/.kube/config
 
@@ -136,7 +143,7 @@
       ansible.builtin.template:
         src: kubeadm-init.yml.j2
         dest: /tmp/kubeadm-init.yml
-        mode: "0600"
+        mode: '0600'
       when:
         - bootstrap_node | default(false)
         - not kubeadm_admin_conf.stat.exists
@@ -169,7 +176,7 @@
         state: directory
         owner: "{{ ansible_user }}"
         group: "{{ ansible_user }}"
-        mode: "0700"
+        mode: '0700'
       when: bootstrap_node | default(false)
 
     - name: Copy admin kubeconfig to ansible user home directory
@@ -178,7 +185,7 @@
         dest: "{{ kubectl_config_path }}"
         owner: "{{ ansible_user }}"
         group: "{{ ansible_user }}"
-        mode: "0600"
+        mode: '0600'
         remote_src: true
       when: bootstrap_node | default(false)
 
@@ -228,7 +235,7 @@
   become_exe: sudo.ws
   vars:
     # kubeadm_cri_socket is repeated from play 1 — vars do not carry across plays.
-    kubeadm_cri_socket: "unix:///var/run/cri-dockerd.sock"
+    kubeadm_cri_socket: 'unix:///var/run/cri-dockerd.sock'
     bootstrap_control_plane: >-
       {{ groups['homelab']
          | map('extract', hostvars)
@@ -268,8 +275,8 @@
   become: true
   become_exe: sudo.ws
   vars:
-    kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
-    hubble_hostname: "hubble.{{ dns_zone }}"
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    hubble_hostname: 'hubble.{{ dns_zone }}'
     cilium_version: 1.19.1
     cilium_namespace: kube-system
     cilium_cli_version: 0.19.1
@@ -278,7 +285,9 @@
     # 1.19.1's operator expects TLSRoute at v1alpha2 and crashes on startup if
     # it is absent or unserved. Use v1.4.1 until Cilium adds v1.5.0 support.
     gateway_api_version: 1.4.1
-    bind9_image: internetsystemsconsortium/bind9:9.20
+    cert_manager_version: 1.20.0
+    cert_manager_namespace: cert-manager
+    bind9_image: 'internetsystemsconsortium/bind9:9.20'
     bind9_namespace: kube-system
     externaldns_version: 1.19.0
 
@@ -306,7 +315,7 @@
       ansible.builtin.get_url:
         url: https://github.com/kubernetes-sigs/gateway-api/releases/download/v{{ gateway_api_version }}/standard-install.yaml # noqa: yaml[line-length]
         dest: /tmp/gateway-api-install.yaml
-        mode: "0644"
+        mode: '0644'
       when:
         - bootstrap_node | default(false)
         - (gateway_crd_check.rc | default(1)) != 0
@@ -373,6 +382,7 @@
           --set hubble.enabled=true
           --set hubble.relay.enabled=true
           --set hubble.ui.enabled=true
+          --set hubble.ui.ingress.enabled=false
           --set l2announcements.enabled=true
       when: bootstrap_node | default(false)
       changed_when: true
@@ -389,7 +399,7 @@
       ansible.builtin.template:
         src: cilium-lb-pool.yml.j2
         dest: /tmp/cilium-lb-pool.yml
-        mode: "0644"
+        mode: '0644'
       when: bootstrap_node | default(false)
 
     - name: Apply CiliumLoadBalancerIPPool
@@ -420,7 +430,7 @@
       ansible.builtin.template:
         src: cilium-l2-announcement.yml.j2
         dest: /tmp/cilium-l2-announcement.yml
-        mode: "0644"
+        mode: '0644'
       when: bootstrap_node | default(false)
 
     - name: Apply CiliumL2AnnouncementPolicy
@@ -441,19 +451,112 @@
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
+    # cert-manager
+    # Installs cert-manager via the Jetstack Helm chart. cert-manager
+    # automates TLS certificate management in Kubernetes, providing
+    # issuance and renewal. A self-signed ClusterIssuer is created
+    # along with a wildcard Certificate for *.{{ dns_zone }}. The
+    # wildcard cert is referenced by the Gateway's HTTPS listener so
+    # all services exposed via HTTPRoute get TLS automatically without
+    # per-resource annotations.
+    # -------------------------------------------------------------------------
+    - name: Add Jetstack Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add jetstack https://charts.jetstack.io
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Update Helm repositories for cert-manager
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Install or upgrade cert-manager via Helm
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade --install cert-manager jetstack/cert-manager
+          --version v{{ cert_manager_version }}
+          --namespace {{ cert_manager_namespace }}
+          --create-namespace
+          --kubeconfig {{ kubectl_config_path }}
+          --set crds.enabled=true
+      when: bootstrap_node | default(false)
+      changed_when: true
+
+    - name: Wait for cert-manager webhook to be ready
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          rollout status deployment cert-manager-webhook
+          -n {{ cert_manager_namespace }}
+          --timeout=120s
+      when: bootstrap_node | default(false)
+      changed_when: false
+
+    - name: Write self-signed ClusterIssuer manifest
+      ansible.builtin.template:
+        src: cert-manager-clusterissuer.yml.j2
+        dest: /tmp/cert-manager-clusterissuer.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply self-signed ClusterIssuer
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/cert-manager-clusterissuer.yml
+      register: clusterissuer_result
+      changed_when: >-
+        'created' in clusterissuer_result.stdout or
+        'configured' in clusterissuer_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up ClusterIssuer manifest
+      ansible.builtin.file:
+        path: /tmp/cert-manager-clusterissuer.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write wildcard TLS Certificate manifest
+      ansible.builtin.template:
+        src: cert-manager-wildcard-cert.yml.j2
+        dest: /tmp/cert-manager-wildcard-cert.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply wildcard TLS Certificate
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/cert-manager-wildcard-cert.yml
+      register: wildcard_cert_result
+      changed_when: >-
+        'created' in wildcard_cert_result.stdout or
+        'configured' in wildcard_cert_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up wildcard TLS Certificate manifest
+      ansible.builtin.file:
+        path: /tmp/cert-manager-wildcard-cert.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
     # Hubble UI Exposure
     # Creates a Gateway and HTTPRoute to expose the Hubble UI over the LAN via
     # Cilium's Gateway API controller. The Gateway provisions a LoadBalancer
-    # service that receives an IP from the homelab pool, making the UI reachable
-    # on port 80. The HTTPRoute routes all incoming requests to the hubble-ui
-    # ClusterIP service. To find the assigned IP after deployment, run:
+    # service that receives an IP from the homelab pool. The HTTPS listener
+    # uses the wildcard TLS certificate and HTTP requests are redirected to
+    # HTTPS via a dedicated redirect HTTPRoute. To find the assigned IP after
+    # deployment, run:
     #   kubectl get svc -n kube-system cilium-gateway-hubble-gateway
     # -------------------------------------------------------------------------
     - name: Write Hubble Gateway manifest
       ansible.builtin.template:
         src: hubble-gateway.yml.j2
         dest: /tmp/hubble-gateway.yml
-        mode: "0644"
+        mode: '0644'
       when: bootstrap_node | default(false)
 
     - name: Apply Hubble Gateway
@@ -477,7 +580,7 @@
       ansible.builtin.template:
         src: hubble-httproute.yml.j2
         dest: /tmp/hubble-httproute.yml
-        mode: "0644"
+        mode: '0644'
       when: bootstrap_node | default(false)
 
     - name: Apply Hubble HTTPRoute
@@ -566,7 +669,7 @@
       ansible.builtin.template:
         src: bind9.yml.j2
         dest: /tmp/bind9.yml
-        mode: "0644"
+        mode: '0644'
       when: bootstrap_node | default(false)
 
     - name: Apply Bind9 manifest
@@ -623,7 +726,7 @@
       ansible.builtin.template:
         src: externaldns-values.yml.j2
         dest: /tmp/externaldns-values.yml
-        mode: "0644"
+        mode: '0644'
       vars:
         bind9_service_ip: "{{ bind9_service_ip_result.stdout }}"
       when: bootstrap_node | default(false)
@@ -664,7 +767,7 @@
       ansible.builtin.get_url:
         url: https://github.com/cilium/cilium-cli/releases/download/v{{ cilium_cli_version }}/cilium-linux-{{ dpkg_arch.stdout }}.tar.gz # noqa: yaml[line-length]
         dest: /tmp/cilium-cli.tar.gz
-        mode: "0644"
+        mode: '0644'
 
     - name: Extract Cilium CLI binary to /usr/local/bin
       ansible.builtin.unarchive:

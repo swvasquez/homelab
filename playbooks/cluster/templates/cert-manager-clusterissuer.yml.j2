@@ -1,0 +1,14 @@
+{#
+  Defines a cert-manager ClusterIssuer using a self-signed CA.
+
+  This ClusterIssuer is cluster-scoped and referenced by all cert-manager Certificate
+  resources in the cluster. A self-signed issuer generates certificates signed by
+  themselves rather than by a trusted CA, which is appropriate for internal homelab
+  services where the certificate only needs to be trusted on devices you control.
+#}
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned-issuer
+spec:
+  selfSigned: {}
