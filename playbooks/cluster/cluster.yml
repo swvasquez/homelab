@@ -15,6 +15,9 @@
 #   - Optionally removes the NoSchedule taint from the control plane node to
 #     allow it to also schedule workloads (when `worker_node: true` is set on
 #     the control plane host in inventory).
+#   - Removes kube-proxy and installs Cilium as the CNI plugin via Helm, with
+#     Cilium's eBPF kube-proxy replacement enabled.
+#   - Installs the Cilium CLI on all nodes for inspecting and troubleshooting.
 #
 # Node roles are determined by host variables in inventory.yml:
 #   - control_plane: true  — node is a Kubernetes control plane node.
@@ -28,7 +31,7 @@
 #   - cluster_name:            Name of the Kubernetes cluster, used in kubeconfig
 #                              contexts (default: homelab-0).
 #   - pod_network_cidr:        CIDR range for pod networking
-#                              (default: 10.244.0.0/16, compatible with Flannel).
+#                              (default: 10.244.0.0/16).
 #   - kubeadm_cri_socket:      CRI socket path set in the kubeadm config
 #                              (default: unix:///var/run/cri-dockerd.sock).
 #   - kubectl_config_dir:      Directory where the kubectl config is stored for
@@ -43,6 +46,12 @@
 #   - bootstrap_control_plane: The host in the homelab group with bootstrap_node:
 #                              true. Resolved automatically from inventory — do
 #                              not set manually.
+#   - cilium_version:          Version of Cilium to install via Helm
+#                              (default: 1.16.0).
+#   - cilium_namespace:        Kubernetes namespace for the Cilium installation
+#                              (default: kube-system).
+#   - cilium_cli_version:      Version of the Cilium CLI to install
+#                              (default: 0.16.0).
 #
 
 - name: Initialize Kubernetes control plane
@@ -92,20 +101,10 @@
       when: bootstrap_node | default(false)
 
     - name: Write kubeadm init config file
-      ansible.builtin.copy:
+      ansible.builtin.template:
+        src: kubeadm-init.yml.j2
         dest: /tmp/kubeadm-init.yml
         mode: '0600'
-        content: |
-          apiVersion: kubeadm.k8s.io/v1beta3
-          kind: InitConfiguration
-          nodeRegistration:
-            criSocket: {{ kubeadm_cri_socket }}
-          ---
-          apiVersion: kubeadm.k8s.io/v1beta3
-          kind: ClusterConfiguration
-          clusterName: {{ cluster_name }}
-          networking:
-            podSubnet: {{ pod_network_cidr }}
       when:
         - bootstrap_node | default(false)
         - not kubeadm_admin_conf.stat.exists
@@ -161,7 +160,8 @@
         - fetch_kubeconfig | default(false)
 
     - name: Retrieve kubeadm join command from control plane
-      ansible.builtin.command: kubeadm token create --print-join-command
+      ansible.builtin.command:
+        cmd: kubeadm token create --print-join-command
       register: kubeadm_join_command
       changed_when: false
       when: bootstrap_node | default(false)
@@ -177,7 +177,7 @@
     # -------------------------------------------------------------------------
     - name: Remove NoSchedule taint from control plane to enable worker scheduling
       ansible.builtin.command:
-        cmd: >
+        cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
           taint nodes {{ inventory_hostname }}
           node-role.kubernetes.io/control-plane:NoSchedule-
@@ -195,7 +195,7 @@
   become: true
   become_exe: sudo.ws
   vars:
-    # Repeated from play 1 — vars do not carry across plays.
+    # kubeadm_cri_socket is repeated from play 1 — vars do not carry across plays.
     kubeadm_cri_socket: 'unix:///var/run/cri-dockerd.sock'
     bootstrap_control_plane: >-
       {{ groups['homelab']
@@ -222,7 +222,7 @@
 
     - name: Join worker node to the cluster
       ansible.builtin.command:
-        cmd: >
+        cmd: >-
           {{ hostvars[bootstrap_control_plane].kubeadm_join_command.stdout }}
           --cri-socket={{ kubeadm_cri_socket }}
       when:
@@ -230,3 +230,102 @@
         - not (control_plane | default(false))
         - not kubelet_conf.stat.exists
       changed_when: true
+
+- name: Install Cilium CNI
+  hosts: homelab
+  become: true
+  become_exe: sudo.ws
+  vars:
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    cilium_version: 1.16.0
+    cilium_namespace: kube-system
+    cilium_cli_version: 0.16.0
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Cilium Installation
+    # Installs Cilium as the cluster CNI plugin via Helm. Cilium provides
+    # eBPF-based networking, security, and observability for Kubernetes.
+    # kube-proxy is removed and replaced by Cilium's eBPF-based implementation,
+    # which handles ClusterIP and NodePort routing without iptables. The Cilium
+    # Helm repository is registered before installation.
+    # -------------------------------------------------------------------------
+    - name: Remove kube-proxy DaemonSet
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          delete daemonset kube-proxy -n kube-system
+      register: kube_proxy_delete
+      changed_when: '''deleted'' in kube_proxy_delete.stdout'
+      failed_when:
+        - kube_proxy_delete.rc != 0
+        - '''not found'' not in kube_proxy_delete.stderr'
+      when: bootstrap_node | default(false)
+
+    - name: Add Cilium Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add cilium https://helm.cilium.io/
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Update Helm repositories
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Check if Cilium Helm release is already installed
+      ansible.builtin.command:
+        cmd: >-
+          helm status cilium
+          --namespace {{ cilium_namespace }}
+          --kubeconfig {{ kubectl_config_path }}
+      register: cilium_helm_status
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Install Cilium via Helm
+      ansible.builtin.command:
+        cmd: >-
+          helm install cilium cilium/cilium
+          --version {{ cilium_version }}
+          --namespace {{ cilium_namespace }}
+          --kubeconfig {{ kubectl_config_path }}
+          --set kubeProxyReplacement=true
+      when:
+        - bootstrap_node | default(false)
+        - (cilium_helm_status.rc | default(1)) != 0
+      changed_when: true
+
+    # -------------------------------------------------------------------------
+    # Cilium CLI Installation
+    # Installs the Cilium CLI on all nodes. The CLI communicates with Cilium
+    # agent pods via the Kubernetes API and provides commands for checking
+    # cluster networking status, running connectivity tests, and enabling
+    # observability features such as Hubble. The release tarball is fetched
+    # from GitHub, the binary is extracted to /usr/local/bin for system-wide
+    # access, and the tarball is removed.
+    # -------------------------------------------------------------------------
+    - name: Get CPU architecture for Cilium CLI download
+      ansible.builtin.command:
+        cmd: dpkg --print-architecture
+      register: dpkg_arch
+      changed_when: false
+
+    - name: Download Cilium CLI tarball
+      ansible.builtin.get_url:
+        url: https://github.com/cilium/cilium-cli/releases/download/v{{ cilium_cli_version }}/cilium-linux-{{ dpkg_arch.stdout }}.tar.gz  # noqa: yaml[line-length]
+        dest: /tmp/cilium-cli.tar.gz
+        mode: '0644'
+
+    - name: Extract Cilium CLI binary to /usr/local/bin
+      ansible.builtin.unarchive:
+        src: /tmp/cilium-cli.tar.gz
+        dest: /usr/local/bin
+        remote_src: true
+
+    - name: Clean up temporary Cilium CLI tarball
+      ansible.builtin.file:
+        path: /tmp/cilium-cli.tar.gz
+        state: absent
