@@ -1,3 +1,4 @@
+---
 #
 # Installs the Rust programming language, toolchain, and common utilities
 # for system-wide use.
@@ -14,14 +15,23 @@
 #     - cargo-update
 #     - bacon
 #
+# Variables:
+#   - rustup_home:   Directory where rustup stores its toolchain data
+#                   (default: /usr/local/rustup).
+#   - cargo_home:   Directory where Cargo stores binaries and registry data
+#                   (default: /usr/local/cargo).
+#   - rust_packages: List of Cargo packages to install, each with a 'name'
+#                   (crate name) and 'binary' (expected binary filename for
+#                   idempotency checks).
+#
 
 - name: Install Rust and common tools system-wide
   hosts: homelab
   become: true
   become_exe: sudo.ws
   vars:
-    rustup_home: /usr/local/rustup
-    cargo_home: /usr/local/cargo
+    rustup_home: "/usr/local/rustup"
+    cargo_home: "/usr/local/cargo"
     rust_packages:
       - { name: "cargo-edit", binary: "cargo-add" }
       - { name: "cargo-watch", binary: "cargo-watch" }
@@ -29,6 +39,12 @@
       - { name: "bacon", binary: "bacon" }
 
   tasks:
+    # -------------------------------------------------------------------------
+    # Rustup Installation
+    # Downloads and runs the rustup-init script to install the Rust toolchain
+    # system-wide. Cleans up the installer script after use. Skips the
+    # download if the Rust compiler is already present.
+    # -------------------------------------------------------------------------
     - name: Check if Rust is installed
       ansible.builtin.stat:
         path: "{{ cargo_home }}/bin/rustc"
@@ -58,6 +74,11 @@
             state: absent
           become: false
 
+    # -------------------------------------------------------------------------
+    # Toolchain, PATH, and Components
+    # Sets the default toolchain to 'stable', adds Cargo's bin directory to
+    # the system-wide PATH via /etc/profile.d, and installs rust-analyzer.
+    # -------------------------------------------------------------------------
     - name: Set default Rust toolchain to stable
       ansible.builtin.command:
         cmd: "{{ cargo_home }}/bin/rustup default stable"
@@ -80,6 +101,11 @@
         CARGO_HOME: "{{ cargo_home }}"
       changed_when: false
 
+    # -------------------------------------------------------------------------
+    # Cargo Packages
+    # Installs common Rust development utilities from crates.io into the
+    # shared Cargo bin directory, making them available system-wide.
+    # -------------------------------------------------------------------------
     - name: Install common Rust cargo packages
       ansible.builtin.command:
         cmd: "{{ cargo_home }}/bin/cargo install {{ item.name }}"

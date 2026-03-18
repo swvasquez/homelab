@@ -1,3 +1,4 @@
+---
 #
 # Installs a collection of command-line utilities for system and network
 # monitoring.
@@ -10,6 +11,9 @@
 #   - net-tools: Classic networking utilities (e.g., ifconfig, netstat).
 #   - nmap: Network scanner and security auditor.
 #   - iproute2: Modern Linux networking utilities (e.g., ip, ss).
+#
+# Variables:
+#   - monitoring_packages: List of APT packages to install for system and network monitoring.
 #
 
 - name: Install monitoring utilities

@@ -1,3 +1,4 @@
+---
 #
 # Installs the AMDGPU kernel driver and the ROCm (Radeon Open Compute) stack
 # for AMD GPUs.
@@ -9,8 +10,12 @@
 #     and ROCm components.
 #   - Installs additional ROCm and Python development packages.
 #
-# The AMDGPU installer version can be specified by setting the
-# 'amdgpu_install_version' variable.
+# Variables:
+#   - amdgpu_install_version: Version string for the amdgpu-install .deb package
+#                             (default: "7.1.1.70101-1").
+#   - amdgpu_deb_url:         Full URL to download the amdgpu-install .deb package.
+#   - amdgpu_deb_path:        Temporary path to store the downloaded .deb file
+#                             (default: /tmp/amdgpu-install.deb).
 #
 
 - name: Install ROCm (Radeon Open Compute)
@@ -23,6 +28,12 @@
       https://repo.radeon.com/amdgpu-install/7.1.1/ubuntu/noble/amdgpu-install_{{ amdgpu_install_version }}_all.deb
     amdgpu_deb_path: "/tmp/amdgpu-install.deb"
   tasks:
+    # -------------------------------------------------------------------------
+    # GPU Group Configuration
+    # Ensures the 'video' and 'render' groups exist, adds the current user to
+    # them, and configures /etc/adduser.conf so new users automatically inherit
+    # the 'video' group — granting GPU access without manual intervention.
+    # -------------------------------------------------------------------------
     - name: Ensure video and render groups exist
       ansible.builtin.group:
         name: "{{ item }}"
@@ -51,6 +62,12 @@
         line: 'EXTRA_GROUPS="video"'
         state: present
 
+    # -------------------------------------------------------------------------
+    # AMDGPU Installer
+    # Downloads and installs the amdgpu-install utility package, then runs it
+    # with the 'rocm' use case to install the kernel driver and ROCm stack.
+    # Skips the download if amdgpu-install is already present.
+    # -------------------------------------------------------------------------
     - name: Check if amdgpu-install is installed
       ansible.builtin.stat:
         path: /usr/bin/amdgpu-install
@@ -81,6 +98,11 @@
       register: amdgpu_install_result
       changed_when: "'successfully' in amdgpu_install_result.stdout"
 
+    # -------------------------------------------------------------------------
+    # Additional ROCm Packages
+    # Installs supplementary ROCm and Python build packages via APT after the
+    # amdgpu-install step has registered the ROCm APT repository.
+    # -------------------------------------------------------------------------
     - name: Install ROCm and Python development packages
       ansible.builtin.apt:
         name:

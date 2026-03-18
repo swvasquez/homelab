@@ -1,3 +1,4 @@
+---
 #
 # Installs and configures a comprehensive Python development environment.
 #
@@ -8,7 +9,15 @@
 #   - Installs 'uv', a fast Python package installer and resolver from Astral,
 #     into /usr/local/bin.
 #
-# The 'uv' version can be specified by setting the 'uv_version' variable.
+# Variables:
+#   - python3_packages:      List of Python 3 APT packages to install.
+#   - miniconda_prefix:      Installation directory for Miniconda
+#                            (default: /opt/miniconda3).
+#   - miniconda_installer:   Filename of the Miniconda installer script
+#                            (default: "Miniconda3-latest-Linux-x86_64.sh").
+#   - miniconda_download_url: Full URL to download the Miniconda installer.
+#   - uv_version:            Version of the 'uv' package manager to install
+#                            (default: "0.1.18").
 #
 
 - name: Set up Python environment
@@ -30,17 +39,28 @@
       - libreadline-dev
       - zlib1g-dev
       - libsqlite3-dev
-    miniconda_prefix: /opt/miniconda3
-    miniconda_installer: Miniconda3-latest-Linux-x86_64.sh
-    miniconda_download_url: https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+    miniconda_prefix: "/opt/miniconda3"
+    miniconda_installer: "Miniconda3-latest-Linux-x86_64.sh"
+    miniconda_download_url: "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
     uv_version: "0.1.18"
   tasks:
+    # -------------------------------------------------------------------------
+    # APT Packages
+    # Installs Python 3 and common development libraries from the OS package
+    # manager to provide a complete build environment.
+    # -------------------------------------------------------------------------
     - name: Install Python 3 and development packages
       ansible.builtin.apt:
         name: "{{ python3_packages }}"
         state: present
         update_cache: true
 
+    # -------------------------------------------------------------------------
+    # Miniconda
+    # Downloads and installs Miniconda system-wide to provide a managed conda
+    # environment. Adds the Miniconda bin directory to the system-wide PATH.
+    # Skips the download if Miniconda is already installed.
+    # -------------------------------------------------------------------------
     - name: Check if Miniconda is installed
       ansible.builtin.stat:
         path: "{{ miniconda_prefix }}/bin/conda"
@@ -74,6 +94,11 @@
         content: 'export PATH="{{ miniconda_prefix }}/bin:$PATH"'
         mode: "0644"
 
+    # -------------------------------------------------------------------------
+    # uv Package Manager
+    # Installs or updates the 'uv' Python package manager from Astral into
+    # /usr/local/bin so it is available system-wide.
+    # -------------------------------------------------------------------------
     - name: Check installed 'uv' version
       become: false
       ansible.builtin.command:

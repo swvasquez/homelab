@@ -1,3 +1,4 @@
+---
 #
 # Installs and configures Docker Engine and Docker Compose.
 #
@@ -14,6 +15,11 @@
   become: true
   become_exe: sudo.ws
   tasks:
+    # -------------------------------------------------------------------------
+    # Prerequisites
+    # Installs packages needed to add the Docker APT repository securely, and
+    # ensures the system keyring directory exists to store the GPG key.
+    # -------------------------------------------------------------------------
     - name: Install prerequisite packages for Docker repository
       ansible.builtin.apt:
         name:
@@ -27,6 +33,11 @@
         state: directory
         mode: "0755"
 
+    # -------------------------------------------------------------------------
+    # Repository Configuration
+    # Adds Docker's official GPG key and APT repository so that packages can
+    # be installed from Docker's distribution channel rather than the OS repos.
+    # -------------------------------------------------------------------------
     - name: Download Docker's official GPG key
       ansible.builtin.get_url:
         url: https://download.docker.com/linux/ubuntu/gpg
@@ -42,6 +53,11 @@
         state: present
         update_cache: true
 
+    # -------------------------------------------------------------------------
+    # Installation and Service Configuration
+    # Installs Docker Engine and its plugins, grants the current user non-root
+    # access via the 'docker' group, and starts the Docker daemon on boot.
+    # -------------------------------------------------------------------------
     - name: Install Docker Engine, CLI, and plugins
       ansible.builtin.apt:
         name:

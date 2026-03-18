@@ -1,3 +1,4 @@
+---
 #
 # Configures Wake-on-LAN (WoL) for a specified network interface using Netplan.
 #
@@ -7,19 +8,23 @@
 #     enable WoL on the specified interface.
 #   - Notifies a handler to apply the Netplan configuration.
 #
-# This playbook requires the following variables to be defined:
-#   - network_interface: The name of the network interface to configure (e.g., eno1).
-#   - mac_address: The MAC address of the interface.
+# Variables (set in inventory.yml per host):
+#   - network_interface: The name of the network interface to configure (e.g., 'eno1').
+#   - mac_address:       The MAC address of the network interface
+#                        (e.g., '00:11:22:33:44:55').
 #
 
 - name: Configure Wake-on-LAN (WoL)
   hosts: homelab
   become: true
   become_exe: sudo.ws
-  vars:
-    network_interface: "eno1"
-    mac_address: "00:11:22:33:44:55"
+
   tasks:
+    # -------------------------------------------------------------------------
+    # Installation
+    # Installs ethtool for querying and setting NIC parameters, and wakeonlan
+    # for sending magic packets to wake remote machines.
+    # -------------------------------------------------------------------------
     - name: Install WoL and networking utilities
       ansible.builtin.apt:
         name:
@@ -28,10 +33,15 @@
         state: present
         update_cache: true
 
+    # -------------------------------------------------------------------------
+    # Netplan Configuration
+    # Writes a Netplan configuration file that enables Wake-on-LAN on the
+    # target interface and applies it via a handler.
+    # -------------------------------------------------------------------------
     - name: Deploy Netplan configuration for WoL
       ansible.builtin.copy:
         dest: /etc/netplan/50-wol.yaml
-        mode: "0644"
+        mode: '0644'
         content: |
           network:
             version: 2
@@ -45,6 +55,9 @@
       notify: Apply Netplan configuration
 
   handlers:
+    # -------------------------------------------------------------------------
+    # Handlers
+    # -------------------------------------------------------------------------
     - name: Apply Netplan configuration
       ansible.builtin.command:
         cmd: netplan apply

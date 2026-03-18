@@ -2,6 +2,8 @@
 
 Ansible Playbooks to configure Ubuntu x86_64 machines.
 
+> This code was generated with AI assistance.
+
 ## Prerequisites
 
 - [just](https://github.com/casey/just)
@@ -15,7 +17,7 @@ Ansible Playbooks to configure Ubuntu x86_64 machines.
     just venv
     ```
 
-2.  Create an `inventory.yaml` file with the following structure:
+2.  Create an `inventory.yml` file with the following structure:
 
     ```yaml
     all:
@@ -27,20 +29,23 @@ Ansible Playbooks to configure Ubuntu x86_64 machines.
               private_ip: <IP>
               network_interface: <INTERFACE>
               mac_address: <MAC>
-              nfs_server: <IS_NFS_SERVER>
+              nfs_server: <true|false>
+              slurm_controller: <true|false>
+              slurm_compute_node: <true|false>
     ```
 
 3.  Create a `group_vars/homelab.yml` file for group-level variables:
 
     ```yaml
-    dropbear_port: <DROPBEAR_PORT>
     router_private_ip: <ROUTER_IP>
+    dropbear_port: <DROPBEAR_PORT>
     shutdown_schedule: <SHUTDOWN_SCHEDULE>
     ```
 
 ## Directory Structure
 
-Playbooks are organized logically into categories, and each category maintains its own `templates/` folder (if applicable) to keep playbooks and their dependencies tightly coupled:
+Playbooks are organized logically into categories, and each category maintains its own
+`templates/` folder (if applicable) to keep playbooks and their dependencies tightly coupled:
 
 - `infrastructure/`: OS-level configurations and bare-metal setup.
 - `cluster/`: Kubernetes cluster bootstrapping and core components.
@@ -61,7 +66,9 @@ just install <CATEGORY> <PLAYBOOK> [SUBSET]
 ```sh
 just install infrastructure docker
 ```
-or 
+
+or
+
 ```sh
 just install cluster kubernetes homelab
 ```
@@ -84,8 +91,6 @@ just lint
 
 ## Notes
 
-- **`become_exe` configuration**: `become_exe` must be set to `sudo.ws` to resolve an issue with Ansible. See [Ansible Issue #85837](https://github.com/ansible/ansible/issues/85837) for details.
-
-## Acknowledgements
-
-This code was generated with AI assistance.
+- **`become_exe` configuration**: `become_exe` must be set to `sudo.ws` to resolve an issue
+  with Ansible. See [Ansible Issue #85837](https://github.com/ansible/ansible/issues/85837)
+  for details.

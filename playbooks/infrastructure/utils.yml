@@ -1,3 +1,4 @@
+---
 #
 # Installs a curated collection of modern and common command-line utilities
 # to enhance shell productivity.
@@ -14,6 +15,9 @@
 #   - unzip: Utility for extracting ZIP archives.
 #   - vim: A highly configurable text editor.
 #   - yq: A portable command-line YAML processor.
+#
+# Variables:
+#   - util_packages: List of APT packages to install as common CLI utilities.
 #
 
 - name: Install common CLI tools

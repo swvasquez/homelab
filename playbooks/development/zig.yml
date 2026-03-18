@@ -1,10 +1,21 @@
+---
 #
 # Installs and configures the Zig programming language.
 #
 # This playbook performs the following actions:
-#   - Downloads and installs a specific development version of Zig from ziglang.org.
+#   - Downloads and installs a specific version of Zig from ziglang.org.
 #   - Installs Zig to /usr/local/zig.
 #   - Sets up the system-wide PATH to include Zig's bin directory.
+#
+# Variables:
+#   - zig_arch:         Target CPU architecture (default: "x86_64").
+#   - zig_os:           Target operating system (default: "linux").
+#   - zig_archive:      Full archive filename to download from ziglang.org
+#                       (e.g., "zig-x86_64-linux-0.16.0-dev.1657+985a3565c.tar.xz").
+#   - zig_download_url: Full download URL for the Zig archive.
+#   - zig_version:      Version string used for idempotency checks; must match
+#                       the output of 'zig version' for the downloaded archive
+#                       (e.g., "0.16.0-dev.1657+985a3565c").
 #
 
 - name: Manage Zig installation
@@ -17,15 +28,15 @@
     zig_os: "linux"
     zig_archive: "zig-x86_64-linux-0.16.0-dev.1657+985a3565c.tar.xz"
     zig_download_url: "https://ziglang.org/builds/{{ zig_archive }}"
-    # Extract version from archive name for idempotency checks
-    # Archive format: zig-<arch>-<os>-<version>.tar.xz
-    # We want <version>.
-    # split('-') -> ['zig', 'x86_64', 'linux', '0.16.0', 'dev.1657+985a3565c.tar.xz']?
-    # This is brittle. Let's just set the expected version manually or derive it simpler.
-    # Given the constraint to keep it simple and the specific variable request:
+    # Version string matching the archive, used for idempotency checks.
     zig_version: "0.16.0-dev.1657+985a3565c"
 
   tasks:
+    # -------------------------------------------------------------------------
+    # Version Detection
+    # Checks the currently installed Zig version to determine if an install or
+    # update is needed.
+    # -------------------------------------------------------------------------
     - name: Check installed Zig version
       ansible.builtin.command:
         cmd: /usr/local/zig/zig version
@@ -34,6 +45,11 @@
       failed_when: false
       check_mode: false
 
+    # -------------------------------------------------------------------------
+    # Installation
+    # Downloads the Zig archive, removes any existing installation, extracts
+    # Zig to /usr/local/zig, and cleans up the downloaded archive.
+    # -------------------------------------------------------------------------
     - name: Install Zig
       when: zig_installed_version.rc != 0 or zig_installed_version.stdout != zig_version
       vars:
@@ -64,6 +80,11 @@
             path: "{{ zig_tmp_path }}"
             state: absent
 
+    # -------------------------------------------------------------------------
+    # PATH Configuration
+    # Adds Zig's installation directory to the system-wide PATH via
+    # /etc/profile.d so that all users can invoke the 'zig' command.
+    # -------------------------------------------------------------------------
     - name: Set Zig path for all users
       ansible.builtin.copy:
         content: "export PATH=$PATH:/usr/local/zig"

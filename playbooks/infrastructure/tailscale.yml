@@ -1,3 +1,4 @@
+---
 #
 # Installs and configures the Tailscale mesh VPN client.
 #
@@ -18,6 +19,11 @@
   become: true
   become_exe: sudo.ws
   tasks:
+    # -------------------------------------------------------------------------
+    # System Configuration
+    # Enables IPv4 and IPv6 forwarding so this host can act as a Tailscale
+    # subnet router or exit node.
+    # -------------------------------------------------------------------------
     - name: Enable IP forwarding for subnet routing or exit node
       ansible.posix.sysctl:
         name: "{{ item }}"
@@ -29,6 +35,11 @@
         - net.ipv4.ip_forward
         - net.ipv6.conf.all.forwarding
 
+    # -------------------------------------------------------------------------
+    # Repository Configuration
+    # Adds Tailscale's official GPG key and APT repository so the package can
+    # be installed and updated from the official Tailscale channel.
+    # -------------------------------------------------------------------------
     - name: Check for Tailscale's official GPG key
       ansible.builtin.stat:
         path: /usr/share/keyrings/tailscale-archive-keyring.gpg
@@ -51,6 +62,11 @@
         filename: tailscale
         update_cache: true
 
+    # -------------------------------------------------------------------------
+    # Installation and Network Connection
+    # Installs the Tailscale package and connects the host to the Tailscale
+    # network. The 'tailscale up' step may require interactive authentication.
+    # -------------------------------------------------------------------------
     - name: Install Tailscale package
       ansible.builtin.apt:
         name: tailscale

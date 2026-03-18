@@ -1,3 +1,4 @@
+---
 #
 # Installs the Node.js JavaScript runtime and the npm package manager.
 #
@@ -8,6 +9,9 @@
 # Note: This installs the version of Node.js available in the OS repositories.
 # For a specific or newer version, a repository configuration (like NodeSource)
 # would be required, but this playbook adheres to the standard package manager constraint.
+#
+# Variables:
+#   - nodejs_packages: List of APT packages to install for Node.js and npm.
 #
 
 - name: Install Node.js and npm
@@ -20,6 +24,11 @@
       - npm
 
   tasks:
+    # -------------------------------------------------------------------------
+    # Installation
+    # Installs Node.js and npm from the OS package manager, making them
+    # available system-wide to all users.
+    # -------------------------------------------------------------------------
     - name: Install Node.js and npm packages
       ansible.builtin.apt:
         name: "{{ nodejs_packages }}"

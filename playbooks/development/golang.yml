@@ -1,3 +1,4 @@
+---
 #
 # Installs and configures the Go programming language and common tooling.
 #
@@ -9,6 +10,9 @@
 #   - Sets up the system-wide PATH to include Go's bin directory.
 #   - Installs common Go development tools ('gopls', 'dlv') into /usr/local/bin.
 #
+# Variables:
+#   - go_arch: Target CPU architecture for the Go binary (default: amd64).
+#
 
 - name: Manage golang installation
   hosts: homelab
@@ -16,12 +20,17 @@
   become_exe: sudo.ws
 
   vars:
-    go_arch: "amd64"
+    go_arch: amd64
 
   tasks:
+    # -------------------------------------------------------------------------
+    # Version Detection
+    # Fetches the latest available Go version from go.dev and compares it to
+    # the currently installed version to determine if an update is needed.
+    # -------------------------------------------------------------------------
     - name: Get latest Go version string from go.dev
       ansible.builtin.uri:
-        url: "https://go.dev/VERSION?m=text"
+        url: https://go.dev/VERSION?m=text
         return_content: true
       register: go_version_raw
 
@@ -37,6 +46,12 @@
       failed_when: false
       check_mode: false
 
+    # -------------------------------------------------------------------------
+    # Installation
+    # Downloads and installs Go system-wide to /usr/local/go if the installed
+    # version does not match the latest. Cleans up the downloaded tarball after
+    # extraction.
+    # -------------------------------------------------------------------------
     - name: Install Go
       when: go_version is defined and go_version_output.stdout is not search("go" + go_version)
       vars:
@@ -66,19 +81,24 @@
             path: "{{ go_tmp_path }}"
             state: absent
 
+    # -------------------------------------------------------------------------
+    # PATH and Tooling
+    # Adds Go's bin directory to the system-wide PATH via /etc/profile.d, then
+    # installs common Go development tools (gopls, dlv) for all users.
+    # -------------------------------------------------------------------------
     - name: Set Go path for all users
       ansible.builtin.copy:
-        content: "export PATH=$PATH:/usr/local/go/bin"
+        content: export PATH=$PATH:/usr/local/go/bin
         dest: /etc/profile.d/go.sh
         mode: "0755"
 
     - name: Install common Go tools
       ansible.builtin.command:
-        cmd: "go install {{ item }}"
+        cmd: go install {{ item }}
         creates: "/usr/local/bin/{{ item | split('/') | last | split('@') | first }}"
       loop:
         - golang.org/x/tools/gopls@latest
         - github.com/go-delve/delve/cmd/dlv@latest
       environment:
-        PATH: "/usr/local/go/bin:{{ ansible_env.PATH }}"
-        GOBIN: "/usr/local/bin"
+        PATH: /usr/local/go/bin:{{ ansible_env.PATH }}
+        GOBIN: /usr/local/bin
