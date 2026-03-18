@@ -17,7 +17,11 @@
 #     the control plane host in inventory).
 #   - Installs the Kubernetes Gateway API CRDs required by Cilium.
 #   - Removes kube-proxy and installs Cilium as the CNI plugin via Helm, with
-#     Cilium's eBPF kube-proxy replacement and Gateway API support enabled.
+#     Cilium's eBPF kube-proxy replacement, Gateway API support, and Hubble
+#     observability enabled.
+#   - Configures a Cilium LoadBalancer IP pool for LAN-accessible services.
+#   - Configures L2 announcement so LoadBalancer IPs are reachable on the LAN.
+#   - Exposes the Hubble UI over the LAN via a Gateway and HTTPRoute.
 #   - Installs the Cilium CLI on all nodes for inspecting and troubleshooting.
 #
 # Node roles are determined by host variables in inventory.yml:
@@ -56,6 +60,13 @@
 #   - gateway_api_version:     Version of the Gateway API CRDs to install.
 #                              Must be compatible with the Cilium version in use
 #                              (default: 1.4.1).
+#   - lb_ip_pool_cidr:         CIDR block allocated for Cilium LoadBalancer IP
+#                              assignments. Should be a reserved range on the LAN
+#                              that does not overlap with DHCP or static addresses.
+#                              Read from group_vars.
+#   - network_interface:       Primary network interface on each node used for
+#                              L2 announcement of LoadBalancer IPs (e.g. eth0).
+#                              Read from inventory host vars.
 #
 
 - name: Initialize Kubernetes control plane
@@ -300,9 +311,10 @@
     # Installs Cilium as the cluster CNI plugin via Helm. Cilium provides
     # eBPF-based networking, security, and observability for Kubernetes.
     # kube-proxy is removed and replaced by Cilium's eBPF-based implementation,
-    # which handles ClusterIP and NodePort routing without iptables. Gateway API
-    # support is enabled so Cilium acts as a Gateway API controller. The Cilium
-    # Helm repository is registered before installation.
+    # which handles ClusterIP and NodePort routing without iptables. The following
+    # features are enabled: Gateway API controller, Hubble observability (relay
+    # and UI), and L2 announcement for LAN-reachable LoadBalancer IPs. The
+    # Cilium Helm repository is registered before installation.
     # -------------------------------------------------------------------------
     - name: Remove kube-proxy DaemonSet
       ansible.builtin.command:
@@ -337,8 +349,132 @@
           --kubeconfig {{ kubectl_config_path }}
           --set kubeProxyReplacement=true
           --set gatewayAPI.enabled=true
+          --set hubble.enabled=true
+          --set hubble.relay.enabled=true
+          --set hubble.ui.enabled=true
+          --set l2announcements.enabled=true
       when: bootstrap_node | default(false)
       changed_when: true
+
+    # -------------------------------------------------------------------------
+    # LoadBalancer IP Pool
+    # Configures a CiliumLoadBalancerIPPool, which gives Cilium a reserved CIDR
+    # on the LAN to assign external IPs to LoadBalancer services. This enables
+    # Gateway resources to receive a stable LAN IP without requiring MetalLB or
+    # a cloud provider. The pool CIDR is defined in group_vars and should not
+    # overlap with DHCP or statically assigned addresses on the network.
+    # -------------------------------------------------------------------------
+    - name: Write CiliumLoadBalancerIPPool manifest
+      ansible.builtin.template:
+        src: cilium-lb-pool.yml.j2
+        dest: /tmp/cilium-lb-pool.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply CiliumLoadBalancerIPPool
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/cilium-lb-pool.yml
+      register: lb_pool_result
+      changed_when: >-
+        'created' in lb_pool_result.stdout or
+        'configured' in lb_pool_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up CiliumLoadBalancerIPPool manifest
+      ansible.builtin.file:
+        path: /tmp/cilium-lb-pool.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # L2 Announcement Policy
+    # Creates a CiliumL2AnnouncementPolicy that instructs Cilium to announce
+    # LoadBalancer IPs on the LAN via ARP, making them reachable from other
+    # devices on the network without a dedicated load balancer. The policy
+    # targets all Linux nodes and announces on the primary network interface.
+    # -------------------------------------------------------------------------
+    - name: Write CiliumL2AnnouncementPolicy manifest
+      ansible.builtin.template:
+        src: cilium-l2-announcement.yml.j2
+        dest: /tmp/cilium-l2-announcement.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply CiliumL2AnnouncementPolicy
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/cilium-l2-announcement.yml
+      register: l2_announcement_result
+      changed_when: >-
+        'created' in l2_announcement_result.stdout or
+        'configured' in l2_announcement_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up CiliumL2AnnouncementPolicy manifest
+      ansible.builtin.file:
+        path: /tmp/cilium-l2-announcement.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Hubble UI Exposure
+    # Creates a Gateway and HTTPRoute to expose the Hubble UI over the LAN via
+    # Cilium's Gateway API controller. The Gateway provisions a LoadBalancer
+    # service that receives an IP from the homelab pool, making the UI reachable
+    # on port 80. The HTTPRoute routes all incoming requests to the hubble-ui
+    # ClusterIP service. To find the assigned IP after deployment, run:
+    #   kubectl get svc -n kube-system cilium-gateway-hubble-gateway
+    # -------------------------------------------------------------------------
+    - name: Write Hubble Gateway manifest
+      ansible.builtin.template:
+        src: hubble-gateway.yml.j2
+        dest: /tmp/hubble-gateway.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply Hubble Gateway
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/hubble-gateway.yml
+      register: hubble_gateway_result
+      changed_when: >-
+        'created' in hubble_gateway_result.stdout or
+        'configured' in hubble_gateway_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Hubble Gateway manifest
+      ansible.builtin.file:
+        path: /tmp/hubble-gateway.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write Hubble HTTPRoute manifest
+      ansible.builtin.template:
+        src: hubble-httproute.yml.j2
+        dest: /tmp/hubble-httproute.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply Hubble HTTPRoute
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/hubble-httproute.yml
+      register: hubble_httproute_result
+      changed_when: >-
+        'created' in hubble_httproute_result.stdout or
+        'configured' in hubble_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Hubble HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/hubble-httproute.yml
+        state: absent
+      when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
     # Cilium CLI Installation

@@ -40,6 +40,7 @@ Ansible Playbooks to configure Ubuntu x86_64 machines.
 3.  Create a `group_vars/homelab.yml` file for group-level variables:
 
     ```yaml
+    lb_ip_pool_cidr: <CIDR>
     router_private_ip: <ROUTER_IP>
     dropbear_port: <DROPBEAR_PORT>
     shutdown_schedule: <SHUTDOWN_SCHEDULE>
