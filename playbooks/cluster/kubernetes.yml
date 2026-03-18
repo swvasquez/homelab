@@ -6,6 +6,7 @@
 #   - Installs prerequisite packages (ca-certificates, curl, gnupg).
 #   - Adds the official Kubernetes GPG key and APT repository.
 #   - Installs kubelet, kubeadm, and kubectl.
+#   - Installs helm via official APT repository.
 #   - Places a hold on the installed packages to prevent accidental upgrades.
 #   - Disables swap, a requirement for kubelet.
 #   - Starts and enables the kubelet service.
@@ -16,6 +17,10 @@
 #                     (default: /etc/apt/keyrings/kubernetes-apt-keyring.gpg).
 #   - kube_packages:  List of Kubernetes packages to install
 #                     (default: [kubelet, kubeadm, kubectl]).
+#   - helm_keyring_path: Path to store the Helm APT GPG keyring
+#                     (default: /etc/apt/keyrings/helm.gpg).
+#   - helm_packages:  List of Helm packages to install
+#                     (default: [helm]).
 #
 
 - name: Install and configure Kubernetes
@@ -29,6 +34,9 @@
       - kubelet
       - kubeadm
       - kubectl
+    helm_keyring_path: /etc/apt/keyrings/helm.gpg
+    helm_packages:
+      - helm
   tasks:
     # -------------------------------------------------------------------------
     # Prerequisites
@@ -41,6 +49,7 @@
           - ca-certificates
           - curl
           - gnupg
+          - apt-transport-https
         state: present
         update_cache: true
 
@@ -120,3 +129,47 @@
         name: kubelet
         state: started
         enabled: true
+
+    # -------------------------------------------------------------------------
+    # Helm Installation
+    # Downloads and installs the Helm GPG key, adds the official Helm APT
+    # repository, and installs Helm.
+    # -------------------------------------------------------------------------
+    - name: Stat Helm GPG key
+      ansible.builtin.stat:
+        path: "{{ helm_keyring_path }}"
+      register: helm_keyring_stat
+
+    - name: Download and dearmor Helm GPG key
+      when: not helm_keyring_stat.stat.exists
+      block:
+        - name: Download Helm GPG key
+          ansible.builtin.get_url:
+            url: https://packages.buildkite.com/helm-linux/helm-debian/gpgkey
+            dest: /tmp/helm-gpgkey
+            mode: "0644"
+
+        - name: Dearmor Helm GPG key
+          ansible.builtin.command:
+            cmd: gpg --dearmor -o {{ helm_keyring_path }} /tmp/helm-gpgkey
+          args:
+            creates: "{{ helm_keyring_path }}"
+
+        - name: Clean up temporary Helm GPG key file
+          ansible.builtin.file:
+            path: /tmp/helm-gpgkey
+            state: absent
+
+    - name: Add Helm APT repository
+      ansible.builtin.apt_repository:
+        repo: >
+          deb [signed-by={{ helm_keyring_path }}]
+          https://packages.buildkite.com/helm-linux/helm-debian/any/ any main
+        state: present
+        filename: helm-stable-debian
+        update_cache: true
+
+    - name: Install Helm components
+      ansible.builtin.apt:
+        name: "{{ helm_packages }}"
+        state: present
