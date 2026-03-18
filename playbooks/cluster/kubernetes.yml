@@ -6,21 +6,26 @@
 #   - Installs prerequisite packages (ca-certificates, curl, gnupg).
 #   - Adds the official Kubernetes GPG key and APT repository.
 #   - Installs kubelet, kubeadm, and kubectl.
+#   - Configures the kubelet cgroup driver to match Docker (systemd).
 #   - Installs helm via official APT repository.
-#   - Places a hold on the installed packages to prevent accidental upgrades.
-#   - Disables swap, a requirement for kubelet.
+#   - Places a hold on installed packages to prevent accidental upgrades.
+#   - Disables swap (runtime and permanently via /etc/fstab), a requirement for kubelet.
+#   - Ensures time synchronization is active via chrony.
+#   - Loads required kernel modules and sets sysctl networking parameters.
+#   - Installs and enables the cri-dockerd bridge for Docker CRI compatibility.
 #   - Starts and enables the kubelet service.
 #
 # Variables:
-#   - kube_version:   Kubernetes version to install (default: v1.28).
-#   - keyring_path:   Path to store the Kubernetes APT GPG keyring
-#                     (default: /etc/apt/keyrings/kubernetes-apt-keyring.gpg).
-#   - kube_packages:  List of Kubernetes packages to install
-#                     (default: [kubelet, kubeadm, kubectl]).
-#   - helm_keyring_path: Path to store the Helm APT GPG keyring
-#                     (default: /etc/apt/keyrings/helm.gpg).
-#   - helm_packages:  List of Helm packages to install
-#                     (default: [helm]).
+#   - kube_version:        Kubernetes version to install (default: v1.28).
+#   - keyring_path:        Path to store the Kubernetes APT GPG keyring
+#                          (default: /etc/apt/keyrings/kubernetes-apt-keyring.gpg).
+#   - kube_packages:       List of Kubernetes packages to install
+#                          (default: [kubelet, kubeadm, kubectl]).
+#   - cri_dockerd_version: Version of cri-dockerd to install (default: 0.3.24).
+#   - helm_keyring_path:   Path to store the Helm APT GPG keyring
+#                          (default: /etc/apt/keyrings/helm.gpg).
+#   - helm_packages:       List of Helm packages to install
+#                          (default: [helm]).
 #
 
 - name: Install and configure Kubernetes
@@ -34,14 +39,21 @@
       - kubelet
       - kubeadm
       - kubectl
+    cri_dockerd_version: 0.3.24
     helm_keyring_path: /etc/apt/keyrings/helm.gpg
     helm_packages:
       - helm
+  
   tasks:
     # -------------------------------------------------------------------------
     # Prerequisites
-    # Installs packages needed to add the Kubernetes APT repository securely,
-    # and ensures the system keyring directory exists.
+    # Installs essential packages required to establish secure communication
+    # and key validation:
+    #   - ca-certificates: Ensures secure HTTPS connections to external repos.
+    #   - curl: Used to download GPG keys and external resources.
+    #   - gnupg: Necessary to manage and dearmor GPG keys for package validation.
+    #   - apt-transport-https: Allows APT to securely fetch packages over HTTPS.
+    # This section also prepares the standard system keyring directory.
     # -------------------------------------------------------------------------
     - name: Install prerequisite packages for Kubernetes repository
       ansible.builtin.apt:
@@ -61,8 +73,12 @@
 
     # -------------------------------------------------------------------------
     # Repository Configuration
-    # Downloads and installs the Kubernetes GPG key (de-armoring from ASCII
-    # to binary GPG format), then adds the official Kubernetes APT repository.
+    # Sets up the official Kubernetes APT repository to enable package management.
+    # It ensures authenticity by downloading and dearmoring the official
+    # Kubernetes GPG key (converting it from ASCII to a binary format readable
+    # by APT). The key is placed in the modern /etc/apt/keyrings path.
+    # Finally, the repository source list is added, allowing standard APT
+    # commands to find and install kubelet, kubeadm, and kubectl.
     # -------------------------------------------------------------------------
     - name: Stat Kubernetes GPG key
       ansible.builtin.stat:
@@ -100,8 +116,13 @@
 
     # -------------------------------------------------------------------------
     # Installation and Configuration
-    # Installs Kubernetes components, holds them to prevent accidental upgrades,
-    # disables swap (required by kubelet), and starts the kubelet service.
+    # Handles the core installation and system readiness for Kubernetes:
+    #   - Installs the primary Kubernetes components (kubelet, kubeadm, kubectl).
+    #   - Applies an 'apt-mark hold' to these packages to prevent unintentional
+    #     version upgrades during routine system updates.
+    #   - Configures kubelet to use the systemd cgroup driver, which must match
+    #     the cgroup driver used by Docker to prevent resource management conflicts.
+    #   - Starts and enables the kubelet service to ensure node availability.
     # -------------------------------------------------------------------------
     - name: Install Kubernetes components
       ansible.builtin.apt:
@@ -114,21 +135,91 @@
         selection: hold
       loop: "{{ kube_packages }}"
 
-    - name: Disable swap if active
-      ansible.builtin.command: swapon --noheadings --raw
-      register: swap_status
-      changed_when: false
-
-    - name: Turn off swap
-      ansible.builtin.command: swapoff -a
-      when: swap_status.stdout != ""
-      changed_when: true
-
     - name: Start and enable kubelet service
       ansible.builtin.systemd:
         name: kubelet
         state: started
         enabled: true
+
+    - name: Configure kubelet cgroup driver to use systemd
+      ansible.builtin.copy:
+        dest: /etc/default/kubelet
+        content: 'KUBELET_EXTRA_ARGS=--cgroup-driver=systemd'
+        mode: "0644"
+      register: kubelet_cgroup_config
+
+    - name: Restart kubelet to apply cgroup driver configuration
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+      when: kubelet_cgroup_config is changed
+  
+    # -------------------------------------------------------------------------
+    # System Configuration
+    # Configures essential kernel modules, networking parameters, and swap
+    # settings required by Kubernetes and its container runtime (CRI):
+    #   - chrony: Ensures time synchronization is active across all nodes.
+    #             Clock skew between nodes can cause certificate validation
+    #             failures and leader election issues in the cluster.
+    #   - overlay: Required by the container runtime for the overlay filesystem
+    #              (managing container image layers).
+    #   - br_netfilter: Enables transparent masquerading and facilitates VxLAN
+    #                   traffic for cross-node pod communication.
+    #   - sysctl params: Enables dual-stack (IPv4/IPv6) IP forwarding (allowing
+    #                    nodes to route pod traffic) and ensures bridged network
+    #                    traffic is processed by iptables/ip6tables for filtering.
+    #   - swap: Disabled at runtime and permanently in /etc/fstab, as kubelet
+    #           requires swap to be off for accurate memory limit enforcement.
+    # -------------------------------------------------------------------------
+    - name: Start and enable chronyd service
+      ansible.builtin.systemd:
+        name: chronyd
+        state: started
+        enabled: true
+
+    - name: Force immediate time synchronization via chrony
+      ansible.builtin.command: chronyc makestep
+      changed_when: false
+
+    - name: Persist required kernel modules
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+        mode: "0644"
+
+    - name: Ensure overlay module is loaded
+      ansible.builtin.command: modprobe overlay
+      changed_when: false
+
+    - name: Ensure br_netfilter module is loaded
+      ansible.builtin.command: modprobe br_netfilter
+      changed_when: false
+
+    - name: Set sysctl parameters for Kubernetes networking
+      ansible.posix.sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        sysctl_file: /etc/sysctl.d/k8s.conf
+        sysctl_set: true
+        state: present
+        reload: true
+      loop:
+        - { key: "net.bridge.bridge-nf-call-iptables", value: "1" }
+        - { key: "net.bridge.bridge-nf-call-ip6tables", value: "1" }
+        - { key: "net.ipv4.ip_forward", value: "1" }
+        - { key: "net.ipv6.conf.all.forwarding", value: "1" }
+
+    - name: Disable swap
+      ansible.builtin.command: swapoff -a
+      changed_when: false
+
+    - name: Permanently disable swap in /etc/fstab
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\sswap\s.*)$'
+        replace: '# \1'
 
     # -------------------------------------------------------------------------
     # CRI-Dockerd Installation
@@ -171,8 +262,11 @@
 
     # -------------------------------------------------------------------------
     # Helm Installation
-    # Downloads and installs the Helm GPG key, adds the official Helm APT
-    # repository, and installs Helm.
+    # Installs Helm, the package manager for Kubernetes.
+    # Similar to the Kubernetes repository setup, this task downloads and
+    # dearmors the official Helm GPG key, adds the dedicated Buildkite APT
+    # repository, and cleanly installs the helm package to enable efficient
+    # deployment of charts and applications to the cluster.
     # -------------------------------------------------------------------------
     - name: Stat Helm GPG key
       ansible.builtin.stat:
@@ -212,3 +306,9 @@
       ansible.builtin.apt:
         name: "{{ helm_packages }}"
         state: present
+
+    - name: Hold Helm packages from accidental upgrades
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop: "{{ helm_packages }}"

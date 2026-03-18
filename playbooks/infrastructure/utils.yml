@@ -4,6 +4,7 @@
 # to enhance shell productivity.
 #
 # This playbook installs the following packages:
+#   - chrony: A versatile NTP client and server for time synchronization.
 #   - fd-find: A simple, fast, and user-friendly alternative to 'find'.
 #   - fzf: A general-purpose command-line fuzzy finder.
 #   - jq: A lightweight and flexible command-line JSON processor.
@@ -26,6 +27,7 @@
   become_exe: sudo.ws
   vars:
     util_packages:
+      - chrony
       - fd-find
       - fzf
       - jq
