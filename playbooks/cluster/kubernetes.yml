@@ -131,6 +131,45 @@
         enabled: true
 
     # -------------------------------------------------------------------------
+    # CRI-Dockerd Installation
+    # Installs the cri-dockerd bridge, which acts as a compatibility layer
+    # between Kubernetes (which requires a CRI-compatible runtime) and Docker
+    # Engine (which natively dropped CRI support).
+    # This involves determining the current CPU architecture, fetching the
+    # specific release deb package from GitHub, installing it, and enabling
+    # the cri-dockerd systemd sockets and services to bridge the connection.
+    # -------------------------------------------------------------------------
+    - name: Get CPU architecture for cri-dockerd download
+      ansible.builtin.command: dpkg --print-architecture
+      register: dpkg_arch
+      changed_when: false
+
+    - name: Download cri-dockerd deb package
+      ansible.builtin.get_url:
+        url: https://github.com/Mirantis/cri-dockerd/releases/download/v{{ cri_dockerd_version }}/cri-dockerd_{{ cri_dockerd_version }}.3-0.ubuntu-jammy_{{ dpkg_arch.stdout }}.deb
+        dest: /tmp/cri-dockerd.deb
+        mode: "0644"
+
+    - name: Install cri-dockerd package
+      ansible.builtin.apt:
+        deb: /tmp/cri-dockerd.deb
+        state: present
+
+    - name: Clean up temporary cri-dockerd deb file
+      ansible.builtin.file:
+        path: /tmp/cri-dockerd.deb
+        state: absent
+
+    - name: Enable and start cri-dockerd services
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      loop:
+        - cri-docker.socket
+        - cri-docker.service
+
+    # -------------------------------------------------------------------------
     # Helm Installation
     # Downloads and installs the Helm GPG key, adds the official Helm APT
     # repository, and installs Helm.
