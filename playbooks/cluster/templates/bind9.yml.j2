@@ -1,0 +1,125 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bind9-config
+  namespace: '{{ bind9_namespace }}'
+data:
+  named.conf: |
+    options {
+        directory "/var/cache/bind";
+        listen-on { any; };
+        listen-on-v6 { none; };
+        allow-query { any; };
+        recursion no;
+        allow-transfer { key "externaldns-key"; };
+        dnssec-validation no;
+    };
+
+    key "externaldns-key" {
+        algorithm hmac-sha256;
+        secret "{{ bind9_tsig_secret }}";
+    };
+
+    zone "{{ dns_zone }}" IN {
+        type master;
+        file "/var/lib/bind/db.{{ dns_zone }}";
+        allow-update { key "externaldns-key"; };
+    };
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bind9-zones
+  namespace: '{{ bind9_namespace }}'
+data:
+  db.{{ dns_zone }}: |
+    $ORIGIN {{ dns_zone }}.
+    $TTL 3600
+    @   IN  SOA ns.{{ dns_zone }}. admin.{{ dns_zone }}. (
+                1       ; Serial
+                10800   ; Refresh
+                3600    ; Retry
+                604800  ; Expire
+                3600    ; Negative Cache TTL
+            )
+    @   IN  NS  ns.{{ dns_zone }}.
+    ns  IN  A   127.0.0.1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bind9
+  namespace: '{{ bind9_namespace }}'
+  labels:
+    app: bind9
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bind9
+  template:
+    metadata:
+      labels:
+        app: bind9
+    spec:
+      initContainers:
+        - name: copy-zones
+          image: busybox:1.37
+          command:
+            - sh
+            - -c
+            - cp /zones/* /var/lib/bind/
+          volumeMounts:
+            - name: zone-templates
+              mountPath: /zones
+            - name: zone-data
+              mountPath: /var/lib/bind
+      containers:
+        - name: bind9
+          image: '{{ bind9_image }}'
+          ports:
+            - containerPort: 53
+              protocol: UDP
+            - containerPort: 53
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/bind/named.conf
+              subPath: named.conf
+            - name: zone-data
+              mountPath: /var/lib/bind
+          resources:
+            limits:
+              cpu: 250m
+              memory: 256Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+      volumes:
+        - name: config
+          configMap:
+            name: bind9-config
+        - name: zone-templates
+          configMap:
+            name: bind9-zones
+        - name: zone-data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bind9
+  namespace: '{{ bind9_namespace }}'
+spec:
+  type: LoadBalancer
+  selector:
+    app: bind9
+  ports:
+    - name: dns-udp
+      port: 53
+      protocol: UDP
+      targetPort: 53
+    - name: dns-tcp
+      port: 53
+      protocol: TCP
+      targetPort: 53

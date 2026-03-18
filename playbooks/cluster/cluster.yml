@@ -22,6 +22,11 @@
 #   - Configures a Cilium LoadBalancer IP pool for LAN-accessible services.
 #   - Configures L2 announcement so LoadBalancer IPs are reachable on the LAN.
 #   - Exposes the Hubble UI over the LAN via a Gateway and HTTPRoute.
+#   - Deploys Bind9 as an authoritative DNS server for the homelab zone with
+#     its own LoadBalancer IP. Bind9 is configured with a TSIG key for
+#     RFC 2136 dynamic updates.
+#   - Deploys ExternalDNS (kubernetes-sigs Helm chart) to automatically sync DNS
+#     records from Gateway API route resources into Bind9 via RFC 2136.
 #   - Installs the Cilium CLI on all nodes for inspecting and troubleshooting.
 #
 # Node roles are determined by host variables in inventory.yml:
@@ -60,6 +65,11 @@
 #   - gateway_api_version:     Version of the Gateway API CRDs to install.
 #                              Must be compatible with the Cilium version in use
 #                              (default: 1.4.1).
+#   - dns_zone:                DNS zone served by Bind9 (e.g. homelab.lan).
+#                              Read from group_vars.
+#   - hubble_hostname:         Fully qualified hostname for the Hubble UI,
+#                              derived from dns_zone
+#                              (default: hubble.<dns_zone>).
 #   - lb_ip_pool_cidr:         CIDR block allocated for Cilium LoadBalancer IP
 #                              assignments. Should be a reserved range on the LAN
 #                              that does not overlap with DHCP or static addresses.
@@ -67,6 +77,12 @@
 #   - network_interface:       Primary network interface on each node used for
 #                              L2 announcement of LoadBalancer IPs (e.g. eth0).
 #                              Read from inventory host vars.
+#   - bind9_image:             Container image for the Bind9 DNS server
+#                              (default: internetsystemsconsortium/bind9:9.20).
+#   - bind9_namespace:         Kubernetes namespace for Bind9 and ExternalDNS
+#                              (default: kube-system).
+#   - externaldns_version:     Version of the kubernetes-sigs ExternalDNS
+#                              Helm chart (default: 1.19.0).
 #
 
 - name: Initialize Kubernetes control plane
@@ -76,9 +92,9 @@
   vars:
     cluster_name: homelab-0
     pod_network_cidr: 10.244.0.0/16
-    kubeadm_cri_socket: 'unix:///var/run/cri-dockerd.sock'
-    kubectl_config_dir: '/home/{{ ansible_user }}/.kube'
-    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    kubeadm_cri_socket: "unix:///var/run/cri-dockerd.sock"
+    kubectl_config_dir: "/home/{{ ansible_user }}/.kube"
+    kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
     fetch_kubeconfig: true
     local_kubeconfig_path: ~/.kube/config
 
@@ -98,8 +114,9 @@
             | map('extract', hostvars)
             | selectattr('bootstrap_node', 'equalto', true)
             | list | length == 1
-        fail_msg: 'Exactly one host must have bootstrap_node: true in inventory.'
+        fail_msg: "Exactly one host must have bootstrap_node: true in inventory."
       delegate_to: localhost
+      run_once: true # noqa: run-once[task]
 
     # -------------------------------------------------------------------------
     # Control Plane Initialization
@@ -119,7 +136,7 @@
       ansible.builtin.template:
         src: kubeadm-init.yml.j2
         dest: /tmp/kubeadm-init.yml
-        mode: '0600'
+        mode: "0600"
       when:
         - bootstrap_node | default(false)
         - not kubeadm_admin_conf.stat.exists
@@ -148,27 +165,27 @@
     # -------------------------------------------------------------------------
     - name: Ensure kubectl config directory exists for ansible user
       ansible.builtin.file:
-        path: '{{ kubectl_config_dir }}'
+        path: "{{ kubectl_config_dir }}"
         state: directory
-        owner: '{{ ansible_user }}'
-        group: '{{ ansible_user }}'
-        mode: '0700'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0700"
       when: bootstrap_node | default(false)
 
     - name: Copy admin kubeconfig to ansible user home directory
       ansible.builtin.copy:
         src: /etc/kubernetes/admin.conf
-        dest: '{{ kubectl_config_path }}'
-        owner: '{{ ansible_user }}'
-        group: '{{ ansible_user }}'
-        mode: '0600'
+        dest: "{{ kubectl_config_path }}"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0600"
         remote_src: true
       when: bootstrap_node | default(false)
 
     - name: Copy kubeconfig to local machine
       ansible.builtin.fetch:
         src: /etc/kubernetes/admin.conf
-        dest: '{{ local_kubeconfig_path }}'
+        dest: "{{ local_kubeconfig_path }}"
         flat: true
       when:
         - bootstrap_node | default(false)
@@ -200,10 +217,10 @@
         - bootstrap_node | default(false)
         - worker_node | default(false)
       register: taint_result
-      changed_when: '''untainted'' in taint_result.stdout'
+      changed_when: "'untainted' in taint_result.stdout"
       failed_when:
         - taint_result.rc != 0
-        - '''not found'' not in taint_result.stderr'
+        - "'not found' not in taint_result.stderr"
 
 - name: Join worker nodes to the Kubernetes cluster
   hosts: homelab
@@ -211,7 +228,7 @@
   become_exe: sudo.ws
   vars:
     # kubeadm_cri_socket is repeated from play 1 — vars do not carry across plays.
-    kubeadm_cri_socket: 'unix:///var/run/cri-dockerd.sock'
+    kubeadm_cri_socket: "unix:///var/run/cri-dockerd.sock"
     bootstrap_control_plane: >-
       {{ groups['homelab']
          | map('extract', hostvars)
@@ -246,12 +263,13 @@
         - not kubelet_conf.stat.exists
       changed_when: true
 
-- name: Install Cilium CNI
+- name: Install cluster networking and DNS
   hosts: homelab
   become: true
   become_exe: sudo.ws
   vars:
-    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
+    hubble_hostname: "hubble.{{ dns_zone }}"
     cilium_version: 1.19.1
     cilium_namespace: kube-system
     cilium_cli_version: 0.19.1
@@ -260,6 +278,9 @@
     # 1.19.1's operator expects TLSRoute at v1alpha2 and crashes on startup if
     # it is absent or unserved. Use v1.4.1 until Cilium adds v1.5.0 support.
     gateway_api_version: 1.4.1
+    bind9_image: internetsystemsconsortium/bind9:9.20
+    bind9_namespace: kube-system
+    externaldns_version: 1.19.0
 
   tasks:
     # -------------------------------------------------------------------------
@@ -283,9 +304,9 @@
 
     - name: Download Gateway API CRD manifest
       ansible.builtin.get_url:
-        url: https://github.com/kubernetes-sigs/gateway-api/releases/download/v{{ gateway_api_version }}/standard-install.yaml  # noqa: yaml[line-length]
+        url: https://github.com/kubernetes-sigs/gateway-api/releases/download/v{{ gateway_api_version }}/standard-install.yaml # noqa: yaml[line-length]
         dest: /tmp/gateway-api-install.yaml
-        mode: '0644'
+        mode: "0644"
       when:
         - bootstrap_node | default(false)
         - (gateway_crd_check.rc | default(1)) != 0
@@ -322,10 +343,10 @@
           kubectl --kubeconfig={{ kubectl_config_path }}
           delete daemonset kube-proxy -n kube-system
       register: kube_proxy_delete
-      changed_when: '''deleted'' in kube_proxy_delete.stdout'
+      changed_when: "'deleted' in kube_proxy_delete.stdout"
       failed_when:
         - kube_proxy_delete.rc != 0
-        - '''not found'' not in kube_proxy_delete.stderr'
+        - "'not found' not in kube_proxy_delete.stderr"
       when: bootstrap_node | default(false)
 
     - name: Add Cilium Helm repository
@@ -368,7 +389,7 @@
       ansible.builtin.template:
         src: cilium-lb-pool.yml.j2
         dest: /tmp/cilium-lb-pool.yml
-        mode: '0644'
+        mode: "0644"
       when: bootstrap_node | default(false)
 
     - name: Apply CiliumLoadBalancerIPPool
@@ -399,7 +420,7 @@
       ansible.builtin.template:
         src: cilium-l2-announcement.yml.j2
         dest: /tmp/cilium-l2-announcement.yml
-        mode: '0644'
+        mode: "0644"
       when: bootstrap_node | default(false)
 
     - name: Apply CiliumL2AnnouncementPolicy
@@ -432,7 +453,7 @@
       ansible.builtin.template:
         src: hubble-gateway.yml.j2
         dest: /tmp/hubble-gateway.yml
-        mode: '0644'
+        mode: "0644"
       when: bootstrap_node | default(false)
 
     - name: Apply Hubble Gateway
@@ -456,7 +477,7 @@
       ansible.builtin.template:
         src: hubble-httproute.yml.j2
         dest: /tmp/hubble-httproute.yml
-        mode: '0644'
+        mode: "0644"
       when: bootstrap_node | default(false)
 
     - name: Apply Hubble HTTPRoute
@@ -477,6 +498,154 @@
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
+    # Bind9 DNS Server
+    # Deploys Bind9 as an authoritative DNS server for the homelab zone using
+    # standard Kubernetes manifests (ConfigMap, Deployment, Service). Bind9 is
+    # configured with a TSIG key to allow ExternalDNS to dynamically create
+    # and update DNS records via RFC 2136. The Service is type LoadBalancer so
+    # Bind9 receives its own dedicated LAN IP from the Cilium IP pool.
+    #
+    # The TSIG secret is auto-generated on first run and stored in a
+    # Kubernetes Secret named bind9-tsig. On subsequent runs the existing
+    # secret is reused so DNS update credentials remain stable.
+    #
+    # To find the Bind9 LAN IP after deployment, run:
+    #   kubectl get svc -n kube-system bind9
+    #
+    # To route DNS queries for the zone to Bind9 on client machines:
+    #   macOS:
+    #     sudo mkdir -p /etc/resolver
+    #     echo 'nameserver <BIND9_IP>' | sudo tee /etc/resolver/<dns_zone>
+    #   Linux (systemd-resolved):
+    #     sudo mkdir -p /etc/systemd/resolved.conf.d
+    #     printf '[Resolve]\nDNS=<BIND9_IP>\nDomains=~<dns_zone>\n' \
+    #       | sudo tee /etc/systemd/resolved.conf.d/<dns_zone>.conf
+    #     sudo systemctl restart systemd-resolved
+    # -------------------------------------------------------------------------
+    - name: Check if Bind9 TSIG secret already exists
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret bind9-tsig -n {{ bind9_namespace }}
+          -o jsonpath='{.data.tsig-secret}'
+      register: existing_tsig_secret
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Generate TSIG secret for Bind9
+      ansible.builtin.command:
+        cmd: openssl rand -base64 32
+      register: generated_tsig_secret
+      changed_when: false
+      when:
+        - bootstrap_node | default(false)
+        - existing_tsig_secret.rc != 0
+
+    - name: Create Bind9 TSIG Kubernetes secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic bind9-tsig
+          -n {{ bind9_namespace }}
+          --from-literal=tsig-secret={{ generated_tsig_secret.stdout }}
+      when:
+        - bootstrap_node | default(false)
+        - existing_tsig_secret.rc != 0
+      changed_when: true
+
+    - name: Set TSIG secret fact from existing or newly generated value
+      ansible.builtin.set_fact:
+        bind9_tsig_secret: >-
+          {{ (existing_tsig_secret.rc == 0)
+             | ternary(existing_tsig_secret.stdout | b64decode,
+                       generated_tsig_secret.stdout) }}
+      when: bootstrap_node | default(false)
+
+    - name: Write Bind9 manifest
+      ansible.builtin.template:
+        src: bind9.yml.j2
+        dest: /tmp/bind9.yml
+        mode: "0644"
+      when: bootstrap_node | default(false)
+
+    - name: Apply Bind9 manifest
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/bind9.yml
+      register: bind9_apply_result
+      changed_when: >-
+        'created' in bind9_apply_result.stdout or
+        'configured' in bind9_apply_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Bind9 manifest
+      ansible.builtin.file:
+        path: /tmp/bind9.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Wait for Bind9 LoadBalancer IP to be assigned
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get service bind9 -n {{ bind9_namespace }}
+          -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+      register: bind9_service_ip_result
+      until: bind9_service_ip_result.stdout != ""
+      retries: 20
+      delay: 5
+      when: bootstrap_node | default(false)
+      changed_when: false
+
+    # -------------------------------------------------------------------------
+    # ExternalDNS
+    # Deploys ExternalDNS via the kubernetes-sigs Helm chart to automatically
+    # sync DNS records from Gateway API HTTPRoute resources into Bind9 using
+    # RFC 2136 dynamic updates. ExternalDNS watches for hostnames on HTTPRoute
+    # resources and creates corresponding A records in the Bind9 zone,
+    # authenticated with the same TSIG key configured in the Bind9 named.conf.
+    # -------------------------------------------------------------------------
+    - name: Add ExternalDNS Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add external-dns https://kubernetes-sigs.github.io/external-dns/
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Update Helm repositories for ExternalDNS
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Write ExternalDNS values file
+      ansible.builtin.template:
+        src: externaldns-values.yml.j2
+        dest: /tmp/externaldns-values.yml
+        mode: "0644"
+      vars:
+        bind9_service_ip: "{{ bind9_service_ip_result.stdout }}"
+      when: bootstrap_node | default(false)
+
+    - name: Install or upgrade ExternalDNS via Helm
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade --install external-dns external-dns/external-dns
+          --version {{ externaldns_version }}
+          --namespace {{ bind9_namespace }}
+          --kubeconfig {{ kubectl_config_path }}
+          -f /tmp/externaldns-values.yml
+      when: bootstrap_node | default(false)
+      changed_when: true
+
+    - name: Clean up ExternalDNS values file
+      ansible.builtin.file:
+        path: /tmp/externaldns-values.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
     # Cilium CLI Installation
     # Installs the Cilium CLI on all nodes. The CLI communicates with Cilium
     # agent pods via the Kubernetes API and provides commands for checking
@@ -493,9 +662,9 @@
 
     - name: Download Cilium CLI tarball
       ansible.builtin.get_url:
-        url: https://github.com/cilium/cilium-cli/releases/download/v{{ cilium_cli_version }}/cilium-linux-{{ dpkg_arch.stdout }}.tar.gz  # noqa: yaml[line-length]
+        url: https://github.com/cilium/cilium-cli/releases/download/v{{ cilium_cli_version }}/cilium-linux-{{ dpkg_arch.stdout }}.tar.gz # noqa: yaml[line-length]
         dest: /tmp/cilium-cli.tar.gz
-        mode: '0644'
+        mode: "0644"
 
     - name: Extract Cilium CLI binary to /usr/local/bin
       ansible.builtin.unarchive:

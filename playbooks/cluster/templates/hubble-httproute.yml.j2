@@ -7,6 +7,8 @@ spec:
   parentRefs:
     - name: hubble-gateway
       namespace: kube-system
+  hostnames:
+    - '{{ hubble_hostname }}'
   rules:
     - backendRefs:
         - name: hubble-ui
