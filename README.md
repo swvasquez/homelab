@@ -29,6 +29,9 @@ Ansible Playbooks to configure Ubuntu x86_64 machines.
               private_ip: <IP>
               network_interface: <INTERFACE>
               mac_address: <MAC>
+              control_plane: <true|false>
+              bootstrap_node: <true|false>
+              worker_node: <true|false>
               nfs_server: <true|false>
               slurm_controller: <true|false>
               slurm_compute_node: <true|false>
