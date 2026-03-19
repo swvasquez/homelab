@@ -15,6 +15,8 @@
 #   - Optionally removes the NoSchedule taint from the control plane node to
 #     allow it to also schedule workloads (when `worker_node: true` is set on
 #     the control plane host in inventory).
+#   - Installs Metrics Server via Helm on the bootstrap node to enable resource
+#     monitoring.
 #
 # Run network.yml after this playbook to install CNI, ingress, TLS, and DNS.
 # Playbook order: bootstrap.yml → network.yml → storage.yml → authentication.yml
@@ -46,6 +48,10 @@
 #   - bootstrap_control_plane: The host in the homelab group with bootstrap_node:
 #                              true. Resolved automatically from inventory — do
 #                              not set manually.
+#   - metrics_server_version:  Version of the metrics-server Helm chart to install
+#                              (default: 3.13.0).
+#   - metrics_server_ns:       Kubernetes namespace for metrics-server
+#                              (default: kube-system).
 #
 
 - name: Initialize Kubernetes control plane
@@ -224,4 +230,45 @@
         - worker_node | default(false)
         - not (control_plane | default(false))
         - not kubelet_conf.stat.exists
+      changed_when: true
+
+- name: Install cluster resource add-ons
+  hosts: homelab
+  become: true
+  become_exe: sudo.ws
+  vars:
+    kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
+    metrics_server_version: 3.13.0
+    metrics_server_ns: kube-system
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Metrics Server Installation
+    # Installs Metrics Server via Helm. Metrics Server collects resource metrics
+    # from Kubelets and exposes them via the Kubernetes Resource Metrics API
+    # for use by Horizontal Pod Autoscaler and kubectl top. The
+    # kubelet-insecure-tls argument is typically required in homelab environments
+    # because kubelet serving certificates are usually self-signed.
+    # -------------------------------------------------------------------------
+    - name: Add Metrics Server Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Update Helm repositories
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Install or upgrade Metrics Server via Helm
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade --install metrics-server metrics-server/metrics-server
+          --version {{ metrics_server_version }}
+          --namespace {{ metrics_server_ns }}
+          --kubeconfig {{ kubectl_config_path }}
+          --set "args={--kubelet-insecure-tls}"
+      when: bootstrap_node | default(false)
       changed_when: true
