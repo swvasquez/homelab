@@ -1,0 +1,227 @@
+---
+#
+# Initializes and joins nodes into a Kubernetes cluster using kubeadm.
+#
+# This playbook assumes that kubernetes.yml has already been run on all target
+# hosts (kubelet, kubeadm, kubectl, cri-dockerd, and Helm are installed and
+# configured). It performs the following actions:
+#   - Validates that exactly one bootstrap node is defined in inventory.
+#   - Initializes the control plane node using kubeadm init (idempotent via
+#     a cluster-ready check).
+#   - Configures kubectl access for the ansible user on the control plane.
+#   - Optionally fetches the kubeconfig to the machine running the playbook.
+#   - Retrieves the kubeadm join command from the control plane.
+#   - Joins all worker nodes to the cluster using the retrieved join command.
+#   - Optionally removes the NoSchedule taint from the control plane node to
+#     allow it to also schedule workloads (when `worker_node: true` is set on
+#     the control plane host in inventory).
+#
+# Run network.yml after this playbook to install CNI, ingress, TLS, and DNS.
+# Playbook order: bootstrap.yml → network.yml → storage.yml → authentication.yml
+#
+# Node roles are determined by host variables in inventory.yml:
+#   - control_plane: true  — node is a Kubernetes control plane node.
+#   - bootstrap_node: true — node runs kubeadm init to initialize the cluster.
+#                            Exactly one control plane node should have this set.
+#   - worker_node: true    — node joins the cluster as a worker. When set on the
+#                            bootstrap node, the NoSchedule taint is removed so
+#                            it can also schedule workloads.
+#
+# Variables:
+#   - cluster_name:            Name of the Kubernetes cluster, used in kubeconfig
+#                              contexts (default: homelab-0).
+#   - pod_network_cidr:        CIDR range for pod networking
+#                              (default: 10.244.0.0/16).
+#   - kubeadm_cri_socket:      CRI socket path set in the kubeadm config
+#                              (default: unix:///var/run/cri-dockerd.sock).
+#   - kubectl_config_dir:      Directory where the kubectl config is stored for
+#                              the ansible user (default: /home/<ansible_user>/.kube).
+#   - kubectl_config_path:     Full path to the kubectl config file
+#                              (default: /home/<ansible_user>/.kube/config).
+#   - fetch_kubeconfig:        When true, fetches the kubeconfig from the control
+#                              plane to the machine running the playbook
+#                              (default: true).
+#   - local_kubeconfig_path:   Destination path for the kubeconfig on the local
+#                              machine (default: ~/.kube/config).
+#   - bootstrap_control_plane: The host in the homelab group with bootstrap_node:
+#                              true. Resolved automatically from inventory — do
+#                              not set manually.
+#
+
+- name: Initialize Kubernetes control plane
+  hosts: homelab
+  become: true
+  become_exe: sudo.ws
+  vars:
+    cluster_name: homelab-0
+    pod_network_cidr: 10.244.0.0/16
+    kubeadm_cri_socket: "unix:///var/run/cri-dockerd.sock"
+    kubectl_config_dir: "/home/{{ ansible_user }}/.kube"
+    kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
+    fetch_kubeconfig: true
+    local_kubeconfig_path: ~/.kube/config
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Validation
+    # Ensures exactly one host in the inventory is designated as the bootstrap
+    # node before any cluster initialization begins. This prevents ambiguous or
+    # duplicate control plane initialization if multiple hosts are inadvertently
+    # configured with `bootstrap_node: true`.
+    # -------------------------------------------------------------------------
+    - name: Assert exactly one bootstrap node is defined in inventory
+      ansible.builtin.assert:
+        that:
+          - >-
+            groups['homelab']
+            | map('extract', hostvars)
+            | selectattr('bootstrap_node', 'equalto', true)
+            | list | length == 1
+        fail_msg: "Exactly one host must have bootstrap_node: true in inventory."
+      delegate_to: localhost
+      run_once: true # noqa: run-once[task]
+
+    # -------------------------------------------------------------------------
+    # Control Plane Initialization
+    # Initializes the Kubernetes control plane on the host marked with
+    # `bootstrap_node: true` in inventory. kubeadm init is skipped if the
+    # API server is already running (idempotency check via the presence of
+    # /etc/kubernetes/admin.conf). A kubeadm config file is written to a
+    # temporary path, used during initialization, and then removed.
+    # -------------------------------------------------------------------------
+    - name: Check if control plane is already initialized
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: kubeadm_admin_conf
+      when: bootstrap_node | default(false)
+
+    - name: Write kubeadm init config file
+      ansible.builtin.template:
+        src: kubeadm-init.yml.j2
+        dest: /tmp/kubeadm-init.yml
+        mode: "0600"
+      when:
+        - bootstrap_node | default(false)
+        - not kubeadm_admin_conf.stat.exists
+
+    - name: Initialize Kubernetes control plane with kubeadm
+      ansible.builtin.command:
+        cmd: kubeadm init --config /tmp/kubeadm-init.yml
+      when:
+        - bootstrap_node | default(false)
+        - not kubeadm_admin_conf.stat.exists
+      changed_when: true
+
+    - name: Clean up kubeadm init config file
+      ansible.builtin.file:
+        path: /tmp/kubeadm-init.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # kubectl Configuration
+    # Copies the cluster admin kubeconfig to the ansible user's home directory
+    # to enable kubectl access on the control plane. Optionally fetches the
+    # kubeconfig to the local machine running the playbook when
+    # `fetch_kubeconfig` is true. Also retrieves the kubeadm join command for
+    # use by worker nodes in the next play.
+    # -------------------------------------------------------------------------
+    - name: Ensure kubectl config directory exists for ansible user
+      ansible.builtin.file:
+        path: "{{ kubectl_config_dir }}"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0700"
+      when: bootstrap_node | default(false)
+
+    - name: Copy admin kubeconfig to ansible user home directory
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "{{ kubectl_config_path }}"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0600"
+        remote_src: true
+      when: bootstrap_node | default(false)
+
+    - name: Copy kubeconfig to local machine
+      ansible.builtin.fetch:
+        src: /etc/kubernetes/admin.conf
+        dest: "{{ local_kubeconfig_path }}"
+        flat: true
+      when:
+        - bootstrap_node | default(false)
+        - fetch_kubeconfig | default(false)
+
+    - name: Retrieve kubeadm join command from control plane
+      ansible.builtin.command:
+        cmd: kubeadm token create --print-join-command
+      register: kubeadm_join_command
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Control Plane Taint Removal (Optional)
+    # By default, kubeadm applies a NoSchedule taint to the control plane node
+    # to prevent workloads from being scheduled on it. When the control plane
+    # host also has `worker_node: true` in inventory, this taint is removed so
+    # it can also act as a worker node. This is useful in small homelab clusters
+    # where resource constraints make it impractical to dedicate a node solely
+    # to control plane duties.
+    # -------------------------------------------------------------------------
+    - name: Remove NoSchedule taint from control plane to enable worker scheduling
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          taint nodes {{ inventory_hostname }}
+          node-role.kubernetes.io/control-plane:NoSchedule-
+      when:
+        - bootstrap_node | default(false)
+        - worker_node | default(false)
+      register: taint_result
+      changed_when: "'untainted' in taint_result.stdout"
+      failed_when:
+        - taint_result.rc != 0
+        - "'not found' not in taint_result.stderr"
+
+- name: Join worker nodes to the Kubernetes cluster
+  hosts: homelab
+  become: true
+  become_exe: sudo.ws
+  vars:
+    # kubeadm_cri_socket is repeated from play 1 — vars do not carry across plays.
+    kubeadm_cri_socket: "unix:///var/run/cri-dockerd.sock"
+    bootstrap_control_plane: >-
+      {{ groups['homelab']
+         | map('extract', hostvars)
+         | selectattr('bootstrap_node', 'equalto', true)
+         | map(attribute='inventory_hostname')
+         | first }}
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Worker Node Join
+    # Joins all hosts with `worker_node: true` in inventory (excluding the
+    # control plane) to the cluster using the join command retrieved from the
+    # control plane. The join is skipped if the node has already joined
+    # (detected by the presence of /etc/kubernetes/kubelet.conf).
+    # -------------------------------------------------------------------------
+    - name: Check if node has already joined the cluster
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+      when:
+        - worker_node | default(false)
+        - not (control_plane | default(false))
+
+    - name: Join worker node to the cluster
+      ansible.builtin.command:
+        cmd: >-
+          {{ hostvars[bootstrap_control_plane].kubeadm_join_command.stdout }}
+          --cri-socket={{ kubeadm_cri_socket }}
+      when:
+        - worker_node | default(false)
+        - not (control_plane | default(false))
+        - not kubelet_conf.stat.exists
+      changed_when: true

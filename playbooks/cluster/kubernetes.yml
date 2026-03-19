@@ -152,7 +152,8 @@
         enabled: true
 
     - name: Force immediate time synchronization via chrony
-      ansible.builtin.command: chronyc makestep
+      ansible.builtin.command:
+        cmd: chronyc makestep
       changed_when: false
 
     - name: Persist required kernel modules
@@ -164,11 +165,13 @@
         mode: '0644'
 
     - name: Ensure overlay module is loaded
-      ansible.builtin.command: modprobe overlay
+      ansible.builtin.command:
+        cmd: modprobe overlay
       changed_when: false
 
     - name: Ensure br_netfilter module is loaded
-      ansible.builtin.command: modprobe br_netfilter
+      ansible.builtin.command:
+        cmd: modprobe br_netfilter
       changed_when: false
 
     - name: Set sysctl parameters for Kubernetes networking
@@ -186,7 +189,8 @@
         - {key: 'net.ipv6.conf.all.forwarding', value: '1'}
 
     - name: Disable swap at runtime
-      ansible.builtin.command: swapoff -a
+      ansible.builtin.command:
+        cmd: swapoff -a
       changed_when: false
 
     - name: Permanently disable swap in /etc/fstab
@@ -336,7 +340,7 @@
     # -------------------------------------------------------------------------
     - name: Download k9s deb package
       ansible.builtin.get_url:
-        url: https://github.com/derailed/k9s/releases/download/v{{ k9s_version }}/k9s_linux_{{ dpkg_arch.stdout }}.deb
+        url: https://github.com/derailed/k9s/releases/download/v{{ k9s_version }}/k9s_linux_{{ dpkg_arch.stdout }}.deb # noqa: yaml[line-length]
         dest: /tmp/k9s.deb
         mode: '0644'
 
