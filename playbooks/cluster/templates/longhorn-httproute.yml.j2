@@ -4,9 +4,15 @@
   port 80. HTTP traffic is redirected to HTTPS by the Traefik entrypoint redirect configured
   in traefik-values.yml.j2 — no per-route HTTP redirect is needed.
 
+  When with_forward_auth is true, the Authentik ForwardAuth middleware is applied to
+  the route, requiring authentication before the request reaches the backend. The
+  middleware must be deployed to the longhorn-system namespace before enabling this.
+
   Variables:
     longhorn_hostname:  Fully qualified hostname for the Longhorn UI (e.g. longhorn.homelab.internal).
     longhorn_namespace: Kubernetes namespace where Longhorn is deployed.
+    with_forward_auth:  When true, applies the authentik-forward-auth Middleware to the route
+                        (default: false).
 #}
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
@@ -21,6 +27,18 @@ spec:
   hostnames:
     - '{{ longhorn_hostname }}'
   rules:
+{% if with_forward_auth | default(false) %}
+    - filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: traefik.io
+            kind: Middleware
+            name: authentik-forward-auth
+      backendRefs:
+        - name: longhorn-frontend
+          port: 80
+{% else %}
     - backendRefs:
         - name: longhorn-frontend
           port: 80
+{% endif %}

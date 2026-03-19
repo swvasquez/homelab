@@ -45,6 +45,8 @@ Ansible Playbooks to configure Ubuntu x86_64 machines.
     router_private_ip: <ROUTER_IP>
     dropbear_port: <DROPBEAR_PORT>
     shutdown_schedule: <SHUTDOWN_SCHEDULE>
+    admin_email: <ADMIN_EMAIL>
+    bootstrap_admin_password: <BOOTSTRAP_ADMIN_PASSWORD>
     ```
 
 ## Directory Structure

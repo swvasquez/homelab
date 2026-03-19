@@ -99,7 +99,7 @@ spec:
           command:
             - sh
             - -c
-            - cp /zones/* /var/lib/bind/
+            - cp -n /zones/* /var/lib/bind/
           volumeMounts:
             - name: zone-templates
               mountPath: /zones

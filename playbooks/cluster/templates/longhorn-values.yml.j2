@@ -2,8 +2,8 @@
   Helm values for Longhorn storage.
 
   Variables:
-    longhorn_namespace: The Kubernetes namespace for Longhorn. Read from playbook vars.
-    longhorn_replica_count: Number of nodes in the cluster to use for replicas.
+    longhorn_replica_count: Number of volume replicas. Set dynamically to match the
+                            cluster node count at deployment time.
 #}
 defaultSettings:
   defaultDataPath: /var/lib/longhorn

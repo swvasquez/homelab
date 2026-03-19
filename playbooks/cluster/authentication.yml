@@ -2,7 +2,7 @@
 # ==============================================================================
 # Playbook: Install Authentik Authentication
 # ==============================================================================
-# This playbook deploys authentik, an open-source Identity Provider, to the
+# This playbook deploys Authentik, an open-source Identity Provider, to the
 # Kubernetes cluster via Helm. Authentik provides SSO, OAuth2/OIDC, SAML, and
 # LDAP authentication for homelab services.
 #
@@ -12,25 +12,50 @@
 # subsequent runs the existing secret is reused so credentials remain stable
 # across upgrades.
 #
-# The Authentik UI is exposed over the LAN via Gateway API HTTPRoutes attached
-# to the shared hubble-gateway. HTTPS is handled by the wildcard TLS certificate
-# provisioned by cert-manager. ExternalDNS will register the Authentik hostname
-# in Bind9 once the HTTPRoute is accepted by the Gateway.
+# The Authentik UI is exposed over HTTPS via a Gateway API HTTPRoute attached
+# to the traefik-gateway. Authentik itself is not protected by ForwardAuth —
+# it is the identity provider.
+#
+# After Authentik is deployed, a Traefik ForwardAuth Middleware is applied to
+# the kube-system and longhorn-system namespaces, and the Hubble, Traefik
+# dashboard, and Longhorn HTTPRoutes are re-applied with the middleware enabled.
+# This protects those UIs behind Authentik authentication.
 #
 # Variables:
 #   bootstrap_node:              Boolean indicating if the host is the control
 #                                plane bootstrap node where Helm commands run.
 #                                Read from inventory host vars.
-#   dns_zone:                    DNS zone (e.g. homelab.lan). Read from
+#   dns_zone:                    DNS zone (e.g. homelab.internal). Read from
 #                                group_vars.
 #   authentik_namespace:         Kubernetes namespace for Authentik
 #                                (default: authentik).
 #   authentik_version:           Helm chart version of Authentik to install
-#                                (default: 2025.6.1).
+#                                (default: 2026.2.1).
 #   authentik_hostname:          FQDN for the Authentik UI, derived from
-#                                dns_zone (default: auth.<dns_zone>).
+#                                dns_zone (default: authentik.<dns_zone>).
+#   hubble_hostname:             FQDN for the Hubble UI, derived from dns_zone
+#                                (default: hubble.<dns_zone>).
+#   traefik_namespace:           Kubernetes namespace where Traefik is deployed
+#                                (default: traefik).
+#   traefik_hostname:            FQDN for the Traefik dashboard, derived from
+#                                dns_zone (default: traefik.<dns_zone>).
+#   longhorn_namespace:          Kubernetes namespace for Longhorn
+#                                (default: longhorn-system).
+#   longhorn_hostname:           FQDN for the Longhorn UI, derived from
+#                                dns_zone (default: longhorn.<dns_zone>).
 #   kubectl_config_path:         Full path to the kubectl config file
 #                                (default: /home/<ansible_user>/.kube/config).
+#   authentik_bootstrap_token:   API token auto-generated on first run and
+#                                stored in the authentik-credentials Secret.
+#                                Used to configure Authentik via the REST API.
+#   admin_email:                 Email address for the Authentik default admin
+#                                account. Read from group_vars. Only applied on
+#                                first Authentik startup — update via the UI
+#                                after initial deployment.
+#   bootstrap_admin_password:    Initial password for the Authentik default
+#                                admin account. Read from group_vars. Only
+#                                applied on first Authentik startup — update
+#                                via the UI after initial deployment.
 
 - name: Install Authentik authentication
   hosts: homelab
@@ -40,6 +65,11 @@
     authentik_namespace: authentik
     authentik_version: 2026.2.1
     authentik_hostname: 'authentik.{{ dns_zone }}'
+    hubble_hostname: 'hubble.{{ dns_zone }}'
+    traefik_namespace: traefik
+    traefik_hostname: 'traefik.{{ dns_zone }}'
+    longhorn_namespace: longhorn-system
+    longhorn_hostname: 'longhorn.{{ dns_zone }}'
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
 
   tasks:
@@ -63,10 +93,18 @@
 
     # -------------------------------------------------------------------------
     # Credential Generation
-    # Generates a cryptographic secret key and a PostgreSQL password on first
-    # run, then persists both in a Kubernetes Secret named
-    # authentik-credentials. On subsequent runs the existing Secret is detected
-    # and reused, so credentials remain stable across upgrades.
+    # Generates a cryptographic secret key, PostgreSQL password, and API
+    # bootstrap token on first run, then persists all three in a Kubernetes
+    # Secret named authentik-credentials. On subsequent runs the existing
+    # Secret is reused so credentials remain stable across upgrades.
+    #
+    # The bootstrap token is passed to Authentik via AUTHENTIK_BOOTSTRAP_TOKEN,
+    # which creates a persistent API token in the database on first startup.
+    # This token is used later in the playbook to configure Authentik via the
+    # REST API without requiring manual UI interaction.
+    #
+    # If the secret exists but predates the bootstrap token (upgrade path), the
+    # token is generated and patched into the existing secret.
     # -------------------------------------------------------------------------
     - name: Check if Authentik credentials secret already exists
       ansible.builtin.command:
@@ -96,6 +134,15 @@
         - bootstrap_node | default(false)
         - existing_credentials_check.rc != 0
 
+    - name: Generate Authentik bootstrap token
+      ansible.builtin.command:
+        cmd: openssl rand -hex 32
+      register: generated_bootstrap_token
+      changed_when: false
+      when:
+        - bootstrap_node | default(false)
+        - existing_credentials_check.rc != 0
+
     - name: Create Authentik credentials Kubernetes secret
       ansible.builtin.command:
         cmd: >-
@@ -104,10 +151,49 @@
           -n {{ authentik_namespace }}
           --from-literal=secret-key={{ generated_secret_key.stdout }}
           --from-literal=postgresql-password={{ generated_postgres_password.stdout }}
+          --from-literal=bootstrap-token={{ generated_bootstrap_token.stdout }}
       when:
         - bootstrap_node | default(false)
         - existing_credentials_check.rc != 0
       changed_when: true
+
+    - name: Check if bootstrap token exists in Authentik credentials secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret authentik-credentials -n {{ authentik_namespace }}
+          -o jsonpath='{.data.bootstrap-token}'
+      register: existing_bootstrap_token_check
+      changed_when: false
+      failed_when: false
+      when:
+        - bootstrap_node | default(false)
+        - existing_credentials_check.rc == 0
+
+    - name: Generate Authentik bootstrap token for existing secret
+      ansible.builtin.command:
+        cmd: openssl rand -hex 32
+      register: generated_bootstrap_token_upgrade
+      changed_when: false
+      when:
+        - bootstrap_node | default(false)
+        - existing_credentials_check.rc == 0
+        - existing_bootstrap_token_check.stdout == ''
+
+    - name: Patch bootstrap token into existing Authentik credentials secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch secret authentik-credentials
+          -n {{ authentik_namespace }}
+          --type=json
+          -p='[{"op":"add","path":"/data/bootstrap-token",
+          "value":"{{ generated_bootstrap_token_upgrade.stdout | b64encode }}"}]'
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - existing_credentials_check.rc == 0
+        - existing_bootstrap_token_check.stdout == ''
 
     - name: Read Authentik secret key from Kubernetes secret
       ansible.builtin.command:
@@ -129,10 +215,21 @@
       changed_when: false
       when: bootstrap_node | default(false)
 
+    - name: Read Authentik bootstrap token from Kubernetes secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret authentik-credentials -n {{ authentik_namespace }}
+          -o jsonpath='{.data.bootstrap-token}'
+      register: authentik_bootstrap_token_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
     - name: Set Authentik credential facts
       ansible.builtin.set_fact:
         authentik_secret_key: '{{ authentik_secret_key_b64.stdout | b64decode }}'
         authentik_postgres_password: '{{ authentik_postgres_password_b64.stdout | b64decode }}'
+        authentik_bootstrap_token: '{{ authentik_bootstrap_token_b64.stdout | b64decode }}'
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
@@ -179,12 +276,181 @@
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
+    # Authentik API Configuration
+    # Configures Authentik via its REST API using the bootstrap token. Creates
+    # a single domain-level Forward Auth proxy provider covering the entire DNS
+    # zone (*.{{ dns_zone }}). With domain-level mode, one provider and one
+    # outpost configuration protect all services — no per-service Authentik
+    # changes are needed when new services are added.
+    #
+    # The provider is linked to an application and assigned to the embedded
+    # outpost. All tasks are idempotent: existing resources are detected before
+    # creation and the outpost is only patched if the provider is not already
+    # assigned.
+    #
+    # API calls are made directly to the Authentik server ClusterIP, which is
+    # reachable from cluster nodes via Cilium's eBPF kube-proxy replacement.
+    # -------------------------------------------------------------------------
+    - name: Wait for Authentik server deployment to be ready
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          rollout status deployment authentik-server
+          -n {{ authentik_namespace }}
+          --timeout=300s
+      when: bootstrap_node | default(false)
+      changed_when: false
+
+    - name: Get Authentik server ClusterIP
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get svc authentik-server -n {{ authentik_namespace }}
+          -o jsonpath='{.spec.clusterIP}'
+      register: authentik_server_clusterip
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Authentik API base URL
+      ansible.builtin.set_fact:
+        authentik_api_url: 'http://{{ authentik_server_clusterip.stdout }}/api/v3'
+      when: bootstrap_node | default(false)
+
+    - name: Get default authorization flow UUID
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/flows/instances/?slug=default-provider-authorization-implicit-consent' # noqa: yaml[line-length]
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: auth_flow_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set authorization flow UUID fact
+      ansible.builtin.set_fact:
+        authentik_auth_flow_uuid: '{{ auth_flow_result.json.results[0].pk }}'
+      when: bootstrap_node | default(false)
+
+    - name: Get default invalidation flow UUID
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/flows/instances/?slug=default-provider-invalidation-flow' # noqa: yaml[line-length]
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: invalidation_flow_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set invalidation flow UUID fact
+      ansible.builtin.set_fact:
+        authentik_invalidation_flow_uuid: '{{ invalidation_flow_result.json.results[0].pk }}'
+      when: bootstrap_node | default(false)
+
+    - name: Check if Forward Auth proxy provider already exists
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/providers/proxy/?name=homelab-forward-auth'
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: existing_provider_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Create domain-level Forward Auth proxy provider
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/providers/proxy/'
+        method: POST
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+        body_format: json
+        body:
+          name: homelab-forward-auth
+          authorization_flow: '{{ authentik_auth_flow_uuid }}'
+          invalidation_flow: '{{ authentik_invalidation_flow_uuid }}'
+          mode: forward_domain
+          external_host: 'https://{{ authentik_hostname }}'
+          cookie_domain: '{{ dns_zone }}'
+        status_code: 201
+      register: create_provider_result
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - existing_provider_result.json.pagination.count == 0
+
+    - name: Set proxy provider ID fact from existing provider
+      ansible.builtin.set_fact:
+        authentik_provider_id: '{{ existing_provider_result.json.results[0].pk }}'
+      when:
+        - bootstrap_node | default(false)
+        - existing_provider_result.json.pagination.count > 0
+
+    - name: Set proxy provider ID fact from newly created provider
+      ansible.builtin.set_fact:
+        authentik_provider_id: '{{ create_provider_result.json.pk }}'
+      when:
+        - bootstrap_node | default(false)
+        - existing_provider_result.json.pagination.count == 0
+
+    - name: Check if Forward Auth application already exists
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/core/applications/?slug=homelab-forward-auth'
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: existing_app_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Create Authentik application for Forward Auth
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/core/applications/'
+        method: POST
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+        body_format: json
+        body:
+          name: Homelab Forward Auth
+          slug: homelab-forward-auth
+          provider: '{{ authentik_provider_id }}'
+        status_code: 201
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - existing_app_result.json.pagination.count == 0
+
+    - name: Get embedded outpost
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/outposts/instances/?managed=goauthentik.io%2Foutposts%2Fembedded' # noqa: yaml[line-length]
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: outpost_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set outpost ID and current providers facts
+      ansible.builtin.set_fact:
+        authentik_outpost_id: '{{ outpost_result.json.results[0].pk }}'
+        authentik_outpost_providers: '{{ outpost_result.json.results[0].providers }}'
+      when: bootstrap_node | default(false)
+
+    - name: Assign Forward Auth provider to embedded outpost
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/outposts/instances/{{ authentik_outpost_id }}/'
+        method: PATCH
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+        body_format: json
+        body:
+          providers: '{{ (authentik_outpost_providers + [authentik_provider_id]) | unique }}'
+          config:
+            authentik_host: 'https://{{ authentik_hostname }}'
+            authentik_host_insecure: false
+        status_code: 200
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
     # UI Exposure
-    # Exposes the Authentik UI over the LAN via the shared hubble-gateway using
-    # Gateway API HTTPRoutes. HTTPS traffic is routed to the authentik-server
-    # Service on port 80. HTTP requests matching the Authentik hostname are
-    # redirected to HTTPS with a 301 status code. ExternalDNS will register the
-    # Authentik hostname in Bind9 once the HTTPRoute is accepted by the Gateway.
+    # Exposes the Authentik UI over HTTPS via an HTTPRoute attached to the
+    # traefik-gateway. Authentik itself is not protected by ForwardAuth.
+    # ExternalDNS will register the Authentik hostname in Bind9 once the
+    # HTTPRoute is accepted by the Gateway.
     # -------------------------------------------------------------------------
     - name: Write Authentik HTTPRoute manifest
       ansible.builtin.template:
@@ -196,8 +462,8 @@
     - name: Apply Authentik HTTPRoute
       ansible.builtin.command:
         cmd: >-
-          kubectl apply -f /tmp/authentik-httproute.yml
-          --kubeconfig /etc/kubernetes/admin.conf
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/authentik-httproute.yml
       register: authentik_httproute_result
       changed_when: >-
         'created' in authentik_httproute_result.stdout or
@@ -207,5 +473,150 @@
     - name: Clean up Authentik HTTPRoute manifest
       ansible.builtin.file:
         path: /tmp/authentik-httproute.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ForwardAuth Middleware
+    # Deploys the Traefik ForwardAuth Middleware to every namespace that hosts
+    # protected HTTPRoutes. Traefik requires the Middleware to be in the same
+    # namespace as the HTTPRoute that references it. The middleware forwards
+    # each incoming request to the Authentik outpost for authentication before
+    # allowing it to reach the backend service.
+    # -------------------------------------------------------------------------
+    - name: Write ForwardAuth Middleware manifest for kube-system
+      ansible.builtin.template:
+        src: traefik-forward-auth-middleware.yml.j2
+        dest: /tmp/traefik-forward-auth-middleware-kube-system.yml
+        mode: '0644'
+      vars:
+        middleware_namespace: kube-system
+      when: bootstrap_node | default(false)
+
+    - name: Apply ForwardAuth Middleware to kube-system
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/traefik-forward-auth-middleware-kube-system.yml
+      register: middleware_kube_system_result
+      changed_when: >-
+        'created' in middleware_kube_system_result.stdout or
+        'configured' in middleware_kube_system_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up ForwardAuth Middleware manifest for kube-system
+      ansible.builtin.file:
+        path: /tmp/traefik-forward-auth-middleware-kube-system.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write ForwardAuth Middleware manifest for longhorn-system
+      ansible.builtin.template:
+        src: traefik-forward-auth-middleware.yml.j2
+        dest: /tmp/traefik-forward-auth-middleware-longhorn-system.yml
+        mode: '0644'
+      vars:
+        middleware_namespace: longhorn-system
+      when: bootstrap_node | default(false)
+
+    - name: Apply ForwardAuth Middleware to longhorn-system
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/traefik-forward-auth-middleware-longhorn-system.yml
+      register: middleware_longhorn_system_result
+      changed_when: >-
+        'created' in middleware_longhorn_system_result.stdout or
+        'configured' in middleware_longhorn_system_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up ForwardAuth Middleware manifest for longhorn-system
+      ansible.builtin.file:
+        path: /tmp/traefik-forward-auth-middleware-longhorn-system.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Protected HTTPRoutes
+    # Re-applies the Hubble, Traefik dashboard, and Longhorn HTTPRoutes with
+    # the ForwardAuth middleware enabled. This replaces the unauthenticated
+    # HTTPRoutes deployed by cluster.yml and storage.yml. If authentication.yml
+    # is not run, those services remain accessible without authentication.
+    # -------------------------------------------------------------------------
+    - name: Write Hubble HTTPRoute manifest with ForwardAuth
+      ansible.builtin.template:
+        src: hubble-httproute.yml.j2
+        dest: /tmp/hubble-httproute.yml
+        mode: '0644'
+      vars:
+        with_forward_auth: true
+      when: bootstrap_node | default(false)
+
+    - name: Apply Hubble HTTPRoute with ForwardAuth
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/hubble-httproute.yml
+      register: hubble_httproute_result
+      changed_when: >-
+        'created' in hubble_httproute_result.stdout or
+        'configured' in hubble_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Hubble HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/hubble-httproute.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write Traefik dashboard HTTPRoute manifest with ForwardAuth
+      ansible.builtin.template:
+        src: traefik-dashboard-httproute.yml.j2
+        dest: /tmp/traefik-dashboard-httproute.yml
+        mode: '0644'
+      vars:
+        with_forward_auth: true
+      when: bootstrap_node | default(false)
+
+    - name: Apply Traefik dashboard HTTPRoute with ForwardAuth
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/traefik-dashboard-httproute.yml
+      register: traefik_dashboard_httproute_result
+      changed_when: >-
+        'created' in traefik_dashboard_httproute_result.stdout or
+        'configured' in traefik_dashboard_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Traefik dashboard HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/traefik-dashboard-httproute.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write Longhorn HTTPRoute manifest with ForwardAuth
+      ansible.builtin.template:
+        src: longhorn-httproute.yml.j2
+        dest: /tmp/longhorn-httproute.yml
+        mode: '0644'
+      vars:
+        with_forward_auth: true
+      when: bootstrap_node | default(false)
+
+    - name: Apply Longhorn HTTPRoute with ForwardAuth
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/longhorn-httproute.yml
+      register: longhorn_httproute_result
+      changed_when: >-
+        'created' in longhorn_httproute_result.stdout or
+        'configured' in longhorn_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Longhorn HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/longhorn-httproute.yml
         state: absent
       when: bootstrap_node | default(false)

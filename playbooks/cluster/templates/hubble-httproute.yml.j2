@@ -3,9 +3,15 @@
   traefik-gateway. Routes HTTPS traffic matching the Hubble hostname to the hubble-ui
   Service on port 80.
 
+  When with_forward_auth is true, the Authentik ForwardAuth middleware is applied to
+  the route, requiring authentication before the request reaches the backend. The
+  middleware must be deployed to the kube-system namespace before enabling this.
+
   Variables:
-    hubble_hostname: Fully qualified hostname for the Hubble UI (e.g. hubble.homelab.internal).
-                     Derived from dns_zone in cluster.yml.
+    hubble_hostname:    Fully qualified hostname for the Hubble UI (e.g. hubble.homelab.internal).
+                        Derived from dns_zone in cluster.yml.
+    with_forward_auth:  When true, applies the authentik-forward-auth Middleware to the route
+                        (default: false).
 #}
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
@@ -20,6 +26,18 @@ spec:
   hostnames:
     - '{{ hubble_hostname }}'
   rules:
+{% if with_forward_auth | default(false) %}
+    - filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: traefik.io
+            kind: Middleware
+            name: authentik-forward-auth
+      backendRefs:
+        - name: hubble-ui
+          port: 80
+{% else %}
     - backendRefs:
         - name: hubble-ui
           port: 80
+{% endif %}

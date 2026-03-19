@@ -5,17 +5,34 @@
   authentik-credentials Kubernetes Secret. PostgreSQL and Redis subcharts are
   enabled to provide persistent storage and caching within the cluster.
 
+  The bootstrap_token sets AUTHENTIK_BOOTSTRAP_TOKEN, which creates a persistent
+  API token in the Authentik database on first run. This token is used by the
+  authentication.yml playbook to configure Authentik via the REST API without
+  requiring manual UI interaction.
+
+  The bootstrap_email sets the default admin account email on first run via
+  AUTHENTIK_BOOTSTRAP_EMAIL. On subsequent runs this value is ignored by
+  Authentik if the account already exists.
+
   Variables:
-    authentik_secret_key:       Django secret key for Authentik. Read from the
-                                authentik-credentials Kubernetes Secret.
+    authentik_secret_key:        Django secret key for Authentik. Read from the
+                                 authentik-credentials Kubernetes Secret.
     authentik_postgres_password: Password for the Authentik PostgreSQL user.
-                                 Read from the authentik-credentials Kubernetes
-                                 Secret.
+                                 Read from the authentik-credentials Kubernetes Secret.
+    authentik_bootstrap_token:   API token created on first run. Read from the
+                                 authentik-credentials Kubernetes Secret.
+    admin_email:                 Email address for the default admin account.
+                                 Read from group_vars.
+    bootstrap_admin_password:    Initial password for the default admin account.
+                                 Read from group_vars.
 #}
 authentik:
   secret_key: '{{ authentik_secret_key }}'
   postgresql:
     password: '{{ authentik_postgres_password }}'
+  bootstrap_token: '{{ authentik_bootstrap_token }}'
+  bootstrap_email: '{{ admin_email }}'
+  bootstrap_password: '{{ bootstrap_admin_password }}'
 
 postgresql:
   enabled: true

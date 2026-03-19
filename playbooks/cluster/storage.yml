@@ -10,7 +10,7 @@
 #   bootstrap_node:         Boolean indicating if the host is the control plane
 #                           bootstrap node where Helm commands should execute.
 #                           Read from inventory host vars.
-#   dns_zone:               DNS zone served by Bind9 (e.g. homelab.lan).
+#   dns_zone:               DNS zone served by Bind9 (e.g. homelab.internal).
 #                           Read from group_vars.
 #   longhorn_namespace:     Kubernetes namespace for Longhorn
 #                           (default: longhorn-system).

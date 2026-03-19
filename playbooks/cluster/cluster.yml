@@ -68,7 +68,7 @@
 #   - gateway_api_version:     Version of the Gateway API CRDs to install.
 #                              Must be compatible with the Cilium version in use
 #                              (default: 1.4.1).
-#   - dns_zone:                DNS zone served by Bind9 (e.g. homelab.lan).
+#   - dns_zone:                DNS zone served by Bind9 (e.g. homelab.internal).
 #                              Read from group_vars.
 #   - hubble_hostname:         Fully qualified hostname for the Hubble UI,
 #                              derived from dns_zone

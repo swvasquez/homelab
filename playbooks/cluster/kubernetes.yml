@@ -1,5 +1,7 @@
 ---
-#
+# ==============================================================================
+# Playbook: Install and Configure Kubernetes
+# ==============================================================================
 # Installs and configures Kubernetes components (kubelet, kubeadm, kubectl).
 #
 # This playbook performs the following actions:
@@ -17,19 +19,18 @@
 #   - Installs k9s, a terminal UI for managing Kubernetes clusters.
 #
 # Variables:
-#   - kube_version:        Kubernetes version to install (default: v1.28).
-#   - keyring_path:        Path to store the Kubernetes APT GPG keyring
-#                          (default: /etc/apt/keyrings/kubernetes-apt-keyring.gpg).
-#   - kube_packages:       List of Kubernetes packages to install
-#                          (default: [kubelet, kubeadm, kubectl]).
-#   - cri_dockerd_version: Version of cri-dockerd to install (default: 0.3.24).
-#   - cri_dockerd_distro:  Ubuntu distro codename for the cri-dockerd package
-#                          (default: ubuntu-jammy).
-#   - helm_keyring_path:   Path to store the Helm APT GPG keyring
-#                          (default: /etc/apt/keyrings/helm.gpg).
-#   - helm_packages:       List of Helm packages to install (default: [helm]).
-#   - k9s_version:         Version of k9s to install (default: 0.50.18).
-#
+#   kube_version:        Kubernetes version to install (default: v1.28).
+#   keyring_path:        Path to store the Kubernetes APT GPG keyring
+#                        (default: /etc/apt/keyrings/kubernetes-apt-keyring.gpg).
+#   kube_packages:       List of Kubernetes packages to install
+#                        (default: [kubelet, kubeadm, kubectl]).
+#   cri_dockerd_version: Version of cri-dockerd to install (default: 0.3.24).
+#   cri_dockerd_distro:  Ubuntu distro codename for the cri-dockerd package
+#                        (default: ubuntu-jammy).
+#   helm_keyring_path:   Path to store the Helm APT GPG keyring
+#                        (default: /etc/apt/keyrings/helm.gpg).
+#   helm_packages:       List of Helm packages to install (default: [helm]).
+#   k9s_version:         Version of k9s to install (default: 0.50.18).
 
 - name: Install and configure Kubernetes
   hosts: homelab
