@@ -1,0 +1,54 @@
+{#
+  Defines the HTTPRoutes that expose the Authentik UI over the LAN.
+
+  Two routes are created:
+
+    authentik (HTTPS):
+      Routes HTTPS traffic from the traefik-gateway's https listener to the
+      authentik-server Service on port 80. Only accepts requests matching the
+      Authentik hostname ({{ authentik_hostname }}).
+
+    authentik-redirect (HTTP):
+      Attached to the traefik-gateway's http listener. Redirects HTTP requests
+      matching the Authentik hostname to HTTPS with a 301 status code, ensuring
+      clients are always served over TLS.
+
+  Variables:
+    authentik_hostname:  FQDN for the Authentik UI (e.g. auth.homelab.lan).
+    authentik_namespace: Kubernetes namespace where Authentik is deployed.
+#}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: authentik
+  namespace: '{{ authentik_namespace }}'
+spec:
+  parentRefs:
+    - name: traefik-gateway
+      namespace: kube-system
+      sectionName: https
+  hostnames:
+    - '{{ authentik_hostname }}'
+  rules:
+    - backendRefs:
+        - name: authentik-server
+          port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: authentik-redirect
+  namespace: '{{ authentik_namespace }}'
+spec:
+  parentRefs:
+    - name: traefik-gateway
+      namespace: kube-system
+      sectionName: http
+  hostnames:
+    - '{{ authentik_hostname }}'
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301

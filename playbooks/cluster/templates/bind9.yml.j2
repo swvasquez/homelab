@@ -1,3 +1,22 @@
+{#
+  Defines the Kubernetes resources for the Bind9 authoritative DNS server:
+    - ConfigMap (bind9-config): named.conf with TSIG key and zone configuration.
+    - ConfigMap (bind9-zones):  Initial zone file for the homelab DNS zone.
+    - PersistentVolumeClaim:    Stores zone data written by ExternalDNS across pod restarts.
+    - Deployment:               Runs the Bind9 container with an initContainer that copies
+                                the initial zone file to the PVC on first boot.
+    - Service (LoadBalancer):   Exposes Bind9 on UDP and TCP port 53 with a dedicated
+                                LAN IP from the Cilium IP pool.
+
+  Variables:
+    bind9_namespace:   Kubernetes namespace for Bind9 (e.g. kube-system).
+    bind9_image:       Container image for Bind9 (e.g. internetsystemsconsortium/bind9:9.20).
+    bind9_pvc_size:    Size of the PersistentVolumeClaim for zone data (e.g. 128Mi).
+    bind9_tsig_secret: TSIG shared secret for RFC 2136 dynamic updates. Auto-generated
+                       on first run and stored in the bind9-tsig Kubernetes Secret.
+    dns_zone:          DNS zone served by Bind9 (e.g. homelab.internal).
+                       Read from group_vars.
+#}
 apiVersion: v1
 kind: ConfigMap
 metadata:

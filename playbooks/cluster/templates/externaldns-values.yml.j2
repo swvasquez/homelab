@@ -1,3 +1,16 @@
+{#
+  Helm values for the kubernetes-sigs ExternalDNS chart. Configures ExternalDNS to
+  watch Gateway API HTTPRoute resources and sync hostnames as A records into Bind9
+  using RFC 2136 dynamic DNS updates authenticated with a TSIG key. Only upsert
+  (create/update) operations are performed — records are never deleted automatically.
+
+  Variables:
+    bind9_service_ip:  External IP of the Bind9 LoadBalancer service. Resolved at
+                       runtime after Bind9 is deployed.
+    dns_zone:          DNS zone to manage (e.g. homelab.internal). Read from group_vars.
+    bind9_tsig_secret: TSIG shared secret matching the key in Bind9's named.conf.
+                       Read from the bind9-tsig Kubernetes Secret at runtime.
+#}
 provider:
   name: rfc2136
 

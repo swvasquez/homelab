@@ -1,0 +1,28 @@
+{#
+  Helm values for the Authentik identity provider.
+
+  Configures the authentik chart with the auto-generated credentials from the
+  authentik-credentials Kubernetes Secret. PostgreSQL and Redis subcharts are
+  enabled to provide persistent storage and caching within the cluster.
+
+  Variables:
+    authentik_secret_key:       Django secret key for Authentik. Read from the
+                                authentik-credentials Kubernetes Secret.
+    authentik_postgres_password: Password for the Authentik PostgreSQL user.
+                                 Read from the authentik-credentials Kubernetes
+                                 Secret.
+#}
+authentik:
+  secret_key: '{{ authentik_secret_key }}'
+  postgresql:
+    password: '{{ authentik_postgres_password }}'
+
+postgresql:
+  enabled: true
+  auth:
+    username: authentik
+    database: authentik
+    password: '{{ authentik_postgres_password }}'
+
+redis:
+  enabled: true

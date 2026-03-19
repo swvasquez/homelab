@@ -1,0 +1,45 @@
+{#
+  Defines a Gateway API Gateway that exposes services on the homelab LAN via Traefik's
+  Gateway API controller. The Gateway provisions a LoadBalancer service that receives
+  a stable LAN IP from the Cilium IP pool.
+
+  Listeners:
+    - http  (port 8000): Accepts HTTP traffic for all hostnames in the DNS zone.
+                         Maps to Traefik's internal 'web' entrypoint. All HTTP traffic
+                         is redirected to HTTPS via the Traefik entrypoint redirect.
+                         External port 80 is mapped to 8000 by the Traefik LoadBalancer Service.
+    - https (port 8443): Terminates TLS using the wildcard certificate (wildcard-tls
+                         Secret in kube-system) and routes HTTPS traffic to backend
+                         services registered via HTTPRoutes. Maps to Traefik's internal
+                         'websecure' entrypoint. External port 443 maps to 8443.
+
+  Variables:
+    dns_zone: DNS zone served by Bind9 (e.g. homelab.lan). Read from group_vars.
+#}
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: traefik-gateway
+  namespace: kube-system
+spec:
+  gatewayClassName: traefik
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 8000
+      hostname: '*.{{ dns_zone }}'
+      allowedRoutes:
+        namespaces:
+          from: All
+
+    - name: https
+      protocol: HTTPS
+      port: 8443
+      hostname: '*.{{ dns_zone }}'
+      tls:
+        certificateRefs:
+          - name: wildcard-tls
+            namespace: kube-system
+      allowedRoutes:
+        namespaces:
+          from: All

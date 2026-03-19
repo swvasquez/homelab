@@ -1,0 +1,46 @@
+{#
+  Defines the HTTPRoute and ReferenceGrant that expose the Traefik dashboard over the LAN.
+
+  The HTTPRoute routes HTTPS traffic from the traefik-gateway's https listener to the Traefik
+  dashboard API on port 8080. Only accepts requests matching the Traefik hostname
+  ({{ traefik_hostname }}).
+
+  A ReferenceGrant is required in the traefik namespace to permit the HTTPRoute in kube-system
+  to reference the traefik Service across namespace boundaries.
+
+  Variables:
+    traefik_hostname:  Fully qualified hostname for the Traefik dashboard
+                       (e.g. traefik.homelab.internal). Derived from dns_zone.
+    traefik_namespace: Kubernetes namespace where Traefik is deployed (e.g. traefik).
+#}
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: traefik-dashboard
+  namespace: '{{ traefik_namespace }}'
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: kube-system
+  to:
+    - group: ''
+      kind: Service
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: traefik-dashboard
+  namespace: kube-system
+spec:
+  parentRefs:
+    - name: traefik-gateway
+      namespace: kube-system
+      sectionName: https
+  hostnames:
+    - '{{ traefik_hostname }}'
+  rules:
+    - backendRefs:
+        - name: traefik
+          namespace: '{{ traefik_namespace }}'
+          port: 8080

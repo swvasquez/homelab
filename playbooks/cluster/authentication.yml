@@ -1,0 +1,211 @@
+---
+# ==============================================================================
+# Playbook: Install Authentik Authentication
+# ==============================================================================
+# This playbook deploys authentik, an open-source Identity Provider, to the
+# Kubernetes cluster via Helm. Authentik provides SSO, OAuth2/OIDC, SAML, and
+# LDAP authentication for homelab services.
+#
+# Authentik includes PostgreSQL and Redis as subcharts, both enabled by default.
+# Credentials (secret key and PostgreSQL password) are auto-generated on first
+# run and stored in a Kubernetes Secret named authentik-credentials. On
+# subsequent runs the existing secret is reused so credentials remain stable
+# across upgrades.
+#
+# The Authentik UI is exposed over the LAN via Gateway API HTTPRoutes attached
+# to the shared hubble-gateway. HTTPS is handled by the wildcard TLS certificate
+# provisioned by cert-manager. ExternalDNS will register the Authentik hostname
+# in Bind9 once the HTTPRoute is accepted by the Gateway.
+#
+# Variables:
+#   bootstrap_node:              Boolean indicating if the host is the control
+#                                plane bootstrap node where Helm commands run.
+#                                Read from inventory host vars.
+#   dns_zone:                    DNS zone (e.g. homelab.lan). Read from
+#                                group_vars.
+#   authentik_namespace:         Kubernetes namespace for Authentik
+#                                (default: authentik).
+#   authentik_version:           Helm chart version of Authentik to install
+#                                (default: 2025.6.1).
+#   authentik_hostname:          FQDN for the Authentik UI, derived from
+#                                dns_zone (default: auth.<dns_zone>).
+#   kubectl_config_path:         Full path to the kubectl config file
+#                                (default: /home/<ansible_user>/.kube/config).
+
+- name: Install Authentik authentication
+  hosts: homelab
+  become: true
+  become_exe: sudo.ws
+  vars:
+    authentik_namespace: authentik
+    authentik_version: 2026.2.1
+    authentik_hostname: 'authentik.{{ dns_zone }}'
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # Namespace
+    # Creates the Authentik namespace before any other resources so that the
+    # credentials Secret can be stored there prior to the Helm install.
+    # -------------------------------------------------------------------------
+    - name: Create Authentik namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create namespace {{ authentik_namespace }}
+      register: authentik_ns_result
+      changed_when: "'created' in authentik_ns_result.stdout"
+      failed_when:
+        - authentik_ns_result.rc != 0
+        - "'already exists' not in authentik_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Credential Generation
+    # Generates a cryptographic secret key and a PostgreSQL password on first
+    # run, then persists both in a Kubernetes Secret named
+    # authentik-credentials. On subsequent runs the existing Secret is detected
+    # and reused, so credentials remain stable across upgrades.
+    # -------------------------------------------------------------------------
+    - name: Check if Authentik credentials secret already exists
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret authentik-credentials -n {{ authentik_namespace }}
+      register: existing_credentials_check
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Generate Authentik secret key
+      ansible.builtin.command:
+        cmd: openssl rand -hex 32
+      register: generated_secret_key
+      changed_when: false
+      when:
+        - bootstrap_node | default(false)
+        - existing_credentials_check.rc != 0
+
+    - name: Generate Authentik PostgreSQL password
+      ansible.builtin.command:
+        cmd: openssl rand -base64 24
+      register: generated_postgres_password
+      changed_when: false
+      when:
+        - bootstrap_node | default(false)
+        - existing_credentials_check.rc != 0
+
+    - name: Create Authentik credentials Kubernetes secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic authentik-credentials
+          -n {{ authentik_namespace }}
+          --from-literal=secret-key={{ generated_secret_key.stdout }}
+          --from-literal=postgresql-password={{ generated_postgres_password.stdout }}
+      when:
+        - bootstrap_node | default(false)
+        - existing_credentials_check.rc != 0
+      changed_when: true
+
+    - name: Read Authentik secret key from Kubernetes secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret authentik-credentials -n {{ authentik_namespace }}
+          -o jsonpath='{.data.secret-key}'
+      register: authentik_secret_key_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Read Authentik PostgreSQL password from Kubernetes secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret authentik-credentials -n {{ authentik_namespace }}
+          -o jsonpath='{.data.postgresql-password}'
+      register: authentik_postgres_password_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Authentik credential facts
+      ansible.builtin.set_fact:
+        authentik_secret_key: '{{ authentik_secret_key_b64.stdout | b64decode }}'
+        authentik_postgres_password: '{{ authentik_postgres_password_b64.stdout | b64decode }}'
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Authentik Installation
+    # Installs Authentik via Helm using the official goauthentik chart
+    # repository. PostgreSQL and Redis subcharts are enabled to provide
+    # persistent storage and caching. Credentials are injected via a values
+    # file rendered from the generated or existing Kubernetes Secret.
+    # -------------------------------------------------------------------------
+    - name: Add Authentik Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add authentik https://charts.goauthentik.io
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Update Helm repositories
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Write Authentik values file
+      ansible.builtin.template:
+        src: authentik-values.yml.j2
+        dest: /tmp/authentik-values.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Install or upgrade Authentik via Helm
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade --install authentik authentik/authentik
+          --namespace {{ authentik_namespace }}
+          --kubeconfig {{ kubectl_config_path }}
+          --values /tmp/authentik-values.yml
+          --version {{ authentik_version }}
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Authentik values file
+      ansible.builtin.file:
+        path: /tmp/authentik-values.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # UI Exposure
+    # Exposes the Authentik UI over the LAN via the shared hubble-gateway using
+    # Gateway API HTTPRoutes. HTTPS traffic is routed to the authentik-server
+    # Service on port 80. HTTP requests matching the Authentik hostname are
+    # redirected to HTTPS with a 301 status code. ExternalDNS will register the
+    # Authentik hostname in Bind9 once the HTTPRoute is accepted by the Gateway.
+    # -------------------------------------------------------------------------
+    - name: Write Authentik HTTPRoute manifest
+      ansible.builtin.template:
+        src: authentik-httproute.yml.j2
+        dest: /tmp/authentik-httproute.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply Authentik HTTPRoute
+      ansible.builtin.command:
+        cmd: >-
+          kubectl apply -f /tmp/authentik-httproute.yml
+          --kubeconfig /etc/kubernetes/admin.conf
+      register: authentik_httproute_result
+      changed_when: >-
+        'created' in authentik_httproute_result.stdout or
+        'configured' in authentik_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Authentik HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/authentik-httproute.yml
+        state: absent
+      when: bootstrap_node | default(false)

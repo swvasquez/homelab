@@ -23,8 +23,8 @@
 #   - Configures L2 announcement so LoadBalancer IPs are reachable on the LAN.
 #   - Installs cert-manager and creates a self-signed ClusterIssuer for
 #     automatic TLS certificate provisioning.
-#   - Exposes the Hubble UI over the LAN via a Gateway and HTTPRoute with
-#     self-signed HTTPS support.
+#   - Exposes the Hubble UI over the LAN via an HTTPRoute attached to the
+#     traefik-gateway with self-signed HTTPS support.
 #   - Deploys Bind9 as an authoritative DNS server for the homelab zone with
 #     its own LoadBalancer IP. Bind9 is configured with a TSIG key for
 #     RFC 2136 dynamic updates.
@@ -93,6 +93,12 @@
 #                              (default: 128Mi).
 #   - externaldns_version:     Version of the kubernetes-sigs ExternalDNS
 #                              Helm chart (default: 1.19.0).
+#   - traefik_version:         Version of the Traefik Helm chart (default: 34.4.1).
+#   - traefik_namespace:       Kubernetes namespace where Traefik is deployed
+#                              (default: traefik).
+#   - traefik_hostname:        Fully qualified hostname for the Traefik dashboard,
+#                              derived from dns_zone
+#                              (default: traefik.<dns_zone>).
 #
 
 - name: Initialize Kubernetes control plane
@@ -288,6 +294,9 @@
     # 1.19.1's operator expects TLSRoute at v1alpha2 and crashes on startup if
     # it is absent or unserved. Use v1.4.1 until Cilium adds v1.5.0 support.
     gateway_api_version: 1.4.1
+    traefik_version: 34.4.1
+    traefik_namespace: traefik
+    traefik_hostname: 'traefik.{{ dns_zone }}'
     cert_manager_version: 1.20.0
     cert_manager_namespace: cert-manager
     bind9_image: 'internetsystemsconsortium/bind9:9.20'
@@ -399,6 +408,16 @@
     # a cloud provider. The pool CIDR is defined in group_vars and should not
     # overlap with DHCP or statically assigned addresses on the network.
     # -------------------------------------------------------------------------
+    - name: Wait for Cilium DaemonSet to be ready
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          rollout status daemonset cilium
+          -n {{ cilium_namespace }}
+          --timeout=180s
+      when: bootstrap_node | default(false)
+      changed_when: false
+
     - name: Write CiliumLoadBalancerIPPool manifest
       ansible.builtin.template:
         src: cilium-lb-pool.yml.j2
@@ -451,6 +470,117 @@
     - name: Clean up CiliumL2AnnouncementPolicy manifest
       ansible.builtin.file:
         path: /tmp/cilium-l2-announcement.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Traefik Installation
+    # Installs Traefik via Helm as the L7 Gateway API controller. The Traefik
+    # Helm repository is registered and updated before installation. A values
+    # file is rendered from the traefik-values.yml.j2 template, which enables
+    # the kubernetesGateway and kubernetesCRD providers, disables the legacy
+    # kubernetesIngress provider, configures a LoadBalancer service, sets up
+    # HTTP-to-HTTPS redirect, disables the default ingressRoute dashboard, and
+    # enables access logs. The values file is removed after installation.
+    # -------------------------------------------------------------------------
+    - name: Add Traefik Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add traefik https://helm.traefik.io/traefik
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Update Helm repositories
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Write Traefik values file
+      ansible.builtin.template:
+        src: traefik-values.yml.j2
+        dest: /tmp/traefik-values.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Install or upgrade Traefik via Helm
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade --install traefik traefik/traefik
+          --namespace {{ traefik_namespace }}
+          --create-namespace
+          --kubeconfig {{ kubectl_config_path }}
+          --values /tmp/traefik-values.yml
+          --version {{ traefik_version }}
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Traefik values file
+      ansible.builtin.file:
+        path: /tmp/traefik-values.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Gateway
+    # Creates the traefik-gateway Gateway API resource in kube-system. This
+    # Gateway uses the traefik GatewayClass and provisions a LoadBalancer
+    # service that receives a LAN IP from the Cilium IP pool. It exposes an
+    # HTTP listener on port 80 and an HTTPS listener on port 443, both scoped
+    # to wildcard hostnames in the configured DNS zone. The HTTPS listener
+    # terminates TLS using the wildcard-tls certificate. HTTPRoutes from any
+    # namespace may attach to either listener.
+    # -------------------------------------------------------------------------
+    - name: Write Traefik Gateway manifest
+      ansible.builtin.template:
+        src: traefik-gateway.yml.j2
+        dest: /tmp/traefik-gateway.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply Traefik Gateway
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig={{ kubectl_config_path }} apply -f /tmp/traefik-gateway.yml
+      register: traefik_gateway_result
+      changed_when: >-
+        'created' in traefik_gateway_result.stdout or
+        'configured' in traefik_gateway_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Traefik Gateway manifest
+      ansible.builtin.file:
+        path: /tmp/traefik-gateway.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Dashboard Exposure
+    # Exposes the Traefik dashboard over HTTPS via a Gateway API HTTPRoute
+    # attached to the traefik-gateway. The HTTPRoute routes traffic matching
+    # the Traefik hostname to the dashboard service on port 8080. HTTP traffic
+    # is redirected to HTTPS by the Traefik entrypoint redirect configured in
+    # traefik-values.yml.j2.
+    # -------------------------------------------------------------------------
+    - name: Write Traefik dashboard HTTPRoute manifest
+      ansible.builtin.template:
+        src: traefik-dashboard-httproute.yml.j2
+        dest: /tmp/traefik-dashboard-httproute.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply Traefik dashboard HTTPRoute
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/traefik-dashboard-httproute.yml
+      register: traefik_dashboard_httproute_result
+      changed_when: >-
+        'created' in traefik_dashboard_httproute_result.stdout or
+        'configured' in traefik_dashboard_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Traefik dashboard HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/traefik-dashboard-httproute.yml
         state: absent
       when: bootstrap_node | default(false)
 
@@ -548,38 +678,9 @@
 
     # -------------------------------------------------------------------------
     # Hubble UI Exposure
-    # Creates a Gateway and HTTPRoute to expose the Hubble UI over the LAN via
-    # Cilium's Gateway API controller. The Gateway provisions a LoadBalancer
-    # service that receives an IP from the homelab pool. The HTTPS listener
-    # uses the wildcard TLS certificate and HTTP requests are redirected to
-    # HTTPS via a dedicated redirect HTTPRoute. To find the assigned IP after
-    # deployment, run:
-    #   kubectl get svc -n kube-system cilium-gateway-hubble-gateway
+    # Exposes the Hubble UI over the LAN via an HTTPRoute attached to the
+    # traefik-gateway. No separate Gateway is needed.
     # -------------------------------------------------------------------------
-    - name: Write Hubble Gateway manifest
-      ansible.builtin.template:
-        src: hubble-gateway.yml.j2
-        dest: /tmp/hubble-gateway.yml
-        mode: '0644'
-      when: bootstrap_node | default(false)
-
-    - name: Apply Hubble Gateway
-      ansible.builtin.command:
-        cmd: >-
-          kubectl --kubeconfig={{ kubectl_config_path }}
-          apply -f /tmp/hubble-gateway.yml
-      register: hubble_gateway_result
-      changed_when: >-
-        'created' in hubble_gateway_result.stdout or
-        'configured' in hubble_gateway_result.stdout
-      when: bootstrap_node | default(false)
-
-    - name: Clean up Hubble Gateway manifest
-      ansible.builtin.file:
-        path: /tmp/hubble-gateway.yml
-        state: absent
-      when: bootstrap_node | default(false)
-
     - name: Write Hubble HTTPRoute manifest
       ansible.builtin.template:
         src: hubble-httproute.yml.j2
@@ -666,7 +767,7 @@
         bind9_tsig_secret: >-
           {{ (existing_tsig_secret.rc == 0)
              | ternary(existing_tsig_secret.stdout | b64decode,
-                       generated_tsig_secret.stdout) }}
+                       generated_tsig_secret.stdout | default('')) }}
       when: bootstrap_node | default(false)
 
     - name: Write Bind9 manifest

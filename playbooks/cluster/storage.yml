@@ -73,7 +73,7 @@
 
     - name: Determine number of nodes in the cluster
       ansible.builtin.command:
-        cmd: kubectl get nodes --no-headers --kubeconfig /etc/kubernetes/admin.conf
+        cmd: kubectl --kubeconfig={{ kubectl_config_path }} get nodes --no-headers
       register: kubectl_get_nodes_result
       changed_when: false
       when: bootstrap_node | default(false)
@@ -110,10 +110,10 @@
 
     # -------------------------------------------------------------------------
     # UI Exposure
-    # Exposes the Longhorn UI over the LAN via the shared hubble-gateway using
-    # Gateway API HTTPRoutes. HTTPS traffic is routed to the longhorn-frontend
-    # service. HTTP requests matching the Longhorn hostname are redirected to
-    # HTTPS with a 301 status code. ExternalDNS will register the Longhorn
+    # Exposes the Longhorn UI over the LAN via an HTTPRoute attached to the
+    # traefik-gateway. HTTPS traffic matching the Longhorn hostname is routed
+    # to the longhorn-frontend service. HTTP traffic is redirected to HTTPS by
+    # the Traefik entrypoint redirect. ExternalDNS will register the Longhorn
     # hostname in Bind9 once the HTTPRoute is accepted by the Gateway.
     # -------------------------------------------------------------------------
     - name: Write Longhorn HTTPRoute manifest
@@ -125,7 +125,9 @@
 
     - name: Apply Longhorn HTTPRoute
       ansible.builtin.command:
-        cmd: kubectl apply -f /tmp/longhorn-httproute.yml --kubeconfig /etc/kubernetes/admin.conf
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/longhorn-httproute.yml
       register: longhorn_httproute_result
       changed_when: >-
         'created' in longhorn_httproute_result.stdout or

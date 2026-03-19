@@ -1,0 +1,34 @@
+{#
+  Defines a Traefik Middleware resource that enables ForwardAuth authentication via
+  Authentik's embedded outpost. When this middleware is applied to an HTTPRoute, Traefik
+  forwards each incoming request to the Authentik outpost for authentication before
+  allowing it to reach the backend service. If authentication fails, Authentik handles
+  the redirect to the login page.
+
+  The middleware is deployed into a specific namespace (middleware_namespace) so that
+  HTTPRoutes in that namespace can reference it via an ExtensionRef filter.
+
+  authResponseHeaders: A list of headers that Authentik returns and Traefik forwards
+    to the backend service, providing the backend with identity information about the
+    authenticated user.
+
+  Variables:
+    middleware_namespace: Kubernetes namespace in which to create the Middleware resource.
+                          Should match the namespace of the HTTPRoutes that reference it.
+#}
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: authentik-forward-auth
+  namespace: '{{ middleware_namespace }}'
+spec:
+  forwardAuth:
+    address: >-
+      http://authentik-server.authentik.svc.cluster.local/outpost.goauthentik.io/auth/traefik
+    trustForwardHeader: true
+    authResponseHeaders:
+      - X-authentik-username
+      - X-authentik-groups
+      - X-authentik-email
+      - X-authentik-name
+      - X-authentik-uid

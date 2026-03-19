@@ -5,7 +5,7 @@
   automatically without requiring per-resource certificate configuration.
 
   The resulting Secret (wildcard-tls) is stored in the kube-system namespace and
-  referenced by the hubble-gateway.yml.j2 HTTPS listener.
+  referenced by the traefik-gateway.yml.j2 HTTPS listener.
 
   Variables:
     dns_zone: DNS zone served by Bind9 (e.g. homelab.lan). Read from group_vars.

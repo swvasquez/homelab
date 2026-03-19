@@ -1,3 +1,12 @@
+{#
+  Defines a CiliumL2AnnouncementPolicy that instructs Cilium to announce LoadBalancer
+  IPs via ARP on the primary network interface, making them reachable from other
+  devices on the LAN without a dedicated load balancer or BGP.
+
+  Variables:
+    network_interface: Primary network interface to announce on (e.g. eth0).
+                       Read from inventory host vars.
+#}
 apiVersion: cilium.io/v2alpha1
 kind: CiliumL2AnnouncementPolicy
 metadata:

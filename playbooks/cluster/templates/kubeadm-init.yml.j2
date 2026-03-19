@@ -1,3 +1,13 @@
+{#
+  Defines the kubeadm InitConfiguration and ClusterConfiguration used to initialize
+  the Kubernetes control plane. Written to a temporary file on the bootstrap node
+  and passed to `kubeadm init --config`.
+
+  Variables:
+    kubeadm_cri_socket: CRI socket path (e.g. unix:///var/run/cri-dockerd.sock).
+    cluster_name:       Name of the Kubernetes cluster (e.g. homelab-0).
+    pod_network_cidr:   CIDR range for pod networking (e.g. 10.244.0.0/16).
+#}
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: InitConfiguration
 nodeRegistration:

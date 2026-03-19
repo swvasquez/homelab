@@ -1,20 +1,10 @@
 {#
-  Defines the HTTPRoutes that expose the Cilium Hubble UI over the LAN.
-
-  Two routes are created:
-
-    hubble-ui (HTTPS):
-      Routes HTTPS traffic from the hubble-gateway's https listener to the hubble-ui
-      Service on port 80. Only accepts requests matching the hubble hostname
-      ({{ hubble_hostname }}).
-
-    hubble-ui-redirect (HTTP):
-      Attached to the hubble-gateway's http listener. Redirects HTTP requests matching
-      the hubble hostname to HTTPS with a 301 status code, ensuring clients are always
-      served over TLS.
+  Defines the HTTPRoute that exposes the Cilium Hubble UI over the LAN via the
+  traefik-gateway. Routes HTTPS traffic matching the Hubble hostname to the hubble-ui
+  Service on port 80.
 
   Variables:
-    hubble_hostname: Fully qualified hostname for the Hubble UI (e.g. hubble.homelab.lan).
+    hubble_hostname: Fully qualified hostname for the Hubble UI (e.g. hubble.homelab.internal).
                      Derived from dns_zone in cluster.yml.
 #}
 apiVersion: gateway.networking.k8s.io/v1
@@ -24,7 +14,7 @@ metadata:
   namespace: kube-system
 spec:
   parentRefs:
-    - name: hubble-gateway
+    - name: traefik-gateway
       namespace: kube-system
       sectionName: https
   hostnames:
@@ -33,22 +23,3 @@ spec:
     - backendRefs:
         - name: hubble-ui
           port: 80
----
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-metadata:
-  name: hubble-ui-redirect
-  namespace: kube-system
-spec:
-  parentRefs:
-    - name: hubble-gateway
-      namespace: kube-system
-      sectionName: http
-  hostnames:
-    - '{{ hubble_hostname }}'
-  rules:
-    - filters:
-        - type: RequestRedirect
-          requestRedirect:
-            scheme: https
-            statusCode: 301

@@ -1,3 +1,12 @@
+{#
+  Defines a CiliumLoadBalancerIPPool that allocates a CIDR block on the LAN for
+  Cilium to assign as external IPs to LoadBalancer services. Gateway resources
+  provisioned by the traefik GatewayClass receive IPs from this pool.
+
+  Variables:
+    lb_ip_pool_cidr: CIDR block for LoadBalancer IP allocation (e.g. 192.168.0.240/28).
+                     Read from group_vars. Must not overlap with DHCP or static addresses.
+#}
 apiVersion: cilium.io/v2
 kind: CiliumLoadBalancerIPPool
 metadata:

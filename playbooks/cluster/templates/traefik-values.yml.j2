@@ -1,0 +1,54 @@
+{#
+  Helm values for Traefik ingress controller.
+
+  Configures Traefik to act as a Gateway API controller using the kubernetesGateway
+  provider. The kubernetesCRD provider is also enabled with cross-namespace access so
+  that Middleware resources defined in one namespace can be referenced by routes in
+  other namespaces. The kubernetesIngress provider is disabled as Gateway API HTTPRoutes
+  are used exclusively. A LoadBalancer service is created so Traefik receives a stable
+  LAN IP from the Cilium IP pool. HTTP traffic on port 80 is redirected to HTTPS by the
+  web entrypoint redirect. The built-in dashboard ingressRoute is disabled in favour of
+  the manually created HTTPRoute. Access logs are enabled for observability.
+
+  Variables:
+    None — this template does not require additional variables from the playbook.
+#}
+providers:
+  kubernetesGateway:
+    enabled: true
+  kubernetesCRD:
+    enabled: true
+    allowCrossNamespace: true
+    namespaces:
+      - traefik
+      - kube-system
+      - longhorn-system
+  kubernetesIngress:
+    enabled: false
+
+service:
+  type: LoadBalancer
+
+ports:
+  traefik:
+    expose:
+      default: true
+  web:
+    redirections:
+      entryPoint:
+        to: websecure
+        scheme: https
+
+
+gateway:
+  enabled: false
+
+additionalArguments:
+  - '--api.insecure=true'
+
+ingressRoute:
+  dashboard:
+    enabled: false
+
+accessLog:
+  enabled: true
