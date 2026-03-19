@@ -74,6 +74,12 @@
 #   - network_interface:       Primary network interface on each node used for
 #                              L2 announcement of LoadBalancer IPs (e.g. eth0).
 #                              Read from inventory host vars.
+#   - control_plane_ip:        IP address of the control plane node. Used to
+#                              configure Cilium's k8sServiceHost so the Cilium
+#                              init container can reach the API server directly
+#                              without relying on ClusterIP routing. Read from
+#                              inventory host vars (private_ip on the bootstrap
+#                              node).
 #
 
 - name: Install cluster networking and DNS
@@ -83,6 +89,10 @@
   vars:
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
     hubble_hostname: 'hubble.{{ dns_zone }}'
+    control_plane_ip: >-
+      {{ groups["homelab"] | map("extract", hostvars)
+         | selectattr("bootstrap_node", "equalto", true)
+         | map(attribute="private_ip") | first }}
     cilium_version: 1.19.1
     cilium_namespace: kube-system
     cilium_cli_version: 0.19.1
@@ -188,6 +198,8 @@
           --namespace {{ cilium_namespace }}
           --kubeconfig {{ kubectl_config_path }}
           --set kubeProxyReplacement=true
+          --set k8sServiceHost={{ control_plane_ip }}
+          --set k8sServicePort=6443
           --set gatewayAPI.enabled=true
           --set hubble.enabled=true
           --set hubble.relay.enabled=true
