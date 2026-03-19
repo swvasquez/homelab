@@ -1,0 +1,139 @@
+---
+# ==============================================================================
+# Playbook: Install Longhorn Storage
+# ==============================================================================
+# This playbook installs the dependencies required for Longhorn distributed
+# block storage across all nodes, and then deploys Longhorn via Helm on the
+# bootstrap node. It provides cluster-persistent storage for Kubernetes.
+#
+# Variables:
+#   bootstrap_node:         Boolean indicating if the host is the control plane
+#                           bootstrap node where Helm commands should execute.
+#                           Read from inventory host vars.
+#   dns_zone:               DNS zone served by Bind9 (e.g. homelab.lan).
+#                           Read from group_vars.
+#   longhorn_namespace:     Kubernetes namespace for Longhorn
+#                           (default: longhorn-system).
+#   longhorn_version:       Helm chart version of Longhorn to install
+#                           (default: 1.8.0).
+#   longhorn_replica_count: Number of volume replicas. Overridden at runtime
+#                           to match the actual cluster node count
+#                           (default: 3).
+#   longhorn_hostname:      Fully qualified hostname for the Longhorn UI,
+#                           derived from dns_zone
+#                           (default: longhorn.<dns_zone>).
+#   kubectl_config_path:    Full path to the kubectl config file
+#                           (default: /home/<ansible_user>/.kube/config).
+
+- name: Install Longhorn storage
+  hosts: homelab
+  become: true
+  become_exe: sudo.ws
+  vars:
+    longhorn_namespace: longhorn-system
+    longhorn_version: 1.8.0
+    longhorn_replica_count: 3
+    longhorn_hostname: 'longhorn.{{ dns_zone }}'
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Dependencies
+    # Installs the packages required by Longhorn on every node in the cluster.
+    # open-iscsi provides the iSCSI initiator used for block storage transport
+    # between Longhorn components. nfs-common enables NFS mounts, which
+    # Longhorn uses for ReadWriteMany volume access mode support.
+    # -------------------------------------------------------------------------
+    - name: Install Longhorn dependencies via package manager
+      ansible.builtin.apt:
+        name:
+          - open-iscsi
+          - nfs-common
+        state: present
+        update_cache: true
+
+    # -------------------------------------------------------------------------
+    # Longhorn Installation
+    # Installs Longhorn via Helm on the bootstrap node. The replica count is
+    # determined dynamically from the current cluster node count so the default
+    # replication factor matches available capacity. The Longhorn Helm
+    # repository is registered before installation.
+    # -------------------------------------------------------------------------
+    - name: Add Longhorn Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add longhorn https://charts.longhorn.io
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Update Helm repositories
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Determine number of nodes in the cluster
+      ansible.builtin.command:
+        cmd: kubectl get nodes --no-headers --kubeconfig /etc/kubernetes/admin.conf
+      register: kubectl_get_nodes_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set longhorn replica count fact based on cluster node count
+      ansible.builtin.set_fact:
+        longhorn_replica_count: '{{ kubectl_get_nodes_result.stdout_lines | length }}'
+      when: bootstrap_node | default(false)
+
+    - name: Write Longhorn values file
+      ansible.builtin.template:
+        src: longhorn-values.yml.j2
+        dest: /tmp/longhorn-values.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Install or upgrade Longhorn via Helm
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade --install longhorn longhorn/longhorn
+          --namespace {{ longhorn_namespace }}
+          --create-namespace
+          --kubeconfig {{ kubectl_config_path }}
+          --values /tmp/longhorn-values.yml
+          --version {{ longhorn_version }}
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Longhorn values file
+      ansible.builtin.file:
+        path: /tmp/longhorn-values.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # UI Exposure
+    # Exposes the Longhorn UI over the LAN via the shared hubble-gateway using
+    # Gateway API HTTPRoutes. HTTPS traffic is routed to the longhorn-frontend
+    # service. HTTP requests matching the Longhorn hostname are redirected to
+    # HTTPS with a 301 status code. ExternalDNS will register the Longhorn
+    # hostname in Bind9 once the HTTPRoute is accepted by the Gateway.
+    # -------------------------------------------------------------------------
+    - name: Write Longhorn HTTPRoute manifest
+      ansible.builtin.template:
+        src: longhorn-httproute.yml.j2
+        dest: /tmp/longhorn-httproute.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply Longhorn HTTPRoute
+      ansible.builtin.command:
+        cmd: kubectl apply -f /tmp/longhorn-httproute.yml --kubeconfig /etc/kubernetes/admin.conf
+      register: longhorn_httproute_result
+      changed_when: >-
+        'created' in longhorn_httproute_result.stdout or
+        'configured' in longhorn_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Longhorn HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/longhorn-httproute.yml
+        state: absent
+      when: bootstrap_node | default(false)

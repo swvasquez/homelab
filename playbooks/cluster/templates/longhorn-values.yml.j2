@@ -1,0 +1,15 @@
+{#
+  Helm values for Longhorn storage.
+
+  Variables:
+    longhorn_namespace: The Kubernetes namespace for Longhorn. Read from playbook vars.
+    longhorn_replica_count: Number of nodes in the cluster to use for replicas.
+#}
+defaultSettings:
+  defaultDataPath: /var/lib/longhorn
+  storageReservedPercentageForDefaultDisk: 30
+  storageMinimalAvailablePercentage: 25
+  storageOverProvisioningPercentage: 100
+persistence:
+  defaultClassReplicaCount: {{ longhorn_replica_count }}
+  defaultClass: true

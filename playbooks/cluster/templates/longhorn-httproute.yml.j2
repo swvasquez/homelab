@@ -1,0 +1,53 @@
+{#
+  Defines the HTTPRoutes that expose the Longhorn UI over the LAN.
+
+  Two routes are created:
+
+    longhorn-ui (HTTPS):
+      Routes HTTPS traffic from the hubble-gateway's https listener to the longhorn-frontend
+      Service on port 80. Only accepts requests matching the longhorn hostname
+      ({{ longhorn_hostname }}).
+
+    longhorn-ui-redirect (HTTP):
+      Attached to the hubble-gateway's http listener. Redirects HTTP requests
+      matching the longhorn hostname to HTTPS with a 301 status code, ensuring
+      clients are always served over TLS.
+
+  Variables:
+    longhorn_hostname: Fully qualified hostname for the Longhorn UI (e.g. longhorn.homelab.lan).
+#}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: longhorn-ui
+  namespace: '{{ longhorn_namespace }}'
+spec:
+  parentRefs:
+    - name: hubble-gateway
+      namespace: kube-system
+      sectionName: https
+  hostnames:
+    - '{{ longhorn_hostname }}'
+  rules:
+    - backendRefs:
+        - name: longhorn-frontend
+          port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: longhorn-ui-redirect
+  namespace: '{{ longhorn_namespace }}'
+spec:
+  parentRefs:
+    - name: hubble-gateway
+      namespace: kube-system
+      sectionName: http
+  hostnames:
+    - '{{ longhorn_hostname }}'
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301

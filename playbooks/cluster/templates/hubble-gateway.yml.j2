@@ -6,6 +6,7 @@
   Listeners:
     - http  (port 80):  Accepts HTTP traffic. Used exclusively by the HTTP-to-HTTPS
                         redirect HTTPRoute so that plain HTTP requests are upgraded.
+                        The hostname is a workaround for cilium/cilium#44123 — see TODO.md.
     - https (port 443): Terminates TLS using the wildcard certificate (wildcard-tls
                         Secret in kube-system) and routes HTTPS traffic to backend
                         services registered via HTTPRoutes attached to this listener.
@@ -27,6 +28,10 @@ spec:
     - name: http
       protocol: HTTP
       port: 80
+      hostname: '*.{{ dns_zone }}'
+      allowedRoutes:
+        namespaces:
+          from: All
     - name: https
       protocol: HTTPS
       port: 443
@@ -35,3 +40,6 @@ spec:
         mode: Terminate
         certificateRefs:
           - name: wildcard-tls
+      allowedRoutes:
+        namespaces:
+          from: All

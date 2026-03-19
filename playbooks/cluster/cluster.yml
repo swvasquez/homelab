@@ -88,6 +88,9 @@
 #                              (default: internetsystemsconsortium/bind9:9.20).
 #   - bind9_namespace:         Kubernetes namespace for Bind9 and ExternalDNS
 #                              (default: kube-system).
+#   - bind9_pvc_size:          Size of the PersistentVolumeClaim used to store
+#                              Bind9 zone data across pod restarts
+#                              (default: 128Mi).
 #   - externaldns_version:     Version of the kubernetes-sigs ExternalDNS
 #                              Helm chart (default: 1.19.0).
 #
@@ -289,6 +292,7 @@
     cert_manager_namespace: cert-manager
     bind9_image: 'internetsystemsconsortium/bind9:9.20'
     bind9_namespace: kube-system
+    bind9_pvc_size: 128Mi
     externaldns_version: 1.19.0
 
   tasks:

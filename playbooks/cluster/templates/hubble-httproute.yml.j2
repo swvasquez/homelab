@@ -9,8 +9,9 @@
       ({{ hubble_hostname }}).
 
     hubble-ui-redirect (HTTP):
-      Attached to the hubble-gateway's http listener. Redirects all HTTP requests
-      to HTTPS with a 301 status code, ensuring clients are always served over TLS.
+      Attached to the hubble-gateway's http listener. Redirects HTTP requests matching
+      the hubble hostname to HTTPS with a 301 status code, ensuring clients are always
+      served over TLS.
 
   Variables:
     hubble_hostname: Fully qualified hostname for the Hubble UI (e.g. hubble.homelab.lan).
@@ -43,6 +44,8 @@ spec:
     - name: hubble-gateway
       namespace: kube-system
       sectionName: http
+  hostnames:
+    - '{{ hubble_hostname }}'
   rules:
     - filters:
         - type: RequestRedirect
