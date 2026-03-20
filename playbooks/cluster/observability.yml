@@ -1,0 +1,245 @@
+---
+# ==============================================================================
+# Playbook: Install Prometheus Observability Stack
+# ==============================================================================
+# This playbook deploys the kube-prometheus-stack Helm chart to the Kubernetes
+# cluster, providing Prometheus for metrics collection, Alertmanager for alert
+# routing, and Grafana for visualization and dashboards.
+#
+# Grafana admin credentials are auto-generated on first run and stored in a
+# Kubernetes Secret named grafana-credentials in the observability namespace. On
+# subsequent runs the existing secret is reused so credentials remain stable
+# across upgrades.
+#
+# Each component UI is exposed over HTTPS via a Gateway API HTTPRoute attached
+# to the traefik-gateway. ExternalDNS registers the hostnames in Bind9 once the
+# HTTPRoutes are accepted. The HTTPRoutes include optional ForwardAuth support
+# so authentication.yml can protect them behind Authentik by re-applying the
+# templates with with_forward_auth: true.
+#
+# Variables:
+#   bootstrap_node:          Boolean indicating if the host is the control
+#                            plane bootstrap node where Helm commands run.
+#                            Read from inventory host vars.
+#   dns_zone:                DNS zone (e.g. homelab.internal). Read from
+#                            group_vars.
+#   observability_namespace: Kubernetes namespace for the observability stack
+#                            (default: observability).
+#   prometheus_version:      Helm chart version of kube-prometheus-stack to
+#                            install (default: 70.4.2).
+#   prometheus_hostname:     FQDN for the Prometheus UI, derived from dns_zone
+#                            (default: prometheus.<dns_zone>).
+#   grafana_hostname:        FQDN for the Grafana UI, derived from dns_zone
+#                            (default: grafana.<dns_zone>).
+#   alertmanager_hostname:   FQDN for the Alertmanager UI, derived from
+#                            dns_zone (default: alertmanager.<dns_zone>).
+#   kubectl_config_path:     Full path to the kubectl config file
+#                            (default: /home/<ansible_user>/.kube/config).
+
+- name: Install Prometheus observability stack
+  hosts: homelab
+  become: true
+  become_exe: sudo.ws
+  vars:
+    observability_namespace: observability
+    prometheus_version: 70.4.2
+    prometheus_hostname: 'prometheus.{{ dns_zone }}'
+    grafana_hostname: 'grafana.{{ dns_zone }}'
+    alertmanager_hostname: 'alertmanager.{{ dns_zone }}'
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # Namespace
+    # Creates the observability namespace before any other resources so that the
+    # Grafana credentials Secret can be stored there prior to the Helm install.
+    # -------------------------------------------------------------------------
+    - name: Create observability namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create namespace {{ observability_namespace }}
+      register: observability_ns_result
+      changed_when: "'created' in observability_ns_result.stdout"
+      failed_when:
+        - observability_ns_result.rc != 0
+        - "'already exists' not in observability_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Grafana Credentials
+    # Generates a Grafana admin password on first run and persists it in a
+    # Kubernetes Secret named grafana-credentials. On subsequent runs the
+    # existing Secret is reused so credentials remain stable across upgrades.
+    # -------------------------------------------------------------------------
+    - name: Check if Grafana credentials secret already exists
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret grafana-credentials -n {{ observability_namespace }}
+      register: existing_grafana_credentials_check
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Generate Grafana admin password
+      ansible.builtin.command:
+        cmd: openssl rand -base64 24
+      register: generated_grafana_password
+      changed_when: false
+      when:
+        - bootstrap_node | default(false)
+        - existing_grafana_credentials_check.rc != 0
+
+    - name: Create Grafana credentials Kubernetes secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic grafana-credentials
+          -n {{ observability_namespace }}
+          --from-literal=admin-password={{ generated_grafana_password.stdout }}
+      when:
+        - bootstrap_node | default(false)
+        - existing_grafana_credentials_check.rc != 0
+      changed_when: true
+
+    - name: Read Grafana admin password from Kubernetes secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret grafana-credentials -n {{ observability_namespace }}
+          -o jsonpath='{.data.admin-password}'
+      register: grafana_password_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Grafana admin password fact
+      ansible.builtin.set_fact:
+        grafana_admin_password: '{{ grafana_password_b64.stdout | b64decode }}'
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # kube-prometheus-stack Installation
+    # Installs kube-prometheus-stack via Helm, deploying Prometheus,
+    # Alertmanager, Grafana, node-exporter, kube-state-metrics, and a default
+    # set of recording rules and alert rules. Grafana admin credentials are
+    # injected via the values file rendered from the grafana-credentials Secret.
+    # Native Ingress is disabled for all components — UIs are exposed via
+    # Gateway API HTTPRoutes instead.
+    # -------------------------------------------------------------------------
+    - name: Add Prometheus community Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Update Helm repositories
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Write kube-prometheus-stack values file
+      ansible.builtin.template:
+        src: prometheus-values.yml.j2
+        dest: /tmp/prometheus-values.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Install or upgrade kube-prometheus-stack via Helm
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade --install kube-prometheus-stack
+          prometheus-community/kube-prometheus-stack
+          --namespace {{ observability_namespace }}
+          --kubeconfig {{ kubectl_config_path }}
+          --values /tmp/prometheus-values.yml
+          --version {{ prometheus_version }}
+          --timeout 10m
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Clean up kube-prometheus-stack values file
+      ansible.builtin.file:
+        path: /tmp/prometheus-values.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # UI Exposure
+    # Exposes Prometheus, Grafana, and Alertmanager over HTTPS via Gateway API
+    # HTTPRoutes attached to the traefik-gateway. ExternalDNS registers each
+    # hostname in Bind9 once the HTTPRoutes are accepted by the Gateway.
+    # -------------------------------------------------------------------------
+    - name: Write Prometheus HTTPRoute manifest
+      ansible.builtin.template:
+        src: prometheus-httproute.yml.j2
+        dest: /tmp/prometheus-httproute.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply Prometheus HTTPRoute
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/prometheus-httproute.yml
+      register: prometheus_httproute_result
+      changed_when: >-
+        'created' in prometheus_httproute_result.stdout or
+        'configured' in prometheus_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Prometheus HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/prometheus-httproute.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write Grafana HTTPRoute manifest
+      ansible.builtin.template:
+        src: grafana-httproute.yml.j2
+        dest: /tmp/grafana-httproute.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply Grafana HTTPRoute
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/grafana-httproute.yml
+      register: grafana_httproute_result
+      changed_when: >-
+        'created' in grafana_httproute_result.stdout or
+        'configured' in grafana_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Grafana HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/grafana-httproute.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write Alertmanager HTTPRoute manifest
+      ansible.builtin.template:
+        src: alertmanager-httproute.yml.j2
+        dest: /tmp/alertmanager-httproute.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply Alertmanager HTTPRoute
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/alertmanager-httproute.yml
+      register: alertmanager_httproute_result
+      changed_when: >-
+        'created' in alertmanager_httproute_result.stdout or
+        'configured' in alertmanager_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Alertmanager HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/alertmanager-httproute.yml
+        state: absent
+      when: bootstrap_node | default(false)

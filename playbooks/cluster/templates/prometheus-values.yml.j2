@@ -1,0 +1,35 @@
+{#
+  Helm values for kube-prometheus-stack. Configures Prometheus, Grafana, and
+  Alertmanager with Grafana admin credentials sourced from the grafana-credentials
+  Kubernetes Secret. Native Ingress is disabled for all three components — UIs
+  are exposed via Gateway API HTTPRoutes defined in the observability playbook.
+
+  Prometheus is configured to discover ServiceMonitors across all namespaces.
+  Grafana's root_url is set to the HTTPS hostname so that redirect links and
+  OAuth callbacks resolve correctly.
+
+  Variables:
+    grafana_hostname:       FQDN for the Grafana UI (e.g. grafana.homelab.internal).
+    grafana_admin_password: Grafana admin password read from the grafana-credentials
+                            Kubernetes Secret.
+#}
+grafana:
+  adminUser: admin
+  adminPassword: '{{ grafana_admin_password }}'
+  ingress:
+    enabled: false
+  grafana.ini:
+    server:
+      root_url: 'https://{{ grafana_hostname }}'
+
+prometheus:
+  ingress:
+    enabled: false
+  prometheusSpec:
+    retention: 30d
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+
+alertmanager:
+  ingress:
+    enabled: false

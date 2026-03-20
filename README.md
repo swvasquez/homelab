@@ -1,6 +1,6 @@
 # Homelab
 
-Ansible Playbooks to configure Ubuntu x86_64 machines.
+Ansible Playbooks to configure Ubuntu x86_64 machines and manage a Kubernetes homelab cluster.
 
 > This code was generated with AI assistance.
 
@@ -77,7 +77,7 @@ just install infrastructure docker
 or
 
 ```sh
-just install cluster kubernetes homelab
+just install cluster observability homelab
 ```
 
 ### Verify Connectivity

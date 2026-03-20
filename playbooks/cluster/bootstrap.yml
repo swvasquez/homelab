@@ -19,7 +19,7 @@
 #     monitoring.
 #
 # Run network.yml after this playbook to install CNI, ingress, TLS, and DNS.
-# Playbook order: bootstrap.yml → network.yml → storage.yml → authentication.yml
+# Playbook order: bootstrap.yml → network.yml → storage.yml → observability.yml → authentication.yml
 #
 # Node roles are determined by host variables in inventory.yml:
 #   - control_plane: true  — node is a Kubernetes control plane node.

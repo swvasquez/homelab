@@ -11,7 +11,10 @@
   the manually created HTTPRoute. Access logs are enabled for observability.
 
   Variables:
-    None — this template does not require additional variables from the playbook.
+    None — this template does not use Jinja variables. The kubernetesCRD
+    namespaces allowlist (traefik, kube-system, longhorn-system, observability)
+    is hardcoded. Add to this list when deploying services in new namespaces
+    that use ExtensionRef middleware filters in their HTTPRoutes.
 #}
 providers:
   kubernetesGateway:
@@ -23,6 +26,7 @@ providers:
       - traefik
       - kube-system
       - longhorn-system
+      - observability
   kubernetesIngress:
     enabled: false
 
