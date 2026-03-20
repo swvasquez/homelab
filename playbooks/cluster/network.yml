@@ -289,8 +289,12 @@
     # file is rendered from the traefik-values.yml.j2 template, which enables
     # the kubernetesGateway and kubernetesCRD providers, disables the legacy
     # kubernetesIngress provider, configures a LoadBalancer service, sets up
-    # HTTP-to-HTTPS redirect, disables the default ingressRoute dashboard, and
-    # enables access logs. The values file is removed after installation.
+    # HTTP-to-HTTPS redirect, and disables the default ingressRoute dashboard.
+    # After Helm install, a JSON patch (traefik-readiness-patch.json.j2) replaces
+    # the default httpGet readiness probe with a custom exec probe that verifies
+    # the kubernetesCRD provider has completed its initial sync before the pod
+    # accepts traffic. The Traefik chart hardcodes httpGet in its template, so
+    # the probe must be replaced via kubectl patch rather than Helm values.
     # -------------------------------------------------------------------------
     - name: Add Traefik Helm repository
       ansible.builtin.command:
@@ -326,6 +330,30 @@
     - name: Clean up Traefik values file
       ansible.builtin.file:
         path: /tmp/traefik-values.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write Traefik readiness probe patch
+      ansible.builtin.template:
+        src: traefik-readiness-patch.json.j2
+        dest: /tmp/traefik-readiness-patch.json
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Patch Traefik deployment readiness probe
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch deployment traefik
+          -n {{ traefik_namespace }}
+          --type=json
+          --patch-file /tmp/traefik-readiness-patch.json
+      when: bootstrap_node | default(false)
+      changed_when: true
+
+    - name: Clean up Traefik readiness probe patch file
+      ansible.builtin.file:
+        path: /tmp/traefik-readiness-patch.json
         state: absent
       when: bootstrap_node | default(false)
 

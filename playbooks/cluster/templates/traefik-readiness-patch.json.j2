@@ -1,0 +1,45 @@
+{#
+  JSON Patch (RFC 6902) that replaces the Traefik deployment readiness probe with a
+  custom exec handler. The Traefik Helm chart hardcodes an httpGet probe in its
+  template, so setting readinessProbe values alone would produce a deployment with both
+  httpGet and exec handlers, which Kubernetes rejects. This patch is applied after the
+  Helm install to replace the probe entirely.
+
+  The exec command calls the Traefik API (/api/rawdata) and verifies that the
+  kubernetesCRD provider has finished its initial sync before the pod is marked ready.
+  Kubernetes will not route traffic to the pod until the probe passes, preventing the
+  startup race window where the kubernetesGateway provider processes HTTPRoutes before
+  the kubernetesCRD provider has loaded Middleware objects.
+
+  Probe logic:
+    1. If the Traefik API is unreachable — not ready.
+    2. If no @kubernetescrd references exist anywhere (fresh install, no Middleware
+       objects deployed yet) — ready (no middleware to wait for).
+    3. If @kubernetescrd middleware objects appear as top-level keys in the API
+       response (i.e. the pattern @kubernetescrd": is present) — ready.
+    4. Otherwise (@kubernetescrd references exist in routes but no objects are loaded
+       yet) — not ready.
+
+  Variables:
+    None — this template does not use Jinja variables.
+#}
+[
+  {
+    "op": "replace",
+    "path": "/spec/template/spec/containers/0/readinessProbe",
+    "value": {
+      "exec": {
+        "command": [
+          "sh",
+          "-c",
+          "DATA=$(wget -qO- http://localhost:8080/api/rawdata 2>/dev/null) || exit 1; echo \"$DATA\" | grep -qF @kubernetescrd || exit 0; echo \"$DATA\" | grep -qF '@kubernetescrd\":' && exit 0; exit 1"
+        ]
+      },
+      "initialDelaySeconds": 5,
+      "periodSeconds": 5,
+      "failureThreshold": 6,
+      "successThreshold": 1,
+      "timeoutSeconds": 3
+    }
+  }
+]
