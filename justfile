@@ -6,10 +6,10 @@ venv:
     uv pip install ansible-dev-tools pre-commit
 
 # Lint Ansible playbooks using ansible-lint
-lint:
+lint target="playbooks":
     #!/usr/bin/env sh
     set -euxo pipefail
-    uv run ansible-lint playbooks
+    uv run ansible-lint {{ target }}
 
 # Verify that a subset of machines are reachable via Ansible
 ping subset="homelab":

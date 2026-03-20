@@ -90,10 +90,16 @@ just ping <SUBSET>
 
 ### Linting
 
-To lint the playbooks:
+To lint all playbooks, or optionally a specific playbook or directory:
 
 ```sh
-just lint
+just lint [TARGET]
+```
+
+**Example:**
+
+```sh
+just lint playbooks/cluster/bootstrap.yml
 ```
 
 ## Notes
