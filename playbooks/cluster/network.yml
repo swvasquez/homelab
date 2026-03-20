@@ -1,9 +1,11 @@
 ---
-#
+# ==============================================================================
+# Playbook: Install Cluster Networking and DNS
+# ==============================================================================
 # Installs cluster networking, ingress, TLS, and DNS components onto a Kubernetes
-# cluster that has already been bootstrapped by cluster.yml.
+# cluster that has already been bootstrapped by bootstrap.yml.
 #
-# This playbook assumes that cluster.yml has already been run and the cluster is
+# This playbook assumes that bootstrap.yml has already been run and the cluster is
 # fully operational. It performs the following actions:
 #   - Installs the Kubernetes Gateway API CRDs required by Cilium.
 #   - Removes kube-proxy and installs Cilium as the CNI plugin via Helm, with
@@ -27,68 +29,67 @@
 #   - Installs the Cilium CLI on all nodes for inspecting and troubleshooting.
 #
 # Node roles are determined by host variables in inventory.yml:
-#   - bootstrap_node: true — node runs cluster management commands (kubectl,
-#                            helm). Exactly one control plane node should have
-#                            this set.
+#   bootstrap_node: true — node runs cluster management commands (kubectl,
+#                          helm). Exactly one control plane node should have
+#                          this set.
 #
 # Variables:
-#   - kubectl_config_path:     Full path to the kubectl config file
-#                              (default: /home/<ansible_user>/.kube/config).
-#   - cilium_version:          Version of Cilium to install via Helm
-#                              (default: 1.19.1).
-#   - cilium_namespace:        Kubernetes namespace for the Cilium installation
-#                              (default: kube-system).
-#   - cilium_cli_version:      Version of the Cilium CLI to install
-#                              (default: 0.19.1).
-#   - gateway_api_version:     Version of the Gateway API CRDs to install.
-#                              Must be compatible with the Cilium version in use
-#                              (default: 1.4.1).
-#   - traefik_version:         Version of the Traefik Helm chart (default: 34.4.1).
-#   - traefik_namespace:       Kubernetes namespace where Traefik is deployed
-#                              (default: traefik).
-#   - traefik_hostname:        Fully qualified hostname for the Traefik dashboard,
-#                              derived from dns_zone
-#                              (default: traefik.<dns_zone>).
-#   - cert_manager_version:    Version of the cert-manager Helm chart
-#                              (default: 1.20.0).
-#   - cert_manager_namespace:  Kubernetes namespace for cert-manager
-#                              (default: cert-manager).
-#   - hubble_hostname:         Fully qualified hostname for the Hubble UI,
-#                              derived from dns_zone
-#                              (default: hubble.<dns_zone>).
-#   - bind9_image:             Container image for the Bind9 DNS server
-#                              (default: internetsystemsconsortium/bind9:9.20).
-#   - bind9_namespace:         Kubernetes namespace for Bind9 and ExternalDNS
-#                              (default: kube-system).
-#   - bind9_pvc_size:          Size of the PersistentVolumeClaim used to store
-#                              Bind9 zone data across pod restarts
-#                              (default: 128Mi).
-#   - externaldns_version:     Version of the kubernetes-sigs ExternalDNS
-#                              Helm chart (default: 1.19.0).
-#   - dns_zone:                DNS zone served by Bind9 (e.g. homelab.internal).
-#                              Read from group_vars.
-#   - lb_ip_pool_cidr:         CIDR block allocated for Cilium LoadBalancer IP
-#                              assignments. Should be a reserved range on the LAN
-#                              that does not overlap with DHCP or static addresses.
-#                              Read from group_vars.
-#   - network_interface:       Primary network interface on each node used for
-#                              L2 announcement of LoadBalancer IPs (e.g. eth0).
-#                              Read from inventory host vars.
-#   - control_plane_ip:        IP address of the control plane node. Used to
-#                              configure Cilium's k8sServiceHost so the Cilium
-#                              init container can reach the API server directly
-#                              without relying on ClusterIP routing. Read from
-#                              inventory host vars (private_ip on the bootstrap
-#                              node).
-#
+#   kubectl_config_path:     Full path to the kubectl config file
+#                            (default: /home/<ansible_user>/.kube/config).
+#   cilium_version:          Version of Cilium to install via Helm
+#                            (default: 1.19.1).
+#   cilium_namespace:        Kubernetes namespace for the Cilium installation
+#                            (default: kube-system).
+#   cilium_cli_version:      Version of the Cilium CLI to install
+#                            (default: 0.19.1).
+#   gateway_api_version:     Version of the Gateway API CRDs to install.
+#                            Must be compatible with the Cilium version in use
+#                            (default: 1.4.1).
+#   traefik_version:         Version of the Traefik Helm chart (default: 34.4.1).
+#   traefik_namespace:       Kubernetes namespace where Traefik is deployed
+#                            (default: traefik).
+#   traefik_hostname:        Fully qualified hostname for the Traefik dashboard,
+#                            derived from dns_zone
+#                            (default: traefik.<dns_zone>).
+#   cert_manager_version:    Version of the cert-manager Helm chart
+#                            (default: 1.20.0).
+#   cert_manager_namespace:  Kubernetes namespace for cert-manager
+#                            (default: cert-manager).
+#   hubble_hostname:         Fully qualified hostname for the Hubble UI,
+#                            derived from dns_zone
+#                            (default: hubble.<dns_zone>).
+#   bind9_image:             Container image for the Bind9 DNS server
+#                            (default: internetsystemsconsortium/bind9:9.20).
+#   bind9_namespace:         Kubernetes namespace for Bind9 and ExternalDNS
+#                            (default: kube-system).
+#   bind9_pvc_size:          Size of the PersistentVolumeClaim used to store
+#                            Bind9 zone data across pod restarts
+#                            (default: 128Mi).
+#   externaldns_version:     Version of the kubernetes-sigs ExternalDNS
+#                            Helm chart (default: 1.19.0).
+#   dns_zone:                DNS zone served by Bind9 (e.g. homelab.internal).
+#                            Read from group_vars.
+#   lb_ip_pool_cidr:         CIDR block allocated for Cilium LoadBalancer IP
+#                            assignments. Should be a reserved range on the LAN
+#                            that does not overlap with DHCP or static addresses.
+#                            Read from group_vars.
+#   network_interface:       Primary network interface on each node used for
+#                            L2 announcement of LoadBalancer IPs (e.g. eth0).
+#                            Read from inventory host vars.
+#   control_plane_ip:        IP address of the control plane node. Used to
+#                            configure Cilium's k8sServiceHost so the Cilium
+#                            init container can reach the API server directly
+#                            without relying on ClusterIP routing. Read from
+#                            inventory host vars (private_ip on the bootstrap
+#                            node).
 
 - name: Install cluster networking and DNS
   hosts: homelab
   become: true
   become_exe: sudo.ws
   vars:
-    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
-    hubble_hostname: 'hubble.{{ dns_zone }}'
+    kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
+    hubble_hostname: "hubble.{{ dns_zone }}"
     control_plane_ip: >-
       {{ groups["homelab"] | map("extract", hostvars)
          | selectattr("bootstrap_node", "equalto", true)
@@ -103,10 +104,10 @@
     gateway_api_version: 1.4.1
     traefik_version: 34.4.1
     traefik_namespace: traefik
-    traefik_hostname: 'traefik.{{ dns_zone }}'
+    traefik_hostname: "traefik.{{ dns_zone }}"
     cert_manager_version: 1.20.0
     cert_manager_namespace: cert-manager
-    bind9_image: 'internetsystemsconsortium/bind9:9.20'
+    bind9_image: "internetsystemsconsortium/bind9:9.20"
     bind9_namespace: kube-system
     bind9_pvc_size: 128Mi
     externaldns_version: 1.19.0
@@ -135,7 +136,7 @@
       ansible.builtin.get_url:
         url: https://github.com/kubernetes-sigs/gateway-api/releases/download/v{{ gateway_api_version }}/standard-install.yaml # noqa: yaml[line-length]
         dest: /tmp/gateway-api-install.yaml
-        mode: '0644'
+        mode: "0644"
       when:
         - bootstrap_node | default(false)
         - (gateway_crd_check.rc | default(1)) != 0
@@ -231,7 +232,7 @@
       ansible.builtin.template:
         src: cilium-lb-pool.yml.j2
         dest: /tmp/cilium-lb-pool.yml
-        mode: '0644'
+        mode: "0644"
       when: bootstrap_node | default(false)
 
     - name: Apply CiliumLoadBalancerIPPool
@@ -262,7 +263,7 @@
       ansible.builtin.template:
         src: cilium-l2-announcement.yml.j2
         dest: /tmp/cilium-l2-announcement.yml
-        mode: '0644'
+        mode: "0644"
       when: bootstrap_node | default(false)
 
     - name: Apply CiliumL2AnnouncementPolicy
@@ -312,7 +313,7 @@
       ansible.builtin.template:
         src: traefik-values.yml.j2
         dest: /tmp/traefik-values.yml
-        mode: '0644'
+        mode: "0644"
       when: bootstrap_node | default(false)
 
     - name: Install or upgrade Traefik via Helm
@@ -337,7 +338,7 @@
       ansible.builtin.template:
         src: traefik-readiness-patch.json.j2
         dest: /tmp/traefik-readiness-patch.json
-        mode: '0644'
+        mode: "0644"
       when: bootstrap_node | default(false)
 
     - name: Patch Traefik deployment readiness probe
@@ -371,7 +372,7 @@
       ansible.builtin.template:
         src: traefik-gateway.yml.j2
         dest: /tmp/traefik-gateway.yml
-        mode: '0644'
+        mode: "0644"
       when: bootstrap_node | default(false)
 
     - name: Apply Traefik Gateway
@@ -399,9 +400,16 @@
     # -------------------------------------------------------------------------
     - name: Write Traefik dashboard HTTPRoute manifest
       ansible.builtin.template:
-        src: traefik-dashboard-httproute.yml.j2
+        src: httproute.yml.j2
         dest: /tmp/traefik-dashboard-httproute.yml
-        mode: '0644'
+        mode: "0644"
+      vars:
+        httproute_name: traefik-dashboard
+        httproute_namespace: kube-system
+        httproute_hostname: "{{ traefik_hostname }}"
+        httproute_backend_name: traefik
+        httproute_backend_namespace: "{{ traefik_namespace }}"
+        httproute_backend_port: 8080
       when: bootstrap_node | default(false)
 
     - name: Apply Traefik dashboard HTTPRoute
@@ -469,7 +477,7 @@
       ansible.builtin.template:
         src: cert-manager-clusterissuer.yml.j2
         dest: /tmp/cert-manager-clusterissuer.yml
-        mode: '0644'
+        mode: "0644"
       when: bootstrap_node | default(false)
 
     - name: Apply self-signed ClusterIssuer
@@ -493,7 +501,7 @@
       ansible.builtin.template:
         src: cert-manager-wildcard-cert.yml.j2
         dest: /tmp/cert-manager-wildcard-cert.yml
-        mode: '0644'
+        mode: "0644"
       when: bootstrap_node | default(false)
 
     - name: Apply wildcard TLS Certificate
@@ -520,9 +528,16 @@
     # -------------------------------------------------------------------------
     - name: Write Hubble HTTPRoute manifest
       ansible.builtin.template:
-        src: hubble-httproute.yml.j2
+        src: httproute.yml.j2
         dest: /tmp/hubble-httproute.yml
-        mode: '0644'
+        mode: "0644"
+      vars:
+        httproute_name: hubble-ui
+        httproute_namespace: kube-system
+        httproute_hostname: "{{ hubble_hostname }}"
+        httproute_backend_name: hubble-ui
+        httproute_backend_namespace: kube-system
+        httproute_backend_port: 80
       when: bootstrap_node | default(false)
 
     - name: Apply Hubble HTTPRoute
@@ -611,7 +626,7 @@
       ansible.builtin.template:
         src: bind9.yml.j2
         dest: /tmp/bind9.yml
-        mode: '0644'
+        mode: "0644"
       when: bootstrap_node | default(false)
 
     - name: Apply Bind9 manifest
@@ -668,7 +683,7 @@
       ansible.builtin.template:
         src: externaldns-values.yml.j2
         dest: /tmp/externaldns-values.yml
-        mode: '0644'
+        mode: "0644"
       vars:
         bind9_service_ip: "{{ bind9_service_ip_result.stdout }}"
       when: bootstrap_node | default(false)
@@ -709,7 +724,7 @@
       ansible.builtin.get_url:
         url: https://github.com/cilium/cilium-cli/releases/download/v{{ cilium_cli_version }}/cilium-linux-{{ dpkg_arch.stdout }}.tar.gz # noqa: yaml[line-length]
         dest: /tmp/cilium-cli.tar.gz
-        mode: '0644'
+        mode: "0644"
 
     - name: Extract Cilium CLI binary to /usr/local/bin
       ansible.builtin.unarchive:

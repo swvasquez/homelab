@@ -33,8 +33,11 @@
 #                            (default: grafana.<dns_zone>).
 #   alertmanager_hostname:   FQDN for the Alertmanager UI, derived from
 #                            dns_zone (default: alertmanager.<dns_zone>).
-#   kubectl_config_path:     Full path to the kubectl config file
-#                            (default: /home/<ansible_user>/.kube/config).
+#   kubectl_config_path:          Full path to the kubectl config file
+#                                 (default: /home/<ansible_user>/.kube/config).
+#   observability_httproutes:     List of HTTPRoute definitions for Prometheus,
+#                                 Grafana, and Alertmanager. Derived from the
+#                                 hostname variables above — do not set manually.
 
 - name: Install Prometheus observability stack
   hosts: homelab
@@ -43,13 +46,25 @@
   vars:
     observability_namespace: observability
     prometheus_version: 70.4.2
-    prometheus_hostname: 'prometheus.{{ dns_zone }}'
-    grafana_hostname: 'grafana.{{ dns_zone }}'
-    alertmanager_hostname: 'alertmanager.{{ dns_zone }}'
-    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    prometheus_hostname: "prometheus.{{ dns_zone }}"
+    grafana_hostname: "grafana.{{ dns_zone }}"
+    alertmanager_hostname: "alertmanager.{{ dns_zone }}"
+    kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
+    observability_httproutes:
+      - name: prometheus
+        hostname: "{{ prometheus_hostname }}"
+        backend_name: kube-prometheus-stack-prometheus
+        backend_port: 9090
+      - name: grafana
+        hostname: "{{ grafana_hostname }}"
+        backend_name: kube-prometheus-stack-grafana
+        backend_port: 80
+      - name: alertmanager
+        hostname: "{{ alertmanager_hostname }}"
+        backend_name: kube-prometheus-stack-alertmanager
+        backend_port: 9093
 
   tasks:
-
     # -------------------------------------------------------------------------
     # Namespace
     # Creates the observability namespace before any other resources so that the
@@ -116,7 +131,7 @@
 
     - name: Set Grafana admin password fact
       ansible.builtin.set_fact:
-        grafana_admin_password: '{{ grafana_password_b64.stdout | b64decode }}'
+        grafana_admin_password: "{{ grafana_password_b64.stdout | b64decode }}"
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
@@ -144,7 +159,7 @@
       ansible.builtin.template:
         src: prometheus-values.yml.j2
         dest: /tmp/prometheus-values.yml
-        mode: '0600'
+        mode: "0600"
       when: bootstrap_node | default(false)
 
     - name: Install or upgrade kube-prometheus-stack via Helm
@@ -172,74 +187,36 @@
     # HTTPRoutes attached to the traefik-gateway. ExternalDNS registers each
     # hostname in Bind9 once the HTTPRoutes are accepted by the Gateway.
     # -------------------------------------------------------------------------
-    - name: Write Prometheus HTTPRoute manifest
+    - name: Write observability HTTPRoute manifests
       ansible.builtin.template:
-        src: prometheus-httproute.yml.j2
-        dest: /tmp/prometheus-httproute.yml
-        mode: '0644'
+        src: httproute.yml.j2
+        dest: /tmp/{{ item.name }}-httproute.yml
+        mode: "0644"
+      vars:
+        httproute_name: "{{ item.name }}"
+        httproute_namespace: "{{ observability_namespace }}"
+        httproute_hostname: "{{ item.hostname }}"
+        httproute_backend_name: "{{ item.backend_name }}"
+        httproute_backend_namespace: "{{ observability_namespace }}"
+        httproute_backend_port: "{{ item.backend_port }}"
+      loop: "{{ observability_httproutes }}"
       when: bootstrap_node | default(false)
 
-    - name: Apply Prometheus HTTPRoute
+    - name: Apply observability HTTPRoutes
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
-          apply -f /tmp/prometheus-httproute.yml
-      register: prometheus_httproute_result
+          apply -f /tmp/{{ item.name }}-httproute.yml
+      register: observability_httproute_result
       changed_when: >-
-        'created' in prometheus_httproute_result.stdout or
-        'configured' in prometheus_httproute_result.stdout
+        'created' in observability_httproute_result.stdout or
+        'configured' in observability_httproute_result.stdout
+      loop: "{{ observability_httproutes }}"
       when: bootstrap_node | default(false)
 
-    - name: Clean up Prometheus HTTPRoute manifest
+    - name: Clean up observability HTTPRoute manifests
       ansible.builtin.file:
-        path: /tmp/prometheus-httproute.yml
+        path: /tmp/{{ item.name }}-httproute.yml
         state: absent
-      when: bootstrap_node | default(false)
-
-    - name: Write Grafana HTTPRoute manifest
-      ansible.builtin.template:
-        src: grafana-httproute.yml.j2
-        dest: /tmp/grafana-httproute.yml
-        mode: '0644'
-      when: bootstrap_node | default(false)
-
-    - name: Apply Grafana HTTPRoute
-      ansible.builtin.command:
-        cmd: >-
-          kubectl --kubeconfig={{ kubectl_config_path }}
-          apply -f /tmp/grafana-httproute.yml
-      register: grafana_httproute_result
-      changed_when: >-
-        'created' in grafana_httproute_result.stdout or
-        'configured' in grafana_httproute_result.stdout
-      when: bootstrap_node | default(false)
-
-    - name: Clean up Grafana HTTPRoute manifest
-      ansible.builtin.file:
-        path: /tmp/grafana-httproute.yml
-        state: absent
-      when: bootstrap_node | default(false)
-
-    - name: Write Alertmanager HTTPRoute manifest
-      ansible.builtin.template:
-        src: alertmanager-httproute.yml.j2
-        dest: /tmp/alertmanager-httproute.yml
-        mode: '0644'
-      when: bootstrap_node | default(false)
-
-    - name: Apply Alertmanager HTTPRoute
-      ansible.builtin.command:
-        cmd: >-
-          kubectl --kubeconfig={{ kubectl_config_path }}
-          apply -f /tmp/alertmanager-httproute.yml
-      register: alertmanager_httproute_result
-      changed_when: >-
-        'created' in alertmanager_httproute_result.stdout or
-        'configured' in alertmanager_httproute_result.stdout
-      when: bootstrap_node | default(false)
-
-    - name: Clean up Alertmanager HTTPRoute manifest
-      ansible.builtin.file:
-        path: /tmp/alertmanager-httproute.yml
-        state: absent
+      loop: "{{ observability_httproutes }}"
       when: bootstrap_node | default(false)

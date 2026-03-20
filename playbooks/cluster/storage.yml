@@ -33,8 +33,8 @@
     longhorn_namespace: longhorn-system
     longhorn_version: 1.8.0
     longhorn_replica_count: 3
-    longhorn_hostname: 'longhorn.{{ dns_zone }}'
-    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    longhorn_hostname: "longhorn.{{ dns_zone }}"
+    kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
 
   tasks:
     # -------------------------------------------------------------------------
@@ -80,14 +80,14 @@
 
     - name: Set longhorn replica count fact based on cluster node count
       ansible.builtin.set_fact:
-        longhorn_replica_count: '{{ kubectl_get_nodes_result.stdout_lines | length }}'
+        longhorn_replica_count: "{{ kubectl_get_nodes_result.stdout_lines | length }}"
       when: bootstrap_node | default(false)
 
     - name: Write Longhorn values file
       ansible.builtin.template:
         src: longhorn-values.yml.j2
         dest: /tmp/longhorn-values.yml
-        mode: '0644'
+        mode: "0644"
       when: bootstrap_node | default(false)
 
     - name: Install or upgrade Longhorn via Helm
@@ -118,9 +118,16 @@
     # -------------------------------------------------------------------------
     - name: Write Longhorn HTTPRoute manifest
       ansible.builtin.template:
-        src: longhorn-httproute.yml.j2
+        src: httproute.yml.j2
         dest: /tmp/longhorn-httproute.yml
-        mode: '0644'
+        mode: "0644"
+      vars:
+        httproute_name: longhorn-ui
+        httproute_namespace: "{{ longhorn_namespace }}"
+        httproute_hostname: "{{ longhorn_hostname }}"
+        httproute_backend_name: longhorn-frontend
+        httproute_backend_namespace: "{{ longhorn_namespace }}"
+        httproute_backend_port: 80
       when: bootstrap_node | default(false)
 
     - name: Apply Longhorn HTTPRoute

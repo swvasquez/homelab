@@ -1,5 +1,7 @@
 ---
-#
+# ==============================================================================
+# Playbook: Bootstrap Kubernetes Cluster
+# ==============================================================================
 # Initializes and joins nodes into a Kubernetes cluster using kubeadm.
 #
 # This playbook assumes that kubernetes.yml has already been run on all target
@@ -22,37 +24,36 @@
 # Playbook order: bootstrap.yml → network.yml → storage.yml → observability.yml → authentication.yml
 #
 # Node roles are determined by host variables in inventory.yml:
-#   - control_plane: true  — node is a Kubernetes control plane node.
-#   - bootstrap_node: true — node runs kubeadm init to initialize the cluster.
-#                            Exactly one control plane node should have this set.
-#   - worker_node: true    — node joins the cluster as a worker. When set on the
-#                            bootstrap node, the NoSchedule taint is removed so
-#                            it can also schedule workloads.
+#   control_plane: true  — node is a Kubernetes control plane node.
+#   bootstrap_node: true — node runs kubeadm init to initialize the cluster.
+#                          Exactly one control plane node should have this set.
+#   worker_node: true    — node joins the cluster as a worker. When set on the
+#                          bootstrap node, the NoSchedule taint is removed so
+#                          it can also schedule workloads.
 #
 # Variables:
-#   - cluster_name:            Name of the Kubernetes cluster, used in kubeconfig
-#                              contexts (default: homelab-0).
-#   - pod_network_cidr:        CIDR range for pod networking
-#                              (default: 10.244.0.0/16).
-#   - kubeadm_cri_socket:      CRI socket path set in the kubeadm config
-#                              (default: unix:///var/run/cri-dockerd.sock).
-#   - kubectl_config_dir:      Directory where the kubectl config is stored for
-#                              the ansible user (default: /home/<ansible_user>/.kube).
-#   - kubectl_config_path:     Full path to the kubectl config file
-#                              (default: /home/<ansible_user>/.kube/config).
-#   - fetch_kubeconfig:        When true, fetches the kubeconfig from the control
-#                              plane to the machine running the playbook
-#                              (default: true).
-#   - local_kubeconfig_path:   Destination path for the kubeconfig on the local
-#                              machine (default: ~/.kube/config).
-#   - bootstrap_control_plane: The host in the homelab group with bootstrap_node:
-#                              true. Resolved automatically from inventory — do
-#                              not set manually.
-#   - metrics_server_version:  Version of the metrics-server Helm chart to install
-#                              (default: 3.13.0).
-#   - metrics_server_ns:       Kubernetes namespace for metrics-server
-#                              (default: kube-system).
-#
+#   cluster_name:            Name of the Kubernetes cluster, used in kubeconfig
+#                            contexts (default: homelab-0).
+#   pod_network_cidr:        CIDR range for pod networking
+#                            (default: 10.244.0.0/16).
+#   kubeadm_cri_socket:      CRI socket path set in the kubeadm config
+#                            (default: unix:///var/run/cri-dockerd.sock).
+#   kubectl_config_dir:      Directory where the kubectl config is stored for
+#                            the ansible user (default: /home/<ansible_user>/.kube).
+#   kubectl_config_path:     Full path to the kubectl config file
+#                            (default: /home/<ansible_user>/.kube/config).
+#   fetch_kubeconfig:        When true, fetches the kubeconfig from the control
+#                            plane to the machine running the playbook
+#                            (default: true).
+#   local_kubeconfig_path:   Destination path for the kubeconfig on the local
+#                            machine (default: ~/.kube/config).
+#   bootstrap_control_plane: The host in the homelab group with bootstrap_node:
+#                            true. Resolved automatically from inventory — do
+#                            not set manually.
+#   metrics_server_version:  Version of the metrics-server Helm chart to install
+#                            (default: 3.13.0).
+#   metrics_server_ns:       Kubernetes namespace for metrics-server
+#                            (default: kube-system).
 
 - name: Initialize Kubernetes control plane
   hosts: homelab
