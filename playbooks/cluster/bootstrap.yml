@@ -50,7 +50,7 @@
 #   bootstrap_control_plane: The host in the homelab group with bootstrap_node:
 #                            true. Resolved automatically from inventory — do
 #                            not set manually.
-#   metrics_server_version:  Version of the metrics-server Helm chart to install
+#   metrics_server_chart_version:  Version of the metrics-server Helm chart to install
 #                            (default: 3.13.0).
 #   metrics_server_ns:       Kubernetes namespace for metrics-server
 #                            (default: kube-system).
@@ -239,7 +239,7 @@
   become_exe: sudo.ws
   vars:
     kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
-    metrics_server_version: 3.13.0
+    metrics_server_chart_version: 3.13.0
     metrics_server_ns: kube-system
 
   tasks:
@@ -267,7 +267,7 @@
       ansible.builtin.command:
         cmd: >-
           helm upgrade --install metrics-server metrics-server/metrics-server
-          --version {{ metrics_server_version }}
+          --version {{ metrics_server_chart_version }}
           --namespace {{ metrics_server_ns }}
           --kubeconfig {{ kubectl_config_path }}
           --set "args={--kubelet-insecure-tls}"

@@ -48,13 +48,13 @@
 #   gateway_api_version:     Version of the Gateway API CRDs to install.
 #                            Must be compatible with the Cilium version in use
 #                            (default: 1.4.1).
-#   traefik_version:         Version of the Traefik Helm chart (default: 34.4.1).
+#   traefik_chart_version:         Version of the Traefik Helm chart (default: 34.4.1).
 #   traefik_namespace:       Kubernetes namespace where Traefik is deployed
 #                            (default: traefik).
 #   traefik_hostname:        Fully qualified hostname for the Traefik dashboard,
 #                            derived from dns_zone
 #                            (default: traefik.<dns_zone>).
-#   cert_manager_version:    Version of the cert-manager Helm chart
+#   cert_manager_chart_version:    Version of the cert-manager Helm chart
 #                            (default: 1.20.0).
 #   cert_manager_namespace:  Kubernetes namespace for cert-manager
 #                            (default: cert-manager).
@@ -68,7 +68,7 @@
 #   bind9_pvc_size:          Size of the PersistentVolumeClaim used to store
 #                            Bind9 zone data across pod restarts
 #                            (default: 128Mi).
-#   externaldns_version:     Version of the kubernetes-sigs ExternalDNS
+#   externaldns_chart_version:     Version of the kubernetes-sigs ExternalDNS
 #                            Helm chart (default: 1.19.0).
 #   dns_zone:                DNS zone served by Bind9 (e.g. homelab.internal).
 #                            Read from group_vars.
@@ -105,15 +105,15 @@
     # 1.19.1's operator expects TLSRoute at v1alpha2 and crashes on startup if
     # it is absent or unserved. Use v1.4.1 until Cilium adds v1.5.0 support.
     gateway_api_version: 1.4.1
-    traefik_version: 34.4.1
+    traefik_chart_version: 34.4.1
     traefik_namespace: traefik
     traefik_hostname: "traefik.{{ dns_zone }}"
-    cert_manager_version: 1.20.0
+    cert_manager_chart_version: 1.20.0
     cert_manager_namespace: cert-manager
     bind9_image: "internetsystemsconsortium/bind9:9.20"
     bind9_namespace: kube-system
     bind9_pvc_size: 128Mi
-    externaldns_version: 1.19.0
+    externaldns_chart_version: 1.19.0
 
   tasks:
     # -------------------------------------------------------------------------
@@ -327,7 +327,7 @@
           --create-namespace
           --kubeconfig {{ kubectl_config_path }}
           --values /tmp/traefik-values.yml
-          --version {{ traefik_version }}
+          --version {{ traefik_chart_version }}
       changed_when: true
       when: bootstrap_node | default(false)
 
@@ -458,7 +458,7 @@
       ansible.builtin.command:
         cmd: >-
           helm upgrade --install cert-manager jetstack/cert-manager
-          --version v{{ cert_manager_version }}
+          --version v{{ cert_manager_chart_version }}
           --namespace {{ cert_manager_namespace }}
           --create-namespace
           --kubeconfig {{ kubectl_config_path }}
@@ -695,7 +695,7 @@
       ansible.builtin.command:
         cmd: >-
           helm upgrade --install external-dns external-dns/external-dns
-          --version {{ externaldns_version }}
+          --version {{ externaldns_chart_version }}
           --namespace {{ bind9_namespace }}
           --kubeconfig {{ kubectl_config_path }}
           -f /tmp/externaldns-values.yml

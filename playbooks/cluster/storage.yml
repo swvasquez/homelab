@@ -14,7 +14,7 @@
 #                           Read from group_vars.
 #   longhorn_namespace:     Kubernetes namespace for Longhorn
 #                           (default: longhorn-system).
-#   longhorn_version:       Helm chart version of Longhorn to install
+#   longhorn_chart_version:       Helm chart version of Longhorn to install
 #                           (default: 1.8.0).
 #   longhorn_replica_count: Number of volume replicas. Overridden at runtime
 #                           to match the actual cluster node count
@@ -31,7 +31,7 @@
   become_exe: sudo.ws
   vars:
     longhorn_namespace: longhorn-system
-    longhorn_version: 1.8.0
+    longhorn_chart_version: 1.8.0
     longhorn_replica_count: 3
     longhorn_hostname: "longhorn.{{ dns_zone }}"
     kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
@@ -98,7 +98,7 @@
           --create-namespace
           --kubeconfig {{ kubectl_config_path }}
           --values /tmp/longhorn-values.yml
-          --version {{ longhorn_version }}
+          --version {{ longhorn_chart_version }}
       changed_when: true
       when: bootstrap_node | default(false)
 

@@ -57,7 +57,7 @@ Playbooks are organized logically into categories, and each category maintains i
 - `infrastructure/`: OS-level configurations and bare-metal setup.
 - `cluster/`: Kubernetes cluster bootstrapping and core components.
 - `development/`: Language toolchains and development environments.
-- `services/`: Cluster-hosted services (e.g. Gitea).
+- `services/`: Cluster-hosted services (e.g. Gitea, ArgoCD).
 
 ## Usage
 

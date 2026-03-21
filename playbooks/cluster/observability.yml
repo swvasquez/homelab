@@ -25,7 +25,7 @@
 #                            group_vars.
 #   observability_namespace: Kubernetes namespace for the observability stack
 #                            (default: observability).
-#   prometheus_version:      Helm chart version of kube-prometheus-stack to
+#   prometheus_chart_version:      Helm chart version of kube-prometheus-stack to
 #                            install (default: 70.4.2).
 #   prometheus_hostname:     FQDN for the Prometheus UI, derived from dns_zone
 #                            (default: prometheus.<dns_zone>).
@@ -45,7 +45,7 @@
   become_exe: sudo.ws
   vars:
     observability_namespace: observability
-    prometheus_version: 70.4.2
+    prometheus_chart_version: 70.4.2
     prometheus_hostname: "prometheus.{{ dns_zone }}"
     grafana_hostname: "grafana.{{ dns_zone }}"
     alertmanager_hostname: "alertmanager.{{ dns_zone }}"
@@ -170,7 +170,7 @@
           --namespace {{ observability_namespace }}
           --kubeconfig {{ kubectl_config_path }}
           --values /tmp/prometheus-values.yml
-          --version {{ prometheus_version }}
+          --version {{ prometheus_chart_version }}
           --timeout 10m
       changed_when: true
       when: bootstrap_node | default(false)

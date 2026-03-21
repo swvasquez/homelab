@@ -17,10 +17,10 @@
 # it is the identity provider.
 #
 # After Authentik is deployed, a Traefik ForwardAuth Middleware is applied to
-# the kube-system, longhorn-system, observability, and gitea namespaces, and
-# the Hubble, Traefik dashboard, Longhorn, Prometheus, Grafana, Alertmanager,
-# and Gitea HTTPRoutes are re-applied with the middleware enabled. This protects
-# those UIs behind Authentik authentication.
+# the kube-system, longhorn-system, observability, gitea, and argocd namespaces,
+# and the Hubble, Traefik dashboard, Longhorn, Prometheus, Grafana, Alertmanager,
+# Gitea, and ArgoCD HTTPRoutes are re-applied with the middleware enabled. This
+# protects those UIs behind Authentik authentication.
 #
 # Variables:
 #   bootstrap_node:              Boolean indicating if the host is the control
@@ -30,7 +30,7 @@
 #                                group_vars.
 #   authentik_namespace:         Kubernetes namespace for Authentik
 #                                (default: authentik).
-#   authentik_version:           Helm chart version of Authentik to install
+#   authentik_chart_version:           Helm chart version of Authentik to install
 #                                (default: 2026.2.1).
 #   authentik_hostname:          FQDN for the Authentik UI, derived from
 #                                dns_zone (default: authentik.<dns_zone>).
@@ -56,6 +56,10 @@
 #                                (default: gitea).
 #   gitea_hostname:              FQDN for the Gitea UI, derived from dns_zone
 #                                (default: gitea.<dns_zone>).
+#   argocd_namespace:            Kubernetes namespace for ArgoCD
+#                                (default: argocd).
+#   argocd_hostname:             FQDN for the ArgoCD UI, derived from dns_zone
+#                                (default: argocd.<dns_zone>).
 #   kubectl_config_path:         Full path to the kubectl config file
 #                                (default: /home/<ansible_user>/.kube/config).
 #   authentik_bootstrap_token:   API token auto-generated on first run and
@@ -76,7 +80,7 @@
   become_exe: sudo.ws
   vars:
     authentik_namespace: authentik
-    authentik_version: 2026.2.1
+    authentik_chart_version: 2026.2.1
     authentik_hostname: "authentik.{{ dns_zone }}"
     hubble_hostname: "hubble.{{ dns_zone }}"
     traefik_namespace: traefik
@@ -89,6 +93,8 @@
     alertmanager_hostname: "alertmanager.{{ dns_zone }}"
     gitea_namespace: gitea
     gitea_hostname: "gitea.{{ dns_zone }}"
+    argocd_namespace: argocd
+    argocd_hostname: "argocd.{{ dns_zone }}"
     kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
     protected_httproutes:
       - name: hubble-ui
@@ -133,6 +139,12 @@
         backend_name: gitea-http
         backend_ns: "{{ gitea_namespace }}"
         backend_port: 3000
+      - name: argocd
+        route_ns: "{{ argocd_namespace }}"
+        hostname: "{{ argocd_hostname }}"
+        backend_name: argocd-server
+        backend_ns: "{{ argocd_namespace }}"
+        backend_port: 80
 
   tasks:
     # -------------------------------------------------------------------------
@@ -326,7 +338,7 @@
           --namespace {{ authentik_namespace }}
           --kubeconfig {{ kubectl_config_path }}
           --values /tmp/authentik-values.yml
-          --version {{ authentik_version }}
+          --version {{ authentik_chart_version }}
       changed_when: true
       when: bootstrap_node | default(false)
 
@@ -584,11 +596,12 @@
     # -------------------------------------------------------------------------
     # Protected HTTPRoutes
     # Re-applies the Hubble, Traefik dashboard, Longhorn, Prometheus, Grafana,
-    # Alertmanager, and Gitea HTTPRoutes with the ForwardAuth middleware enabled.
-    # This replaces the unauthenticated HTTPRoutes deployed by network.yml,
-    # storage.yml, and observability.yml. Gitea's HTTPRoute is managed here
-    # rather than in services/gitea.yml. If authentication.yml is not run,
-    # those services remain accessible without authentication.
+    # Alertmanager, Gitea, and ArgoCD HTTPRoutes with the ForwardAuth middleware
+    # enabled. This replaces the unauthenticated HTTPRoutes deployed by
+    # network.yml, storage.yml, and observability.yml. Service HTTPRoutes are
+    # managed here rather than in their individual service playbooks. If
+    # authentication.yml is not run, those services remain accessible without
+    # authentication.
     # -------------------------------------------------------------------------
     - name: Write Protected HTTPRoute manifests with ForwardAuth
       ansible.builtin.template:

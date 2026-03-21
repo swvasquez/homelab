@@ -35,7 +35,7 @@
 #                              from group_vars.
 #   gitea_namespace:           Kubernetes namespace for Gitea
 #                              (default: gitea).
-#   gitea_version:             Helm chart version of Gitea to install
+#   gitea_chart_version:             Helm chart version of Gitea to install
 #                              (default: 12.5.0).
 #   gitea_hostname:            FQDN for the Gitea web UI, derived from
 #                              dns_zone (default: gitea.<dns_zone>).
@@ -56,7 +56,7 @@
   become_exe: sudo.ws
   vars:
     gitea_namespace: gitea
-    gitea_version: 12.5.0
+    gitea_chart_version: 12.5.0
     gitea_hostname: "gitea.{{ dns_zone }}"
     authentik_namespace: authentik
     authentik_hostname: "authentik.{{ dns_zone }}"
@@ -432,7 +432,7 @@
           --namespace {{ gitea_namespace }}
           --kubeconfig {{ kubectl_config_path }}
           --values /tmp/gitea-values.yml
-          --version {{ gitea_version }}
+          --version {{ gitea_chart_version }}
           --timeout 10m
       changed_when: true
       when: bootstrap_node | default(false)
