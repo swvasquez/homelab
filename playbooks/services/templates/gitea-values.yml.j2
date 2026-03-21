@@ -1,0 +1,122 @@
+{#
+  Helm values for the Gitea self-hosted Git service.
+
+  Configures Gitea with auto-generated admin and PostgreSQL credentials, and
+  wires Authentik as the OIDC provider so users sign in via Authentik. Local
+  account registration is disabled — all accounts are provisioned on first
+  OIDC login. The built-in ingress is disabled in favour of a Gateway API
+  HTTPRoute managed by authentication.yml.
+
+  PostgreSQL is enabled as a subchart. Valkey (redis-cluster subchart) is
+  disabled — Gitea uses an in-process cache by default when no external cache
+  is configured.
+
+  The homelab-ca ConfigMap (created by the playbook from the wildcard-tls
+  Secret in kube-system) is injected before Gitea's own init containers run.
+  A preExtraInitContainer combines the Alpine system CA bundle with the
+  homelab CA so that Gitea trusts the cluster's self-signed wildcard
+  certificate when fetching the Authentik OIDC discovery document.
+
+  Variables:
+    gitea_admin_password:     Gitea admin account password. Read from the
+                              gitea-credentials Kubernetes Secret.
+    admin_email:              Email address for the Gitea admin account.
+                              Read from group_vars.
+    gitea_postgres_password:  Password for the Gitea PostgreSQL user. Read
+                              from the gitea-credentials Kubernetes Secret.
+    gitea_hostname:           FQDN for the Gitea web UI
+                              (e.g. gitea.homelab.internal).
+    authentik_hostname:       FQDN for the Authentik UI, used to construct
+                              the OIDC discovery and icon URLs.
+    gitea_oidc_client_id:     OAuth2 client ID from the Authentik provider.
+                              Fetched from the Authentik API by the playbook.
+    gitea_oidc_client_secret: OAuth2 client secret from the Authentik provider.
+                              Fetched from the Authentik API by the playbook.
+#}
+gitea:
+  admin:
+    username: gitea_admin
+    password: '{{ gitea_admin_password }}'
+    email: '{{ admin_email }}'
+
+  config:
+    server:
+      DOMAIN: '{{ gitea_hostname }}'
+      ROOT_URL: 'https://{{ gitea_hostname }}'
+    service:
+      DISABLE_REGISTRATION: false
+      ALLOW_ONLY_EXTERNAL_REGISTRATION: true
+
+  oauth:
+    - name: Authentik
+      provider: openidConnect
+      key: '{{ gitea_oidc_client_id }}'
+      secret: '{{ gitea_oidc_client_secret }}'
+      autoDiscoverUrl: >-
+        https://{{ authentik_hostname }}/application/o/gitea/.well-known/openid-configuration
+      iconUrl: 'https://{{ authentik_hostname }}/static/dist/assets/icons/icon.png'
+      scopes: openid email profile
+
+postgresql:
+  enabled: true
+  auth:
+    username: gitea
+    database: gitea
+    password: '{{ gitea_postgres_password }}'
+
+postgresql-ha:
+  enabled: false
+
+redis-cluster:
+  enabled: false
+
+persistence:
+  enabled: true
+  storageClass: longhorn
+  size: 10Gi
+
+ingress:
+  enabled: false
+
+service:
+  http:
+    type: ClusterIP
+    port: 3000
+  ssh:
+    type: ClusterIP
+    port: 22
+
+# Combines the Alpine system CA bundle with the homelab self-signed CA so that
+# Gitea trusts the cluster wildcard certificate. A preExtraInitContainer writes
+# the combined bundle to an EmptyDir which is then mounted over the default CA
+# bundle path in all Gitea containers.
+preExtraInitContainers:
+  - name: inject-homelab-ca
+    image: alpine:3
+    command:
+      - sh
+      - -c
+      - 'cat /etc/ssl/certs/ca-certificates.crt /homelab-ca/ca.crt > /combined-ca/ca-certificates.crt'
+    volumeMounts:
+      - name: homelab-ca
+        mountPath: /homelab-ca
+        readOnly: true
+      - name: combined-ca
+        mountPath: /combined-ca
+
+extraVolumes:
+  - name: homelab-ca
+    configMap:
+      name: homelab-ca
+  - name: combined-ca
+    emptyDir: {}
+
+extraInitVolumeMounts:
+  - name: combined-ca
+    mountPath: /etc/ssl/certs/ca-certificates.crt
+    subPath: ca-certificates.crt
+
+extraContainerVolumeMounts:
+  - name: combined-ca
+    mountPath: /etc/ssl/certs/ca-certificates.crt
+    subPath: ca-certificates.crt

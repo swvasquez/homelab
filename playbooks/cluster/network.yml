@@ -26,6 +26,9 @@
 #     RFC 2136 dynamic updates.
 #   - Deploys ExternalDNS (kubernetes-sigs Helm chart) to automatically sync DNS
 #     records from Gateway API route resources into Bind9 via RFC 2136.
+#   - Patches CoreDNS to forward homelab zone queries to Bind9's ClusterIP so
+#     that pods can resolve homelab hostnames without relying on the Bind9
+#     LoadBalancer IP, which is unreachable from inside pods via Cilium.
 #   - Installs the Cilium CLI on all nodes for inspecting and troubleshooting.
 #
 # Node roles are determined by host variables in inventory.yml:
@@ -702,6 +705,82 @@
     - name: Clean up ExternalDNS values file
       ansible.builtin.file:
         path: /tmp/externaldns-values.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # CoreDNS Configuration
+    # Patches the CoreDNS ConfigMap to add a dedicated forwarding block for the
+    # homelab DNS zone. By default, CoreDNS forwards all non-cluster queries via
+    # the node's /etc/resolv.conf, which resolves to the Bind9 LoadBalancer IP.
+    # That IP is unreachable from inside pods because Cilium's eBPF kube-proxy
+    # replacement does not support hairpin NAT for LoadBalancer IPs. An explicit
+    # forward block using Bind9's ClusterIP resolves this — ClusterIPs are always
+    # reachable within the cluster via Cilium's eBPF datapath.
+    # -------------------------------------------------------------------------
+    - name: Fetch Bind9 ClusterIP for CoreDNS forwarding configuration
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get service bind9 -n {{ bind9_namespace }}
+          -o jsonpath='{.spec.clusterIP}'
+      register: bind9_cluster_ip_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Assemble CoreDNS Corefile content with homelab zone forward block
+      ansible.builtin.set_fact:
+        coredns_corefile: |
+          {{ dns_zone }}:53 {
+              errors
+              forward . {{ bind9_cluster_ip_result.stdout }}
+              cache 30
+          }
+          .:53 {
+              errors
+              health {
+                 lameduck 5s
+              }
+              ready
+              kubernetes cluster.local in-addr.arpa ip6.arpa {
+                 pods insecure
+                 fallthrough in-addr.arpa ip6.arpa
+                 ttl 30
+              }
+              prometheus :9153
+              forward . /etc/resolv.conf {
+                 max_concurrent 1000
+              }
+              cache 30 {
+                 disable success cluster.local
+                 disable denial cluster.local
+              }
+              loop
+              reload
+              loadbalance
+          }
+      when: bootstrap_node | default(false)
+
+    - name: Write CoreDNS ConfigMap patch file
+      ansible.builtin.copy:
+        content: "{{ {'data': {'Corefile': coredns_corefile}} | to_json }}"
+        dest: /tmp/coredns-patch.json
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply CoreDNS ConfigMap patch to forward homelab zone to Bind9 ClusterIP
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch configmap coredns -n kube-system
+          --type merge
+          --patch-file /tmp/coredns-patch.json
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Clean up CoreDNS ConfigMap patch file
+      ansible.builtin.file:
+        path: /tmp/coredns-patch.json
         state: absent
       when: bootstrap_node | default(false)
 

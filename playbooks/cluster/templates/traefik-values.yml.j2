@@ -12,9 +12,9 @@
 
   Variables:
     None — this template does not use Jinja variables. The kubernetesCRD
-    namespaces allowlist (traefik, kube-system, longhorn-system, observability)
-    is hardcoded. Add to this list when deploying services in new namespaces
-    that use ExtensionRef middleware filters in their HTTPRoutes.
+    namespaces allowlist (traefik, kube-system, longhorn-system, observability,
+    gitea) is hardcoded. Add to this list when deploying services in new
+    namespaces that use ExtensionRef middleware filters in their HTTPRoutes.
 #}
 providers:
   kubernetesGateway:
@@ -27,6 +27,7 @@ providers:
       - kube-system
       - longhorn-system
       - observability
+      - gitea
   kubernetesIngress:
     enabled: false
 

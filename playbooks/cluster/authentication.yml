@@ -17,10 +17,10 @@
 # it is the identity provider.
 #
 # After Authentik is deployed, a Traefik ForwardAuth Middleware is applied to
-# the kube-system, longhorn-system, and observability namespaces, and the
-# Hubble, Traefik dashboard, Longhorn, Prometheus, Grafana, and Alertmanager
-# HTTPRoutes are re-applied with the middleware enabled. This protects those
-# UIs behind Authentik authentication.
+# the kube-system, longhorn-system, observability, and gitea namespaces, and
+# the Hubble, Traefik dashboard, Longhorn, Prometheus, Grafana, Alertmanager,
+# and Gitea HTTPRoutes are re-applied with the middleware enabled. This protects
+# those UIs behind Authentik authentication.
 #
 # Variables:
 #   bootstrap_node:              Boolean indicating if the host is the control
@@ -52,6 +52,10 @@
 #                                dns_zone (default: grafana.<dns_zone>).
 #   alertmanager_hostname:       FQDN for the Alertmanager UI, derived from
 #                                dns_zone (default: alertmanager.<dns_zone>).
+#   gitea_namespace:             Kubernetes namespace for Gitea
+#                                (default: gitea).
+#   gitea_hostname:              FQDN for the Gitea UI, derived from dns_zone
+#                                (default: gitea.<dns_zone>).
 #   kubectl_config_path:         Full path to the kubectl config file
 #                                (default: /home/<ansible_user>/.kube/config).
 #   authentik_bootstrap_token:   API token auto-generated on first run and
@@ -83,6 +87,8 @@
     prometheus_hostname: "prometheus.{{ dns_zone }}"
     grafana_hostname: "grafana.{{ dns_zone }}"
     alertmanager_hostname: "alertmanager.{{ dns_zone }}"
+    gitea_namespace: gitea
+    gitea_hostname: "gitea.{{ dns_zone }}"
     kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
     protected_httproutes:
       - name: hubble-ui
@@ -121,6 +127,12 @@
         backend_name: kube-prometheus-stack-alertmanager
         backend_ns: "{{ observability_namespace }}"
         backend_port: 9093
+      - name: gitea
+        route_ns: "{{ gitea_namespace }}"
+        hostname: "{{ gitea_hostname }}"
+        backend_name: gitea-http
+        backend_ns: "{{ gitea_namespace }}"
+        backend_port: 3000
 
   tasks:
     # -------------------------------------------------------------------------
@@ -304,7 +316,7 @@
       ansible.builtin.template:
         src: authentik-values.yml.j2
         dest: /tmp/authentik-values.yml
-        mode: "0600"
+        mode: '0600'
       when: bootstrap_node | default(false)
 
     - name: Install or upgrade Authentik via Helm
@@ -463,7 +475,7 @@
         - bootstrap_node | default(false)
         - existing_app_result.json.pagination.count == 0
 
-    - name: Get embedded outpost
+    - name: Get Authentik embedded outpost details
       ansible.builtin.uri:
         url: "{{ authentik_api_url }}/outposts/instances/?managed=goauthentik.io%2Foutposts%2Fembedded" # noqa: yaml[line-length]
         headers:
@@ -505,7 +517,7 @@
       ansible.builtin.template:
         src: httproute.yml.j2
         dest: /tmp/authentik-httproute.yml
-        mode: "0644"
+        mode: '0644'
       vars:
         httproute_name: authentik
         httproute_namespace: "{{ authentik_namespace }}"
@@ -544,7 +556,7 @@
       ansible.builtin.template:
         src: traefik-forward-auth-middleware.yml.j2
         dest: /tmp/traefik-forward-auth-middleware-{{ item }}.yml
-        mode: "0644"
+        mode: '0644'
       vars:
         middleware_namespace: "{{ item }}"
       loop: "{{ protected_httproutes | map(attribute='route_ns') | unique | list }}"
@@ -572,16 +584,17 @@
     # -------------------------------------------------------------------------
     # Protected HTTPRoutes
     # Re-applies the Hubble, Traefik dashboard, Longhorn, Prometheus, Grafana,
-    # and Alertmanager HTTPRoutes with the ForwardAuth middleware enabled. This
-    # replaces the unauthenticated HTTPRoutes deployed by network.yml,
-    # storage.yml, and observability.yml. If authentication.yml is not run,
+    # Alertmanager, and Gitea HTTPRoutes with the ForwardAuth middleware enabled.
+    # This replaces the unauthenticated HTTPRoutes deployed by network.yml,
+    # storage.yml, and observability.yml. Gitea's HTTPRoute is managed here
+    # rather than in services/gitea.yml. If authentication.yml is not run,
     # those services remain accessible without authentication.
     # -------------------------------------------------------------------------
     - name: Write Protected HTTPRoute manifests with ForwardAuth
       ansible.builtin.template:
         src: httproute.yml.j2
         dest: "/tmp/{{ item.name }}-httproute.yml"
-        mode: "0644"
+        mode: '0644'
       vars:
         with_forward_auth: true
         httproute_name: "{{ item.name }}"
