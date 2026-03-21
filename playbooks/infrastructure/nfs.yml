@@ -37,7 +37,37 @@
 #   nfs_export_path:  Directory to export from the server (e.g. /srv/nfs/data).
 #   nfs_export_opts:  Export options (default: "*(rw,sync,no_subtree_check)").
 #   nfs_mount_point:  Local directory to mount the NFS share on clients (e.g. /mnt/nfs).
-#   nfs_mount_opts:   Mount options for clients (default: "defaults").
+#   nfs_mount_opts:   Mount options for clients. Defaults to a resilient set of options that
+#                     prevent the client node from hanging at boot when the NFS server is unreachable
+#                     and allow automatic reconnection once the server comes back up:
+#
+#                       _netdev
+#                         Marks this as a network-dependent mount. systemd will defer the mount
+#                         until after the network is online, preventing early-boot failures.
+#
+#                       nofail
+#                         Allows boot to complete even if the mount cannot be established. Without
+#                         this, a missing NFS server causes the boot sequence to stall indefinitely
+#                         waiting for the mount to succeed.
+#
+#                       hard
+#                         Instructs the kernel to retry RPC requests indefinitely until the server
+#                         responds, rather than giving up after a timeout. This prevents silent data
+#                         loss or corruption: the kernel will not return an error to a writing
+#                         process until it receives a definitive acknowledgement from the server.
+#                         The risk of hung uninterruptible processes is mitigated by x-systemd.automount
+#                         below — the mount is not active unless the server was reachable at access
+#                         time, so boot-time unavailability never causes a hang.
+#
+#                       x-systemd.automount
+#                         Creates a systemd automount unit instead of a plain mount unit. The share
+#                         is not mounted at boot; instead it is mounted on first access. If the
+#                         server was down at boot, the next access after the server recovers will
+#                         trigger a fresh mount attempt automatically.
+#
+#                       x-systemd.mount-timeout=30
+#                         Maximum time in seconds that the automount unit will wait for the mount
+#                         to complete before returning an error to the accessing process.
 #   nfs_lvm_vg_name:  The name of the LVM Volume Group to use (required).
 #   nfs_lvm_lv_name:  The name of the LVM Logical Volume to mount for the export (required).
 #   nfs_create_lvm:   Boolean, whether to create and format a new LV (default: false).
@@ -216,7 +246,7 @@
   vars:
     nfs_export_path: "/srv/nfs/data"
     nfs_mount_point: "/mnt/nfs"
-    nfs_mount_opts: "defaults"
+    nfs_mount_opts: '_netdev,nofail,hard,x-systemd.automount,x-systemd.mount-timeout=30'
     _nfs_server_host: >-
       {{ hostvars | dict2items
          | selectattr('value.nfs_server', 'defined')
