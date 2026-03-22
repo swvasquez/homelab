@@ -21,6 +21,9 @@ grafana:
   grafana.ini:
     server:
       root_url: 'https://{{ grafana_hostname }}'
+    auth.anonymous:
+      enabled: true
+      org_role: Admin
 
 prometheus:
   ingress:
