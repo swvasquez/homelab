@@ -45,6 +45,13 @@
 #                              dns_zone (default: authentik.<dns_zone>).
 #   kubectl_config_path:       Full path to the kubectl config file
 #                              (default: /home/<ansible_user>/.kube/config).
+#   gitea_db_name:             PostgreSQL database name for Gitea
+#                              (default: gitea).
+#   gitea_db_username:         PostgreSQL username for Gitea (default: gitea).
+#   gitea_db_storage_size:     Storage size for the Gitea cnpg database PVC
+#                              (default: 10Gi).
+#   gitea_storage_class:       Kubernetes StorageClass for the database PVC
+#                              (default: longhorn).
 #   cluster_ca_secret_name:    Name of the TLS Secret in kube-system that
 #                              holds the cluster CA certificate. Used to build
 #                              a combined CA bundle for Gitea
@@ -58,6 +65,10 @@
     gitea_namespace: gitea
     gitea_chart_version: 12.5.0
     gitea_hostname: "gitea.{{ dns_zone }}"
+    gitea_db_name: gitea
+    gitea_db_username: gitea
+    gitea_db_storage_size: 10Gi
+    gitea_storage_class: longhorn
     authentik_namespace: authentik
     authentik_hostname: "authentik.{{ dns_zone }}"
     kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
@@ -396,12 +407,89 @@
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
+    # Database
+    # Provisions a CloudNativePG Cluster for Gitea's PostgreSQL database. A
+    # cnpg-formatted credentials secret (gitea-db-credentials) is created from
+    # the postgresql-password in gitea-credentials. The Cluster resource is
+    # applied idempotently via kubectl apply and the playbook waits for it to
+    # reach a healthy state before proceeding with the Helm install.
+    # -------------------------------------------------------------------------
+    - name: Create Gitea cnpg database credentials secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic gitea-db-credentials
+          -n {{ gitea_namespace }}
+          --from-literal=username={{ gitea_db_username }}
+          --from-literal=password={{ gitea_postgres_password }}
+      register: gitea_db_creds_result
+      changed_when: "'created' in gitea_db_creds_result.stdout"
+      failed_when:
+        - gitea_db_creds_result.rc != 0
+        - "'already exists' not in gitea_db_creds_result.stderr"
+      when: bootstrap_node | default(false)
+
+    - name: Write Gitea cnpg Cluster manifest
+      ansible.builtin.copy:
+        dest: /tmp/gitea-db-cluster.yml
+        mode: '0600'
+        content: |
+          apiVersion: postgresql.cnpg.io/v1
+          kind: Cluster
+          metadata:
+            name: gitea-db
+            namespace: '{{ gitea_namespace }}'
+          spec:
+            instances: 1
+            imageName: ghcr.io/cloudnative-pg/postgresql:17
+            storage:
+              storageClass: '{{ gitea_storage_class }}'
+              size: '{{ gitea_db_storage_size }}'
+            bootstrap:
+              initdb:
+                database: '{{ gitea_db_name }}'
+                owner: '{{ gitea_db_username }}'
+                secret:
+                  name: gitea-db-credentials
+      when: bootstrap_node | default(false)
+
+    - name: Apply Gitea cnpg Cluster manifest
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/gitea-db-cluster.yml
+      register: gitea_db_cluster_result
+      changed_when: >-
+        'created' in gitea_db_cluster_result.stdout or
+        'configured' in gitea_db_cluster_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Remove Gitea cnpg Cluster manifest temporary file
+      ansible.builtin.file:
+        path: /tmp/gitea-db-cluster.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Wait for Gitea cnpg Cluster to become healthy
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get cluster gitea-db -n {{ gitea_namespace }}
+          -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: gitea_db_ready
+      until: gitea_db_ready.stdout == 'True'
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
     # Gitea Installation
     # Installs Gitea via Helm using the official gitea-charts repository.
-    # PostgreSQL is enabled as a subchart for persistent storage. Valkey is
-    # disabled — Gitea uses an in-process cache when no external cache is
-    # configured. Credentials are injected via a values file rendered from the
-    # generated or existing Kubernetes Secret. The Authentik OIDC provider is
+    # PostgreSQL is managed by CloudNativePG. Valkey is disabled — Gitea uses
+    # an in-process cache when no external cache is configured. Credentials are
+    # injected via a values file rendered from the generated or existing
+    # Kubernetes Secret. The Authentik OIDC provider is
     # configured so users can sign in with their Authentik credentials. Local
     # account registration is disabled — accounts are created on first OIDC
     # login.

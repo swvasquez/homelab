@@ -29,17 +29,17 @@
 authentik:
   secret_key: '{{ authentik_secret_key }}'
   postgresql:
+    host: authentik-db-rw.authentik.svc
+    port: 5432
+    name: authentik
+    user: authentik
     password: '{{ authentik_postgres_password }}'
   bootstrap_token: '{{ authentik_bootstrap_token }}'
   bootstrap_email: '{{ admin_email }}'
   bootstrap_password: '{{ bootstrap_admin_password }}'
 
 postgresql:
-  enabled: true
-  auth:
-    username: authentik
-    database: authentik
-    password: '{{ authentik_postgres_password }}'
+  enabled: false
 
 redis:
   enabled: true

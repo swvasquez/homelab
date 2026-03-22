@@ -1,0 +1,98 @@
+---
+# ==============================================================================
+# Playbook: Install CloudNativePG Operator
+# ==============================================================================
+# This playbook installs the CloudNativePG (cnpg) operator into the Kubernetes
+# cluster. CloudNativePG is a Kubernetes operator that manages the lifecycle of
+# PostgreSQL clusters as first-class Kubernetes resources via a Cluster CRD.
+# Once installed, services that require PostgreSQL (e.g. Immich, Gitea,
+# Authentik) can define a Cluster resource and point their application at it
+# rather than bundling their own PostgreSQL subchart.
+#
+# The operator is installed via Helm into the cnpg-system namespace. It
+# registers cluster-scoped CRDs and deploys a controller that watches for
+# Cluster, Backup, and ScheduledBackup resources across all namespaces.
+#
+# Run order:
+#   1. cluster/database.yml (this playbook)
+#   2. Any service playbook that provisions a cnpg Cluster resource
+#
+# Variables:
+#   bootstrap_node:       Boolean indicating if the host is the control plane
+#                         bootstrap node where Helm commands run. Read from
+#                         inventory host vars.
+#   cnpg_namespace:       Kubernetes namespace for the cnpg operator
+#                         (default: cnpg-system).
+#   cnpg_chart_version:   Helm chart version for the cnpg operator
+#                         (default: 0.27.1).
+#   kubectl_config_path:  Full path to the kubectl config file
+#                         (default: /home/<ansible_user>/.kube/config).
+
+- name: Install CloudNativePG operator
+  hosts: homelab
+  become: true
+  become_exe: sudo.ws
+  vars:
+    cnpg_namespace: cnpg-system
+    cnpg_chart_version: 0.27.1
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Namespace
+    # Creates the cnpg-system namespace before the Helm install so that the
+    # operator pod and its supporting resources have a home.
+    # -------------------------------------------------------------------------
+    - name: Create cnpg-system namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create namespace {{ cnpg_namespace }}
+      register: cnpg_ns_result
+      changed_when: "'created' in cnpg_ns_result.stdout"
+      failed_when:
+        - cnpg_ns_result.rc != 0
+        - "'already exists' not in cnpg_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Helm Repository
+    # Registers the CloudNativePG Helm repository so that the chart can be
+    # resolved by name during install and upgrade operations.
+    # -------------------------------------------------------------------------
+    - name: Add CloudNativePG Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add cnpg https://cloudnative-pg.github.io/charts
+      register: cnpg_repo_result
+      changed_when: "'has been added' in cnpg_repo_result.stdout"
+      failed_when:
+        - cnpg_repo_result.rc != 0
+        - "'already exists' not in cnpg_repo_result.stderr"
+      when: bootstrap_node | default(false)
+
+    - name: Update Helm repositories
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Operator Install
+    # Installs or upgrades the CloudNativePG operator Helm chart. The operator
+    # runs as a cluster-scoped controller and registers the Cluster, Backup,
+    # and ScheduledBackup CRDs. The --wait flag blocks until the operator
+    # deployment is fully ready before the play continues.
+    # -------------------------------------------------------------------------
+    - name: Install CloudNativePG operator via Helm
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade --install cloudnative-pg cnpg/cloudnative-pg
+          --namespace {{ cnpg_namespace }}
+          --version {{ cnpg_chart_version }}
+          --kubeconfig {{ kubectl_config_path }}
+          --wait
+      register: cnpg_helm_result
+      changed_when: >-
+        'has been upgraded' in cnpg_helm_result.stdout or
+        'has been deployed' in cnpg_helm_result.stdout
+      when: bootstrap_node | default(false)

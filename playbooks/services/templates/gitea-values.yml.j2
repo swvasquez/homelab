@@ -40,6 +40,12 @@ gitea:
     email: '{{ admin_email }}'
 
   config:
+    database:
+      DB_TYPE: postgres
+      HOST: 'gitea-db-rw.gitea.svc:5432'
+      NAME: gitea
+      USER: gitea
+      PASSWD: '{{ gitea_postgres_password }}'
     server:
       DOMAIN: '{{ gitea_hostname }}'
       ROOT_URL: 'https://{{ gitea_hostname }}'
@@ -58,11 +64,7 @@ gitea:
       scopes: openid email profile
 
 postgresql:
-  enabled: true
-  auth:
-    username: gitea
-    database: gitea
-    password: '{{ gitea_postgres_password }}'
+  enabled: false
 
 postgresql-ha:
   enabled: false

@@ -6,10 +6,10 @@
 # Kubernetes cluster via Helm. Authentik provides SSO, OAuth2/OIDC, SAML, and
 # LDAP authentication for homelab services.
 #
-# Authentik includes PostgreSQL and Redis as subcharts, both enabled by default.
-# Credentials (secret key and PostgreSQL password) are auto-generated on first
-# run and stored in a Kubernetes Secret named authentik-credentials. On
-# subsequent runs the existing secret is reused so credentials remain stable
+# Authentik uses CloudNativePG for PostgreSQL and Redis as a subchart for
+# caching. Credentials (secret key and PostgreSQL password) are auto-generated
+# on first run and stored in a Kubernetes Secret named authentik-credentials.
+# On subsequent runs the existing secret is reused so credentials remain stable
 # across upgrades.
 #
 # The Authentik UI is exposed over HTTPS via a Gateway API HTTPRoute attached
@@ -73,6 +73,14 @@
 #                                admin account. Read from group_vars. Only
 #                                applied on first Authentik startup — update
 #                                via the UI after initial deployment.
+#   authentik_db_name:           PostgreSQL database name for Authentik
+#                                (default: authentik).
+#   authentik_db_username:       PostgreSQL username for Authentik
+#                                (default: authentik).
+#   authentik_db_storage_size:   Storage size for the Authentik cnpg database
+#                                PVC (default: 8Gi).
+#   authentik_storage_class:     Kubernetes StorageClass for the database PVC
+#                                (default: longhorn).
 
 - name: Install Authentik authentication
   hosts: homelab
@@ -82,6 +90,10 @@
     authentik_namespace: authentik
     authentik_chart_version: 2026.2.1
     authentik_hostname: "authentik.{{ dns_zone }}"
+    authentik_db_name: authentik
+    authentik_db_username: authentik
+    authentik_db_storage_size: 8Gi
+    authentik_storage_class: longhorn
     hubble_hostname: "hubble.{{ dns_zone }}"
     traefik_namespace: traefik
     traefik_hostname: "traefik.{{ dns_zone }}"
@@ -306,10 +318,87 @@
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
+    # Database
+    # Provisions a CloudNativePG Cluster for Authentik's PostgreSQL database.
+    # A cnpg-formatted credentials secret (authentik-db-credentials) is created
+    # from the postgresql-password in authentik-credentials. The Cluster
+    # resource is applied idempotently via kubectl apply and the playbook waits
+    # for it to reach a healthy state before proceeding with the Helm install.
+    # -------------------------------------------------------------------------
+    - name: Create Authentik cnpg database credentials secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic authentik-db-credentials
+          -n {{ authentik_namespace }}
+          --from-literal=username={{ authentik_db_username }}
+          --from-literal=password={{ authentik_postgres_password }}
+      register: authentik_db_creds_result
+      changed_when: "'created' in authentik_db_creds_result.stdout"
+      failed_when:
+        - authentik_db_creds_result.rc != 0
+        - "'already exists' not in authentik_db_creds_result.stderr"
+      when: bootstrap_node | default(false)
+
+    - name: Write Authentik cnpg Cluster manifest
+      ansible.builtin.copy:
+        dest: /tmp/authentik-db-cluster.yml
+        mode: '0600'
+        content: |
+          apiVersion: postgresql.cnpg.io/v1
+          kind: Cluster
+          metadata:
+            name: authentik-db
+            namespace: '{{ authentik_namespace }}'
+          spec:
+            instances: 1
+            imageName: ghcr.io/cloudnative-pg/postgresql:17
+            storage:
+              storageClass: '{{ authentik_storage_class }}'
+              size: '{{ authentik_db_storage_size }}'
+            bootstrap:
+              initdb:
+                database: '{{ authentik_db_name }}'
+                owner: '{{ authentik_db_username }}'
+                secret:
+                  name: authentik-db-credentials
+      when: bootstrap_node | default(false)
+
+    - name: Apply Authentik cnpg Cluster manifest
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/authentik-db-cluster.yml
+      register: authentik_db_cluster_result
+      changed_when: >-
+        'created' in authentik_db_cluster_result.stdout or
+        'configured' in authentik_db_cluster_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Remove Authentik cnpg Cluster manifest temporary file
+      ansible.builtin.file:
+        path: /tmp/authentik-db-cluster.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Wait for Authentik cnpg Cluster to become healthy
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get cluster authentik-db -n {{ authentik_namespace }}
+          -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: authentik_db_ready
+      until: authentik_db_ready.stdout == 'True'
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
     # Authentik Installation
     # Installs Authentik via Helm using the official goauthentik chart
-    # repository. PostgreSQL and Redis subcharts are enabled to provide
-    # persistent storage and caching. Credentials are injected via a values
+    # repository. PostgreSQL is managed by CloudNativePG. Redis subchart
+    # remains enabled for caching. Credentials are injected via a values
     # file rendered from the generated or existing Kubernetes Secret.
     # -------------------------------------------------------------------------
     - name: Add Authentik Helm repository
