@@ -108,3 +108,8 @@ just lint playbooks/cluster/bootstrap.yml
 - **`become_exe` configuration**: `become_exe` must be set to `sudo.ws` to resolve an issue
   with Ansible. See [Ansible Issue #85837](https://github.com/ansible/ansible/issues/85837)
   for details.
+- **Service playbook run order**: Some Playbooks have dependencies on others. For example, the authentication Playbook must be (re)deployed after adding a new Kubernetes service:
+  ```sh
+  just install services <SERVICE>
+  just install cluster authentication
+  ```

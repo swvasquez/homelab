@@ -4,7 +4,7 @@
 # ==============================================================================
 # This playbook deploys ArgoCD, a declarative GitOps continuous delivery tool,
 # to the Kubernetes cluster via Helm. ArgoCD manages application deployments by
-# synchronising the desired cluster state with a Git repository.
+# synchronizing the desired cluster state with a Git repository.
 #
 # Authentik is configured as the OIDC identity provider for ArgoCD, allowing
 # users to sign in with their Authentik credentials. An OAuth2 provider and
@@ -14,7 +14,7 @@
 #
 # ArgoCD runs in insecure mode (--insecure) since TLS is terminated at the
 # Traefik gateway. The ArgoCD UI HTTPRoute is managed by authentication.yml,
-# which centralises HTTPRoute management for all cluster services and applies
+# which centralizes HTTPRoute management for all cluster services and applies
 # the Authentik ForwardAuth middleware. Run authentication.yml after this
 # playbook to expose the ArgoCD UI over HTTPS.
 #
@@ -28,6 +28,23 @@
 # with:
 #   kubectl get secret argocd-initial-admin-secret -n argocd \
 #     -o jsonpath='{.data.password}' | base64 -d
+#
+# Gitea is registered as a Git repository source so that ArgoCD can pull
+# manifests directly from the gitops repository. A dedicated gitops repository
+# is created in Gitea if it does not exist, and an access token named "argocd"
+# is created via the Gitea REST API using the admin credentials stored in the
+# gitea-credentials Secret. The token is stored in a Kubernetes Secret named
+# gitea-gitops in the argocd namespace, labeled as a repository credential.
+# A Gitea webhook is also created on the gitops repository to trigger an
+# immediate ArgoCD sync on every push.
+#
+# Token creation is idempotent: the task is skipped if the gitea-gitops Secret
+# already exists. If the Secret is absent but a stale "argocd" token exists in
+# Gitea, the old token is deleted before a new one is created, since Gitea only
+# exposes the token value at creation time.
+#
+# gitea.yml must be run before this playbook so that Gitea is deployed and the
+# gitea-credentials Secret exists in the gitea namespace.
 #
 # Variables:
 #   bootstrap_node:            Boolean indicating if the host is the control
@@ -51,23 +68,40 @@
 #                              holds the cluster CA certificate
 #                              (default: wildcard-tls).
 #   authentik_signing_key_name: Name of the Authentik certificate key pair used
-#                              to sign OIDC JWTs with RS256. Must exist in
-#                              Authentik's crypto store
-#                              (default: authentik Self-signed Certificate).
+#                               to sign OIDC JWTs with RS256. Must exist in
+#                               Authentik's crypto store
+#                               (default: authentik Self-signed Certificate).
+#   gitea_namespace:           Kubernetes namespace where Gitea is deployed
+#                              (default: gitea).
+#   gitea_hostname:            FQDN for the Gitea web UI, derived from
+#                              dns_zone (default: gitea.<dns_zone>).
+#   gitea_admin_username:      Username of the Gitea admin account used to
+#                              create the ArgoCD access token and own the
+#                              gitops repository (default: gitea_admin).
+#   gitea_gitops_repo:         Name of the Gitea repository that ArgoCD will
+#                              use as its GitOps source (default: gitops).
+#                              A webhook is also created on this repository
+#                              to trigger immediate ArgoCD syncs on push.
 
 - name: Install ArgoCD
   hosts: homelab
   become: true
   become_exe: sudo.ws
   vars:
+    bootstrap_node: false
+    dns_zone: example.internal
     argocd_namespace: argocd
     argocd_chart_version: 9.4.15
-    argocd_hostname: "argocd.{{ dns_zone }}"
+    argocd_hostname: 'argocd.{{ dns_zone }}'
     authentik_namespace: authentik
-    authentik_hostname: "authentik.{{ dns_zone }}"
-    kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
+    authentik_hostname: 'authentik.{{ dns_zone }}'
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
     cluster_ca_secret_name: wildcard-tls
     authentik_signing_key_name: 'authentik Self-signed Certificate'
+    gitea_namespace: gitea
+    gitea_hostname: 'gitea.{{ dns_zone }}'
+    gitea_admin_username: gitea_admin
+    gitea_gitops_repo: gitops
 
   tasks:
     # -------------------------------------------------------------------------
@@ -109,7 +143,7 @@
 
     - name: Set cluster CA certificate fact
       ansible.builtin.set_fact:
-        cluster_ca_cert: "{{ cluster_ca_cert_b64.stdout | b64decode }}"
+        cluster_ca_cert: '{{ cluster_ca_cert_b64.stdout | b64decode }}'
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
@@ -146,7 +180,7 @@
 
     - name: Set Authentik bootstrap token fact
       ansible.builtin.set_fact:
-        authentik_bootstrap_token: "{{ authentik_bootstrap_token_b64.stdout | b64decode }}"
+        authentik_bootstrap_token: '{{ authentik_bootstrap_token_b64.stdout | b64decode }}'
       when: bootstrap_node | default(false)
 
     - name: Get Authentik server ClusterIP
@@ -161,7 +195,7 @@
 
     - name: Set Authentik API base URL fact
       ansible.builtin.set_fact:
-        authentik_api_url: "http://{{ authentik_server_clusterip.stdout }}/api/v3"
+        authentik_api_url: 'http://{{ authentik_server_clusterip.stdout }}/api/v3'
       when: bootstrap_node | default(false)
 
     - name: Get default authorization flow UUID
@@ -169,35 +203,35 @@
         url: >-
           {{ authentik_api_url }}/flows/instances/?slug=default-provider-authorization-implicit-consent
         headers:
-          Authorization: "Bearer {{ authentik_bootstrap_token }}"
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
       register: auth_flow_result
       changed_when: false
       when: bootstrap_node | default(false)
 
     - name: Set authorization flow UUID fact
       ansible.builtin.set_fact:
-        authentik_auth_flow_uuid: "{{ auth_flow_result.json.results[0].pk }}"
+        authentik_auth_flow_uuid: '{{ auth_flow_result.json.results[0].pk }}'
       when: bootstrap_node | default(false)
 
     - name: Get default invalidation flow UUID
       ansible.builtin.uri:
-        url: "{{ authentik_api_url }}/flows/instances/?slug=default-provider-invalidation-flow"
+        url: '{{ authentik_api_url }}/flows/instances/?slug=default-provider-invalidation-flow'
         headers:
-          Authorization: "Bearer {{ authentik_bootstrap_token }}"
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
       register: invalidation_flow_result
       changed_when: false
       when: bootstrap_node | default(false)
 
     - name: Set invalidation flow UUID fact
       ansible.builtin.set_fact:
-        authentik_invalidation_flow_uuid: "{{ invalidation_flow_result.json.results[0].pk }}"
+        authentik_invalidation_flow_uuid: '{{ invalidation_flow_result.json.results[0].pk }}'
       when: bootstrap_node | default(false)
 
     - name: Get OIDC scope property mappings from Authentik
       ansible.builtin.uri:
-        url: "{{ authentik_api_url }}/propertymappings/all/?page_size=100"
+        url: '{{ authentik_api_url }}/propertymappings/all/?page_size=100'
         headers:
-          Authorization: "Bearer {{ authentik_bootstrap_token }}"
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
       register: all_property_mappings_result
       changed_when: false
       when: bootstrap_node | default(false)
@@ -220,24 +254,24 @@
 
     - name: Check if Authentik groups scope mapping already exists
       ansible.builtin.uri:
-        url: "{{ authentik_api_url }}/propertymappings/provider/scope/?scope_name=groups"
+        url: '{{ authentik_api_url }}/propertymappings/provider/scope/?scope_name=groups'
         headers:
-          Authorization: "Bearer {{ authentik_bootstrap_token }}"
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
       register: existing_groups_mapping_result
       changed_when: false
       when: bootstrap_node | default(false)
 
     - name: Create Authentik groups scope mapping
       ansible.builtin.uri:
-        url: "{{ authentik_api_url }}/propertymappings/provider/scope/"
+        url: '{{ authentik_api_url }}/propertymappings/provider/scope/'
         method: POST
         headers:
-          Authorization: "Bearer {{ authentik_bootstrap_token }}"
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
         body_format: json
         body:
           name: "authentik default OAuth Mapping: OpenID 'groups'"
           scope_name: groups
-          expression: "return [group.name for group in request.user.ak_groups.all()]"
+          expression: 'return [group.name for group in request.user.ak_groups.all()]'
         status_code: 201
       register: create_groups_mapping_result
       changed_when: true
@@ -247,21 +281,21 @@
 
     - name: Set groups scope mapping UUID fact from existing mapping
       ansible.builtin.set_fact:
-        groups_scope_mapping_uuid: "{{ existing_groups_mapping_result.json.results[0].pk }}"
+        groups_scope_mapping_uuid: '{{ existing_groups_mapping_result.json.results[0].pk }}'
       when:
         - bootstrap_node | default(false)
         - existing_groups_mapping_result.json.pagination.count > 0
 
     - name: Set groups scope mapping UUID fact from newly created mapping
       ansible.builtin.set_fact:
-        groups_scope_mapping_uuid: "{{ create_groups_mapping_result.json.pk }}"
+        groups_scope_mapping_uuid: '{{ create_groups_mapping_result.json.pk }}'
       when:
         - bootstrap_node | default(false)
         - existing_groups_mapping_result.json.pagination.count == 0
 
     - name: Append groups scope mapping to OIDC scope mapping UUIDs
       ansible.builtin.set_fact:
-        oidc_scope_mapping_uuids: "{{ oidc_scope_mapping_uuids + [groups_scope_mapping_uuid] }}"
+        oidc_scope_mapping_uuids: '{{ oidc_scope_mapping_uuids + [groups_scope_mapping_uuid] }}'
       when: bootstrap_node | default(false)
 
     - name: Get Authentik self-signed signing key
@@ -269,43 +303,43 @@
         url: >-
           {{ authentik_api_url }}/crypto/certificatekeypairs/?has_key=true&name={{ authentik_signing_key_name | urlencode }}
         headers:
-          Authorization: "Bearer {{ authentik_bootstrap_token }}"
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
       register: signing_key_result
       changed_when: false
       when: bootstrap_node | default(false)
 
     - name: Set signing key UUID fact
       ansible.builtin.set_fact:
-        authentik_signing_key_uuid: "{{ signing_key_result.json.results[0].pk }}"
+        authentik_signing_key_uuid: '{{ signing_key_result.json.results[0].pk }}'
       when: bootstrap_node | default(false)
 
     - name: Check if ArgoCD OAuth2 provider already exists in Authentik
       ansible.builtin.uri:
-        url: "{{ authentik_api_url }}/providers/oauth2/?name=ArgoCD"
+        url: '{{ authentik_api_url }}/providers/oauth2/?name=ArgoCD'
         headers:
-          Authorization: "Bearer {{ authentik_bootstrap_token }}"
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
       register: existing_oidc_provider_result
       changed_when: false
       when: bootstrap_node | default(false)
 
     - name: Create ArgoCD OAuth2 provider in Authentik
       ansible.builtin.uri:
-        url: "{{ authentik_api_url }}/providers/oauth2/"
+        url: '{{ authentik_api_url }}/providers/oauth2/'
         method: POST
         headers:
-          Authorization: "Bearer {{ authentik_bootstrap_token }}"
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
         body_format: json
         body:
           name: ArgoCD
-          authorization_flow: "{{ authentik_auth_flow_uuid }}"
-          invalidation_flow: "{{ authentik_invalidation_flow_uuid }}"
-          property_mappings: "{{ oidc_scope_mapping_uuids }}"
+          authorization_flow: '{{ authentik_auth_flow_uuid }}'
+          invalidation_flow: '{{ authentik_invalidation_flow_uuid }}'
+          property_mappings: '{{ oidc_scope_mapping_uuids }}'
           redirect_uris:
             - matching_mode: strict
-              url: "https://{{ argocd_hostname }}/auth/callback"
+              url: 'https://{{ argocd_hostname }}/auth/callback'
           client_type: confidential
           sub_mode: user_username
-          signing_key: "{{ authentik_signing_key_uuid }}"
+          signing_key: '{{ authentik_signing_key_uuid }}'
         status_code: 201
       register: create_oidc_provider_result
       changed_when: true
@@ -315,28 +349,28 @@
 
     - name: Set OIDC provider ID fact from existing provider
       ansible.builtin.set_fact:
-        argocd_oidc_provider_id: "{{ existing_oidc_provider_result.json.results[0].pk }}"
+        argocd_oidc_provider_id: '{{ existing_oidc_provider_result.json.results[0].pk }}'
       when:
         - bootstrap_node | default(false)
         - existing_oidc_provider_result.json.pagination.count > 0
 
     - name: Set OIDC provider ID fact from newly created provider
       ansible.builtin.set_fact:
-        argocd_oidc_provider_id: "{{ create_oidc_provider_result.json.pk }}"
+        argocd_oidc_provider_id: '{{ create_oidc_provider_result.json.pk }}'
       when:
         - bootstrap_node | default(false)
         - existing_oidc_provider_result.json.pagination.count == 0
 
     - name: Update ArgoCD OAuth2 provider property mappings and signing key in Authentik
       ansible.builtin.uri:
-        url: "{{ authentik_api_url }}/providers/oauth2/{{ argocd_oidc_provider_id }}/"
+        url: '{{ authentik_api_url }}/providers/oauth2/{{ argocd_oidc_provider_id }}/'
         method: PATCH
         headers:
-          Authorization: "Bearer {{ authentik_bootstrap_token }}"
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
         body_format: json
         body:
-          property_mappings: "{{ oidc_scope_mapping_uuids }}"
-          signing_key: "{{ authentik_signing_key_uuid }}"
+          property_mappings: '{{ oidc_scope_mapping_uuids }}'
+          signing_key: '{{ authentik_signing_key_uuid }}'
         status_code: 200
       register: patch_provider_result
       changed_when: >-
@@ -349,24 +383,24 @@
 
     - name: Check if ArgoCD application already exists in Authentik
       ansible.builtin.uri:
-        url: "{{ authentik_api_url }}/core/applications/?slug=argocd"
+        url: '{{ authentik_api_url }}/core/applications/?slug=argocd'
         headers:
-          Authorization: "Bearer {{ authentik_bootstrap_token }}"
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
       register: existing_argocd_app_result
       changed_when: false
       when: bootstrap_node | default(false)
 
     - name: Create ArgoCD application in Authentik
       ansible.builtin.uri:
-        url: "{{ authentik_api_url }}/core/applications/"
+        url: '{{ authentik_api_url }}/core/applications/'
         method: POST
         headers:
-          Authorization: "Bearer {{ authentik_bootstrap_token }}"
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
         body_format: json
         body:
           name: ArgoCD
           slug: argocd
-          provider: "{{ argocd_oidc_provider_id }}"
+          provider: '{{ argocd_oidc_provider_id }}'
         status_code: 201
       register: create_argocd_app_result
       changed_when: true
@@ -376,17 +410,17 @@
 
     - name: Get ArgoCD OAuth2 provider details from Authentik
       ansible.builtin.uri:
-        url: "{{ authentik_api_url }}/providers/oauth2/{{ argocd_oidc_provider_id }}/"
+        url: '{{ authentik_api_url }}/providers/oauth2/{{ argocd_oidc_provider_id }}/'
         headers:
-          Authorization: "Bearer {{ authentik_bootstrap_token }}"
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
       register: argocd_oidc_provider_details
       changed_when: false
       when: bootstrap_node | default(false)
 
     - name: Set OIDC client credential facts
       ansible.builtin.set_fact:
-        argocd_oidc_client_id: "{{ argocd_oidc_provider_details.json.client_id }}"
-        argocd_oidc_client_secret: "{{ argocd_oidc_provider_details.json.client_secret }}"
+        argocd_oidc_client_id: '{{ argocd_oidc_provider_details.json.client_id }}'
+        argocd_oidc_client_secret: '{{ argocd_oidc_provider_details.json.client_secret }}'
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
@@ -439,7 +473,7 @@
     # ArgoCD Readiness
     # Waits for the ArgoCD server deployment to be ready before the playbook
     # completes. The HTTPRoute that exposes the ArgoCD UI is managed by
-    # authentication.yml, which centralises HTTPRoute management and applies
+    # authentication.yml, which centralizes HTTPRoute management and applies
     # the Authentik ForwardAuth middleware across all cluster services.
     # -------------------------------------------------------------------------
     - name: Wait for ArgoCD server deployment to be ready
@@ -451,3 +485,227 @@
           --timeout=5m
       changed_when: false
       when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Gitea Repository Credentials and Webhook
+    # Creates the gitops repository in Gitea if it does not already exist, then
+    # creates an ArgoCD access token and stores it as a repository credential
+    # Secret in the argocd namespace. ArgoCD uses this Secret to authenticate
+    # to the specific gitops repository.
+    #
+    # A Gitea webhook is also configured on the gitops repository to notify
+    # ArgoCD on every push, triggering an immediate sync rather than waiting
+    # for ArgoCD's default polling interval.
+    #
+    # Idempotency for the credential Secret is managed by checking whether the
+    # gitea-gitops Secret already exists. Idempotency for the webhook is
+    # managed separately by checking whether a hook pointing to the ArgoCD
+    # webhook URL already exists on the repository.
+    #
+    # Requires gitea.yml to have been run first so that the gitea-credentials
+    # Secret exists in the gitea namespace.
+    # -------------------------------------------------------------------------
+    - name: Check if ArgoCD Gitea repo-creds secret already exists
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret gitea-gitops -n {{ argocd_namespace }}
+      register: existing_repo_creds_check
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Read Gitea admin password from Kubernetes secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret gitea-credentials -n {{ gitea_namespace }}
+          -o jsonpath='{.data.admin-password}'
+      register: gitea_admin_password_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Gitea admin password fact
+      ansible.builtin.set_fact:
+        gitea_admin_password: '{{ gitea_admin_password_b64.stdout | b64decode }}'
+      when: bootstrap_node | default(false)
+
+    - name: Get Gitea pod IP
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get pod -n {{ gitea_namespace }}
+          -l app.kubernetes.io/name=gitea,app.kubernetes.io/instance=gitea
+          -o jsonpath='{.items[0].status.podIP}'
+      register: gitea_pod_ip
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Gitea API URL fact
+      ansible.builtin.set_fact:
+        gitea_api_url: 'http://{{ gitea_pod_ip.stdout }}:3000/api/v1'
+      when: bootstrap_node | default(false)
+
+    - name: Check if gitops repository already exists in Gitea
+      ansible.builtin.uri:
+        url: '{{ gitea_api_url }}/repos/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}'
+        url_username: '{{ gitea_admin_username }}'
+        url_password: '{{ gitea_admin_password }}'
+        force_basic_auth: true
+        status_code: [200, 404]
+      register: gitops_repo_check
+      changed_when: false
+      when:
+        - bootstrap_node | default(false)
+        - existing_repo_creds_check.rc != 0
+
+    - name: Create gitops repository in Gitea
+      ansible.builtin.uri:
+        url: '{{ gitea_api_url }}/user/repos'
+        method: POST
+        url_username: '{{ gitea_admin_username }}'
+        url_password: '{{ gitea_admin_password }}'
+        force_basic_auth: true
+        body_format: json
+        body:
+          name: '{{ gitea_gitops_repo }}'
+          description: GitOps repository for ArgoCD
+          private: true
+          auto_init: true
+          default_branch: main
+        status_code: 201
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - existing_repo_creds_check.rc != 0
+        - gitops_repo_check.status == 404
+
+    - name: List existing tokens for Gitea admin user
+      ansible.builtin.uri:
+        url: '{{ gitea_api_url }}/users/{{ gitea_admin_username }}/tokens'
+        url_username: '{{ gitea_admin_username }}'
+        url_password: '{{ gitea_admin_password }}'
+        force_basic_auth: true
+      register: gitea_tokens_result
+      changed_when: false
+      when:
+        - bootstrap_node | default(false)
+        - existing_repo_creds_check.rc != 0
+
+    - name: Set existing ArgoCD token fact
+      ansible.builtin.set_fact:
+        existing_argocd_token: >-
+          {{
+            gitea_tokens_result.json
+            | selectattr('name', 'equalto', 'argocd')
+            | list
+            | first
+            | default({})
+          }}
+      when:
+        - bootstrap_node | default(false)
+        - existing_repo_creds_check.rc != 0
+
+    - name: Delete stale ArgoCD token from Gitea
+      ansible.builtin.uri:
+        url: '{{ gitea_api_url }}/users/{{ gitea_admin_username }}/tokens/{{ existing_argocd_token.id }}'
+        method: DELETE
+        url_username: '{{ gitea_admin_username }}'
+        url_password: '{{ gitea_admin_password }}'
+        force_basic_auth: true
+        status_code: 204
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - existing_repo_creds_check.rc != 0
+        - existing_argocd_token.id is defined
+
+    - name: Create ArgoCD access token in Gitea
+      ansible.builtin.uri:
+        url: '{{ gitea_api_url }}/users/{{ gitea_admin_username }}/tokens'
+        method: POST
+        url_username: '{{ gitea_admin_username }}'
+        url_password: '{{ gitea_admin_password }}'
+        force_basic_auth: true
+        body_format: json
+        body:
+          name: argocd
+          scopes:
+            - read:repository
+        status_code: 201
+      register: create_gitea_token_result
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - existing_repo_creds_check.rc != 0
+
+    - name: Create Gitea gitops repository credential secret in argocd namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic gitea-gitops
+          -n {{ argocd_namespace }}
+          --from-literal=type=git
+          --from-literal=url=http://gitea-http.{{ gitea_namespace }}.svc.cluster.local:3000/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}
+          --from-literal=username={{ gitea_admin_username }}
+          --from-literal=password={{ create_gitea_token_result.json.sha1 }}
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - existing_repo_creds_check.rc != 0
+
+    - name: Label Gitea gitops repository credential secret for ArgoCD
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          label secret gitea-gitops
+          -n {{ argocd_namespace }}
+          argocd.argoproj.io/secret-type=repository
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - existing_repo_creds_check.rc != 0
+
+    - name: List existing webhooks on gitops repository in Gitea
+      ansible.builtin.uri:
+        url: '{{ gitea_api_url }}/repos/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}/hooks'
+        url_username: '{{ gitea_admin_username }}'
+        url_password: '{{ gitea_admin_password }}'
+        force_basic_auth: true
+      register: gitops_hooks_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set existing ArgoCD webhook fact
+      ansible.builtin.set_fact:
+        existing_argocd_webhook: >-
+          {{
+            gitops_hooks_result.json
+            | selectattr('config.url', 'equalto', 'https://' + argocd_hostname + '/api/webhook')
+            | list
+            | first
+            | default({})
+          }}
+      when: bootstrap_node | default(false)
+
+    - name: Create ArgoCD webhook on gitops repository in Gitea
+      ansible.builtin.uri:
+        url: '{{ gitea_api_url }}/repos/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}/hooks'
+        method: POST
+        url_username: '{{ gitea_admin_username }}'
+        url_password: '{{ gitea_admin_password }}'
+        force_basic_auth: true
+        body_format: json
+        body:
+          type: gitea
+          config:
+            url: 'https://{{ argocd_hostname }}/api/webhook'
+            content_type: json
+          events:
+            - push
+          active: true
+        status_code: 201
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - existing_argocd_webhook.id is not defined
