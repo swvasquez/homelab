@@ -88,8 +88,6 @@
   become: true
   become_exe: sudo.ws
   vars:
-    bootstrap_node: false
-    dns_zone: example.internal
     argocd_namespace: argocd
     argocd_chart_version: 9.4.15
     argocd_hostname: 'argocd.{{ dns_zone }}'
@@ -650,6 +648,7 @@
           --from-literal=username={{ gitea_admin_username }}
           --from-literal=password={{ create_gitea_token_result.json.sha1 }}
       changed_when: true
+      no_log: true
       when:
         - bootstrap_node | default(false)
         - existing_repo_creds_check.rc != 0

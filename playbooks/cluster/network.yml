@@ -70,6 +70,11 @@
 #                            (default: 128Mi).
 #   externaldns_chart_version:     Version of the kubernetes-sigs ExternalDNS
 #                            Helm chart (default: 1.19.0).
+#   upstream_dns:            Space-separated list of upstream DNS servers used
+#                            by CoreDNS to resolve non-cluster, non-homelab
+#                            queries. Must be IPs directly reachable from pod
+#                            network (not 127.0.0.53 or LoadBalancer IPs).
+#                            (default: 8.8.8.8 1.1.1.1).
 #   dns_zone:                DNS zone served by Bind9 (e.g. homelab.internal).
 #                            Read from group_vars.
 #   lb_ip_pool_cidr:         CIDR block allocated for Cilium LoadBalancer IP
@@ -91,8 +96,8 @@
   become: true
   become_exe: sudo.ws
   vars:
-    kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
-    hubble_hostname: "hubble.{{ dns_zone }}"
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    hubble_hostname: 'hubble.{{ dns_zone }}'
     control_plane_ip: >-
       {{ groups["homelab"] | map("extract", hostvars)
          | selectattr("bootstrap_node", "equalto", true)
@@ -107,13 +112,14 @@
     gateway_api_version: 1.4.1
     traefik_chart_version: 34.4.1
     traefik_namespace: traefik
-    traefik_hostname: "traefik.{{ dns_zone }}"
+    traefik_hostname: 'traefik.{{ dns_zone }}'
     cert_manager_chart_version: 1.20.0
     cert_manager_namespace: cert-manager
     bind9_image: "internetsystemsconsortium/bind9:9.20"
     bind9_namespace: kube-system
     bind9_pvc_size: 128Mi
     externaldns_chart_version: 1.19.0
+    upstream_dns: 8.8.8.8 1.1.1.1
 
   tasks:
     # -------------------------------------------------------------------------
@@ -210,8 +216,8 @@
           --set hubble.ui.enabled=true
           --set hubble.ui.ingress.enabled=false
           --set l2announcements.enabled=true
-      when: bootstrap_node | default(false)
       changed_when: true
+      when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
     # LoadBalancer IP Pool
@@ -409,9 +415,9 @@
       vars:
         httproute_name: traefik-dashboard
         httproute_namespace: kube-system
-        httproute_hostname: "{{ traefik_hostname }}"
+        httproute_hostname: '{{ traefik_hostname }}'
         httproute_backend_name: traefik
-        httproute_backend_namespace: "{{ traefik_namespace }}"
+        httproute_backend_namespace: '{{ traefik_namespace }}'
         httproute_backend_port: 8080
       when: bootstrap_node | default(false)
 
@@ -537,7 +543,7 @@
       vars:
         httproute_name: hubble-ui
         httproute_namespace: kube-system
-        httproute_hostname: "{{ hubble_hostname }}"
+        httproute_hostname: '{{ hubble_hostname }}'
         httproute_backend_name: hubble-ui
         httproute_backend_namespace: kube-system
         httproute_backend_port: 80
@@ -688,7 +694,7 @@
         dest: /tmp/externaldns-values.yml
         mode: "0644"
       vars:
-        bind9_service_ip: "{{ bind9_service_ip_result.stdout }}"
+        bind9_service_ip: '{{ bind9_service_ip_result.stdout }}'
       when: bootstrap_node | default(false)
 
     - name: Install or upgrade ExternalDNS via Helm
@@ -711,12 +717,11 @@
     # -------------------------------------------------------------------------
     # CoreDNS Configuration
     # Patches the CoreDNS ConfigMap to add a dedicated forwarding block for the
-    # homelab DNS zone. By default, CoreDNS forwards all non-cluster queries via
-    # the node's /etc/resolv.conf, which resolves to the Bind9 LoadBalancer IP.
-    # That IP is unreachable from inside pods because Cilium's eBPF kube-proxy
-    # replacement does not support hairpin NAT for LoadBalancer IPs. An explicit
-    # forward block using Bind9's ClusterIP resolves this — ClusterIPs are always
-    # reachable within the cluster via Cilium's eBPF datapath.
+    # homelab DNS zone. The homelab zone is forwarded to the Bind9 ClusterIP,
+    # which is always reachable within the cluster via Cilium's eBPF datapath.
+    # The default zone forwards to explicit upstream DNS IPs (upstream_dns)
+    # rather than /etc/resolv.conf because nodes use systemd-resolved with a
+    # stub listener at 127.0.0.53, which is not reachable from pod network IPs.
     # -------------------------------------------------------------------------
     - name: Fetch Bind9 ClusterIP for CoreDNS forwarding configuration
       ansible.builtin.command:
@@ -748,7 +753,7 @@
                  ttl 30
               }
               prometheus :9153
-              forward . /etc/resolv.conf {
+              forward . {{ upstream_dns }} {
                  max_concurrent 1000
               }
               cache 30 {

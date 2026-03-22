@@ -1,0 +1,24 @@
+{#
+  PersistentVolumeClaim for the Immich photo library. The Immich Helm chart
+  requires an existing PVC for the library and does not provision one
+  automatically. This PVC must be created before ArgoCD first syncs the
+  Immich Helm release.
+
+  Variables:
+    immich_library_pvc_name: Name of the PVC (e.g. immich-library).
+    immich_namespace:        Kubernetes namespace for Immich.
+    immich_storage_class:    StorageClass used to provision the volume.
+    immich_library_size:     Requested storage size (e.g. 10Gi).
+#}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: '{{ immich_library_pvc_name }}'
+  namespace: '{{ immich_namespace }}'
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: '{{ immich_storage_class }}'
+  resources:
+    requests:
+      storage: '{{ immich_library_size }}'

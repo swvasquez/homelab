@@ -1,0 +1,98 @@
+{#
+  Immich Helm values for the homelab deployment. Deployed by ArgoCD using the
+  multi-source feature, with this file stored in the Gitea gitops repository and
+  the Immich Helm chart sourced from the upstream immich-app/immich-charts
+  repository.
+
+  PostgreSQL is provided by a CloudNativePG Cluster (immich-db) provisioned by
+  the immich.yml Ansible playbook. The database password and application secret
+  key are read from the Kubernetes Secret 'immich-credentials' in the immich
+  namespace via secretKeyRef so that they are never committed to the gitops
+  repository.
+
+  Note: The OIDC client ID and client secret are stored in this file which is
+  committed to the gitops repository. Ensure the repository is private. For
+  production deployments consider using Sealed Secrets or an External Secrets
+  Operator to manage these values.
+
+  Variables:
+    immich_image_tag:          Docker image tag for Immich server and machine-learning.
+    authentik_hostname:        FQDN of the Authentik identity provider.
+    immich_oidc_client_id:     OIDC client ID registered in Authentik.
+    immich_oidc_client_secret: OIDC client secret from Authentik.
+    immich_db_name:            PostgreSQL database name.
+    immich_db_username:        PostgreSQL username.
+    immich_namespace:          Kubernetes namespace where Immich is deployed.
+    immich_library_pvc_name:   Name of the pre-existing PVC for the photo library.
+    immich_storage_class:      Kubernetes StorageClass for the Valkey data PVC and
+                               the database PVC provisioned in immich.yml.
+#}
+immich:
+  persistence:
+    library:
+      existingClaim: '{{ immich_library_pvc_name }}'
+
+  configuration:
+    oauth:
+      enabled: true
+      issuerUrl: 'https://{{ authentik_hostname }}/application/o/immich/'
+      clientId: '{{ immich_oidc_client_id }}'
+      clientSecret: '{{ immich_oidc_client_secret }}'
+      scope: openid email profile
+      buttonText: Sign in with Authentik
+      autoRegister: true
+      storageLabelClaim: preferred_username
+
+server:
+  controllers:
+    main:
+      containers:
+        main:
+          image:
+            tag: '{{ immich_image_tag }}'
+          env:
+            DB_HOSTNAME: 'immich-db-rw.{{ immich_namespace }}.svc'
+            DB_DATABASE_NAME: '{{ immich_db_name }}'
+            DB_USERNAME: '{{ immich_db_username }}'
+            DB_PASSWORD:
+              valueFrom:
+                secretKeyRef:
+                  name: immich-credentials
+                  key: db-password
+            SECRET_KEY:
+              valueFrom:
+                secretKeyRef:
+                  name: immich-credentials
+                  key: secret-key
+            NODE_TLS_REJECT_UNAUTHORIZED: '0'
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+
+machine-learning:
+  enabled: true
+  controllers:
+    main:
+      containers:
+        main:
+          image:
+            tag: '{{ immich_image_tag }}'
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+
+valkey:
+  enabled: true
+  persistence:
+    data:
+      enabled: true
+      type: persistentVolumeClaim
+      size: 1Gi
+      accessMode: ReadWriteOnce
+      storageClass: '{{ immich_storage_class }}'
