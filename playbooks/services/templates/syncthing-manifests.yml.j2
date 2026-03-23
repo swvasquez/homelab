@@ -1,0 +1,153 @@
+{#
+  Native Kubernetes manifests for the Syncthing deployment, deployed via ArgoCD.
+  Contains the Services to expose the GUI and sync ports, and the StatefulSet
+  that manages the Syncthing pod and its persistent storage.
+
+  Variables:
+    syncthing_namespace:      Kubernetes namespace where Syncthing is deployed.
+    syncthing_image:          Docker image for Syncthing.
+    syncthing_image_tag:      Docker image tag for Syncthing.
+    syncthing_storage_class:  StorageClass to use for the PersistentVolumeClaim.
+    syncthing_storage_size:   Size of the PersistentVolumeClaim.
+    syncthing_gui_port:       Port for the Web GUI.
+    syncthing_sync_port:      Port for the sync protocol.
+    syncthing_discovery_port: Port for local discovery.
+    syncthing_sync_hostname:  DNS hostname for the sync service.
+#}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: syncthing-gui
+  namespace: '{{ syncthing_namespace }}'
+  labels:
+    app.kubernetes.io/name: syncthing
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: syncthing
+  ports:
+    - name: http
+      port: {{ syncthing_gui_port }}
+      targetPort: {{ syncthing_gui_port }}
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: syncthing-sync
+  namespace: '{{ syncthing_namespace }}'
+  annotations:
+    external-dns.alpha.kubernetes.io/hostname: '{{ syncthing_sync_hostname }}'
+  labels:
+    app.kubernetes.io/name: syncthing
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: syncthing
+  ports:
+    - name: tcp-sync
+      port: {{ syncthing_sync_port }}
+      targetPort: {{ syncthing_sync_port }}
+      protocol: TCP
+    - name: udp-sync
+      port: {{ syncthing_sync_port }}
+      targetPort: {{ syncthing_sync_port }}
+      protocol: UDP
+    - name: udp-discovery
+      port: {{ syncthing_discovery_port }}
+      targetPort: {{ syncthing_discovery_port }}
+      protocol: UDP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: syncthing
+  namespace: '{{ syncthing_namespace }}'
+  labels:
+    app.kubernetes.io/name: syncthing
+spec:
+  serviceName: syncthing-gui
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: syncthing
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: syncthing
+    spec:
+      securityContext:
+        fsGroup: 1000
+      initContainers:
+        - name: configure-syncthing
+          image: '{{ syncthing_image }}:{{ syncthing_image_tag }}'
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              CONFIG_FILE="/var/syncthing/config/config.xml"
+              if [ ! -f "$CONFIG_FILE" ]; then
+                  /bin/syncthing generate --home=/var/syncthing/config
+              fi
+
+              INSECURE="{{ syncthing_allow_insecure_admin_access | lower }}"
+              if grep -q "<insecureAdminAccess>" "$CONFIG_FILE"; then
+                  sed -i "s|<insecureAdminAccess>.*<\/insecureAdminAccess>|<insecureAdminAccess>${INSECURE}<\/insecureAdminAccess>|g" "$CONFIG_FILE"
+              else
+                  sed -i "/<gui /a \        <insecureAdminAccess>${INSECURE}</insecureAdminAccess>" "$CONFIG_FILE"
+              fi
+
+              DEFAULT_PATH="{{ syncthing_default_folder_path }}"
+              if grep -q "<defaultFolderPath>" "$CONFIG_FILE"; then
+                  sed -i "s|<defaultFolderPath>.*<\/defaultFolderPath>|<defaultFolderPath>${DEFAULT_PATH}<\/defaultFolderPath>|g" "$CONFIG_FILE"
+              else
+                  sed -i "/<options>/a \        <defaultFolderPath>${DEFAULT_PATH}</defaultFolderPath>" "$CONFIG_FILE"
+              fi
+
+              # Ensure the default sync directory exists
+              mkdir -p "$DEFAULT_PATH"
+          volumeMounts:
+            - name: syncthing-data
+              mountPath: /var/syncthing
+      containers:
+        - name: syncthing
+          image: '{{ syncthing_image }}:{{ syncthing_image_tag }}'
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: {{ syncthing_gui_port }}
+              protocol: TCP
+            - name: tcp-sync
+              containerPort: {{ syncthing_sync_port }}
+              protocol: TCP
+            - name: udp-sync
+              containerPort: {{ syncthing_sync_port }}
+              protocol: UDP
+            - name: discovery
+              containerPort: {{ syncthing_discovery_port }}
+              protocol: UDP
+          volumeMounts:
+            - name: syncthing-data
+              mountPath: /var/syncthing
+          readinessProbe:
+            tcpSocket:
+              port: {{ syncthing_gui_port }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: {{ syncthing_gui_port }}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+  volumeClaimTemplates:
+    - metadata:
+        name: syncthing-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: '{{ syncthing_storage_class }}'
+        resources:
+          requests:
+            storage: '{{ syncthing_storage_size }}'

@@ -57,7 +57,7 @@ Playbooks are organized logically into categories, and each category maintains i
 - `infrastructure/`: OS-level configurations and bare-metal setup.
 - `cluster/`: Kubernetes cluster bootstrapping and core components.
 - `development/`: Language toolchains and development environments.
-- `services/`: Cluster-hosted services (e.g. Gitea, ArgoCD).
+- `services/`: Cluster-hosted services (e.g. Gitea, ArgoCD, Syncthing).
 
 ## Usage
 
@@ -113,3 +113,9 @@ just lint playbooks/cluster/bootstrap.yml
   just install services <SERVICE>
   just install cluster authentication
   ```
+- **Local DNS Resolution**: To resolve homelab services (e.g., `*.homelab.internal`) from your local machine, configure your OS to use the cluster's Bind9 LoadBalancer IP as its nameserver. Note that Syncthing sync traffic uses a **dedicated LoadBalancer IP** (separate from the web GUI) to ensure high-performance data transfer.
+  - **macOS Setup**:
+    ```sh
+    sudo mkdir -p /etc/resolver
+    echo "nameserver <BIND9_LB_IP>" | sudo tee /etc/resolver/<DNS_ZONE>
+    ```

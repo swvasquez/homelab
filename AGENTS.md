@@ -35,5 +35,6 @@ For any request, unless explicitly asked
 
 When attempting to answer a question or debug an issue
 - Assume `kubectl` is available for you to run locally and is connected to the cluster you are debugging
-- Query cluster services with `curl` (via IP or DNS) since the service and DNS load balancers are available on the LAN
-- Prevent build up of artifacts by uninstalling any additional Docker images, Helm charts, Kubernetes manifests, etc., that are used purely for debugging
+- Query cluster services with `curl` (via IP address or DNS) since the service and DNS load balancers are available on the LAN
+- Prevent the build up of artifacts by uninstalling any additional Docker images, Helm charts, Kubernetes manifests, etc., that are used purely for debugging
+- Periodically inform the user whether or not you think you are making progress when running many commands in succession

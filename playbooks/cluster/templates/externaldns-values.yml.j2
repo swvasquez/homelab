@@ -1,8 +1,9 @@
 {#
   Helm values for the kubernetes-sigs ExternalDNS chart. Configures ExternalDNS to
-  watch Gateway API HTTPRoute resources and sync hostnames as A records into Bind9
-  using RFC 2136 dynamic DNS updates authenticated with a TSIG key. Only upsert
-  (create/update) operations are performed — records are never deleted automatically.
+  watch Gateway API HTTPRoute resources and Kubernetes Service resources, syncing
+  hostnames as A records into Bind9 using RFC 2136 dynamic DNS updates authenticated
+  with a TSIG key. Only upsert (create/update) operations are performed — records are
+  never deleted automatically.
 
   Variables:
     bind9_service_ip:  External IP of the Bind9 LoadBalancer service. Resolved at
@@ -25,5 +26,6 @@ extraArgs:
 
 sources:
   - gateway-httproute
+  - service
 
 policy: upsert-only

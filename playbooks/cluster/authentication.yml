@@ -17,10 +17,11 @@
 # it is the identity provider.
 #
 # After Authentik is deployed, a Traefik ForwardAuth Middleware is applied to
-# the kube-system, longhorn-system, observability, gitea, argocd, and immich
-# namespaces, and the Hubble, Traefik dashboard, Longhorn, Prometheus, Grafana,
-# Alertmanager, Gitea, ArgoCD, and Immich HTTPRoutes are re-applied with the
-# middleware enabled. This protects those UIs behind Authentik authentication.
+# the kube-system, longhorn-system, observability, gitea, argocd, immich, and
+# syncthing namespaces, and the Hubble, Traefik dashboard, Longhorn, Prometheus,
+# Grafana, Alertmanager, Gitea, ArgoCD, Immich, and Syncthing HTTPRoutes are
+# re-applied with the middleware enabled. This protects those UIs behind
+# Authentik authentication.
 #
 # Variables:
 #   bootstrap_node:              Boolean indicating if the host is the control
@@ -64,6 +65,10 @@
 #                                (default: immich).
 #   immich_hostname:             FQDN for the Immich UI, derived from dns_zone
 #                                (default: immich.<dns_zone>).
+#   syncthing_namespace:         Kubernetes namespace for Syncthing
+#                                (default: syncthing).
+#   syncthing_hostname:          FQDN for the Syncthing UI, derived from dns_zone
+#                                (default: syncthing.<dns_zone>).
 #   kubectl_config_path:         Full path to the kubectl config file
 #                                (default: /home/<ansible_user>/.kube/config).
 #   authentik_bootstrap_token:   API token auto-generated on first run and
@@ -113,6 +118,8 @@
     argocd_hostname: 'argocd.{{ dns_zone }}'
     immich_namespace: immich
     immich_hostname: 'immich.{{ dns_zone }}'
+    syncthing_namespace: syncthing
+    syncthing_hostname: 'syncthing.{{ dns_zone }}'
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
     protected_httproutes:
       - name: hubble-ui
@@ -169,6 +176,12 @@
         backend_name: immich-server
         backend_ns: '{{ immich_namespace }}'
         backend_port: 2283
+      - name: syncthing
+        route_ns: '{{ syncthing_namespace }}'
+        hostname: '{{ syncthing_hostname }}'
+        backend_name: syncthing-gui
+        backend_ns: '{{ syncthing_namespace }}'
+        backend_port: 8384
 
   tasks:
     # -------------------------------------------------------------------------
@@ -488,60 +501,60 @@
 
     - name: Set Authentik API base URL
       ansible.builtin.set_fact:
-        authentik_api_url: 'http://{{ authentik_server_clusterip.stdout }}/api/v3'
+        authentik_api_url: "http://{{ authentik_server_clusterip.stdout }}/api/v3"
       when: bootstrap_node | default(false)
 
     - name: Get default authorization flow UUID
       ansible.builtin.uri:
-        url: '{{ authentik_api_url }}/flows/instances/?slug=default-provider-authorization-implicit-consent' # noqa: yaml[line-length]
+        url: "{{ authentik_api_url }}/flows/instances/?slug=default-provider-authorization-implicit-consent" # noqa: yaml[line-length]
         headers:
-          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+          Authorization: "Bearer {{ authentik_bootstrap_token }}"
       register: auth_flow_result
       changed_when: false
       when: bootstrap_node | default(false)
 
     - name: Set authorization flow UUID fact
       ansible.builtin.set_fact:
-        authentik_auth_flow_uuid: '{{ auth_flow_result.json.results[0].pk }}'
+        authentik_auth_flow_uuid: "{{ auth_flow_result.json.results[0].pk }}"
       when: bootstrap_node | default(false)
 
     - name: Get default invalidation flow UUID
       ansible.builtin.uri:
-        url: '{{ authentik_api_url }}/flows/instances/?slug=default-provider-invalidation-flow' # noqa: yaml[line-length]
+        url: "{{ authentik_api_url }}/flows/instances/?slug=default-provider-invalidation-flow" # noqa: yaml[line-length]
         headers:
-          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+          Authorization: "Bearer {{ authentik_bootstrap_token }}"
       register: invalidation_flow_result
       changed_when: false
       when: bootstrap_node | default(false)
 
     - name: Set invalidation flow UUID fact
       ansible.builtin.set_fact:
-        authentik_invalidation_flow_uuid: '{{ invalidation_flow_result.json.results[0].pk }}'
+        authentik_invalidation_flow_uuid: "{{ invalidation_flow_result.json.results[0].pk }}"
       when: bootstrap_node | default(false)
 
     - name: Check if Forward Auth proxy provider already exists
       ansible.builtin.uri:
-        url: '{{ authentik_api_url }}/providers/proxy/?name=homelab-forward-auth'
+        url: "{{ authentik_api_url }}/providers/proxy/?name=homelab-forward-auth"
         headers:
-          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+          Authorization: "Bearer {{ authentik_bootstrap_token }}"
       register: existing_provider_result
       changed_when: false
       when: bootstrap_node | default(false)
 
     - name: Create domain-level Forward Auth proxy provider
       ansible.builtin.uri:
-        url: '{{ authentik_api_url }}/providers/proxy/'
+        url: "{{ authentik_api_url }}/providers/proxy/"
         method: POST
         headers:
-          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+          Authorization: "Bearer {{ authentik_bootstrap_token }}"
         body_format: json
         body:
           name: homelab-forward-auth
-          authorization_flow: '{{ authentik_auth_flow_uuid }}'
-          invalidation_flow: '{{ authentik_invalidation_flow_uuid }}'
+          authorization_flow: "{{ authentik_auth_flow_uuid }}"
+          invalidation_flow: "{{ authentik_invalidation_flow_uuid }}"
           mode: forward_domain
-          external_host: 'https://{{ authentik_hostname }}'
-          cookie_domain: '{{ dns_zone }}'
+          external_host: "https://{{ authentik_hostname }}"
+          cookie_domain: "{{ dns_zone }}"
         status_code: 201
       register: create_provider_result
       changed_when: true
@@ -551,38 +564,38 @@
 
     - name: Set proxy provider ID fact from existing provider
       ansible.builtin.set_fact:
-        authentik_provider_id: '{{ existing_provider_result.json.results[0].pk }}'
+        authentik_provider_id: "{{ existing_provider_result.json.results[0].pk }}"
       when:
         - bootstrap_node | default(false)
         - existing_provider_result.json.pagination.count > 0
 
     - name: Set proxy provider ID fact from newly created provider
       ansible.builtin.set_fact:
-        authentik_provider_id: '{{ create_provider_result.json.pk }}'
+        authentik_provider_id: "{{ create_provider_result.json.pk }}"
       when:
         - bootstrap_node | default(false)
         - existing_provider_result.json.pagination.count == 0
 
     - name: Check if Forward Auth application already exists
       ansible.builtin.uri:
-        url: '{{ authentik_api_url }}/core/applications/?slug=homelab-forward-auth'
+        url: "{{ authentik_api_url }}/core/applications/?slug=homelab-forward-auth"
         headers:
-          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+          Authorization: "Bearer {{ authentik_bootstrap_token }}"
       register: existing_app_result
       changed_when: false
       when: bootstrap_node | default(false)
 
     - name: Create Authentik application for Forward Auth
       ansible.builtin.uri:
-        url: '{{ authentik_api_url }}/core/applications/'
+        url: "{{ authentik_api_url }}/core/applications/"
         method: POST
         headers:
-          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+          Authorization: "Bearer {{ authentik_bootstrap_token }}"
         body_format: json
         body:
           name: Homelab Forward Auth
           slug: homelab-forward-auth
-          provider: '{{ authentik_provider_id }}'
+          provider: "{{ authentik_provider_id }}"
         status_code: 201
       changed_when: true
       when:
@@ -591,30 +604,30 @@
 
     - name: Get Authentik embedded outpost details
       ansible.builtin.uri:
-        url: '{{ authentik_api_url }}/outposts/instances/?managed=goauthentik.io%2Foutposts%2Fembedded' # noqa: yaml[line-length]
+        url: "{{ authentik_api_url }}/outposts/instances/?managed=goauthentik.io%2Foutposts%2Fembedded" # noqa: yaml[line-length]
         headers:
-          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+          Authorization: "Bearer {{ authentik_bootstrap_token }}"
       register: outpost_result
       changed_when: false
       when: bootstrap_node | default(false)
 
     - name: Set outpost ID and current providers facts
       ansible.builtin.set_fact:
-        authentik_outpost_id: '{{ outpost_result.json.results[0].pk }}'
-        authentik_outpost_providers: '{{ outpost_result.json.results[0].providers }}'
+        authentik_outpost_id: "{{ outpost_result.json.results[0].pk }}"
+        authentik_outpost_providers: "{{ outpost_result.json.results[0].providers }}"
       when: bootstrap_node | default(false)
 
     - name: Assign Forward Auth provider to embedded outpost
       ansible.builtin.uri:
-        url: '{{ authentik_api_url }}/outposts/instances/{{ authentik_outpost_id }}/'
+        url: "{{ authentik_api_url }}/outposts/instances/{{ authentik_outpost_id }}/"
         method: PATCH
         headers:
-          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+          Authorization: "Bearer {{ authentik_bootstrap_token }}"
         body_format: json
         body:
-          providers: '{{ (authentik_outpost_providers + [authentik_provider_id]) | unique }}'
+          providers: "{{ (authentik_outpost_providers + [authentik_provider_id]) | unique }}"
           config:
-            authentik_host: 'https://{{ authentik_hostname }}'
+            authentik_host: "https://{{ authentik_hostname }}"
             authentik_host_insecure: false
         status_code: 200
       changed_when: true
@@ -631,13 +644,13 @@
       ansible.builtin.template:
         src: httproute.yml.j2
         dest: /tmp/authentik-httproute.yml
-        mode: '0644'
+        mode: "0644"
       vars:
         httproute_name: authentik
-        httproute_namespace: '{{ authentik_namespace }}'
-        httproute_hostname: '{{ authentik_hostname }}'
+        httproute_namespace: "{{ authentik_namespace }}"
+        httproute_hostname: "{{ authentik_hostname }}"
         httproute_backend_name: authentik-server
-        httproute_backend_namespace: '{{ authentik_namespace }}'
+        httproute_backend_namespace: "{{ authentik_namespace }}"
         httproute_backend_port: 80
       when: bootstrap_node | default(false)
 
@@ -670,9 +683,9 @@
       ansible.builtin.template:
         src: traefik-forward-auth-middleware.yml.j2
         dest: /tmp/traefik-forward-auth-middleware-{{ item }}.yml
-        mode: '0644'
+        mode: "0644"
       vars:
-        middleware_namespace: '{{ item }}'
+        middleware_namespace: "{{ item }}"
       loop: "{{ protected_httproutes | map(attribute='route_ns') | unique | list }}"
       when: bootstrap_node | default(false)
 
@@ -698,7 +711,7 @@
     # -------------------------------------------------------------------------
     # Protected HTTPRoutes
     # Re-applies the Hubble, Traefik dashboard, Longhorn, Prometheus, Grafana,
-    # Alertmanager, Gitea, ArgoCD, and Immich HTTPRoutes with the ForwardAuth
+    # Alertmanager, Gitea, ArgoCD, Immich, and Syncthing HTTPRoutes with the ForwardAuth
     # middleware enabled. This replaces the unauthenticated HTTPRoutes deployed
     # by network.yml, storage.yml, and observability.yml. Service HTTPRoutes are
     # managed here rather than in their individual service playbooks. If
@@ -708,16 +721,16 @@
     - name: Write Protected HTTPRoute manifests with ForwardAuth
       ansible.builtin.template:
         src: httproute.yml.j2
-        dest: '/tmp/{{ item.name }}-httproute.yml'
-        mode: '0644'
+        dest: "/tmp/{{ item.name }}-httproute.yml"
+        mode: "0644"
       vars:
         with_forward_auth: true
-        httproute_name: '{{ item.name }}'
-        httproute_namespace: '{{ item.route_ns }}'
-        httproute_hostname: '{{ item.hostname }}'
-        httproute_backend_name: '{{ item.backend_name }}'
-        httproute_backend_namespace: '{{ item.backend_ns }}'
-        httproute_backend_port: '{{ item.backend_port }}'
+        httproute_name: "{{ item.name }}"
+        httproute_namespace: "{{ item.route_ns }}"
+        httproute_hostname: "{{ item.hostname }}"
+        httproute_backend_name: "{{ item.backend_name }}"
+        httproute_backend_namespace: "{{ item.backend_ns }}"
+        httproute_backend_port: "{{ item.backend_port }}"
       loop: "{{ protected_httproutes }}"
       when: bootstrap_node | default(false)
 
@@ -735,7 +748,7 @@
 
     - name: Clean up Protected HTTPRoute manifests
       ansible.builtin.file:
-        path: '/tmp/{{ item.name }}-httproute.yml'
+        path: "/tmp/{{ item.name }}-httproute.yml"
         state: absent
       loop: "{{ protected_httproutes }}"
       when: bootstrap_node | default(false)

@@ -1,0 +1,37 @@
+{#
+  ArgoCD Application manifest for the Syncthing deployment. Uses the multi-source
+  feature or standard git tracking to deploy native Kubernetes manifests stored
+  in the Gitea gitops repository. Any push to the gitops repository triggers
+  an immediate sync via the Gitea webhook registered by argocd.yml.
+
+  Variables:
+    argocd_namespace:       Kubernetes namespace where ArgoCD is deployed.
+    syncthing_namespace:    Kubernetes namespace where Syncthing will be deployed.
+    syncthing_gitops_path:  Path within the gitops repository to the Syncthing
+                            manifests (e.g. apps/syncthing).
+    gitea_namespace:        Kubernetes namespace where Gitea is deployed.
+    gitea_admin_username:   Gitea admin username that owns the gitops repository.
+    gitea_gitops_repo:      Name of the Gitea gitops repository.
+#}
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: syncthing
+  namespace: '{{ argocd_namespace }}'
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: 'http://gitea-http.{{ gitea_namespace }}.svc.cluster.local:3000/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}'
+    path: '{{ syncthing_gitops_path }}'
+    targetRevision: main
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: '{{ syncthing_namespace }}'
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
