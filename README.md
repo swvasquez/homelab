@@ -119,3 +119,7 @@ just lint playbooks/cluster/bootstrap.yml
     sudo mkdir -p /etc/resolver
     echo "nameserver <BIND9_LB_IP>" | sudo tee /etc/resolver/<DNS_ZONE>
     ```
+- **Flushing the local DNS cache**: If a service is unreachable or resolves to a stale IP after a cluster change, flush the local DNS cache. Common triggers include deploying a new service, changing a LoadBalancer IP, or redeploying Bind9:
+  ```sh
+  just flush-dns
+  ```

@@ -17,6 +17,17 @@ ping subset="homelab":
     set -euxo pipefail
     uv run ansible {{ subset }} -m ping -i inventory.yml
 
+# Flush the local DNS cache
+flush-dns:
+    #!/usr/bin/env sh
+    set -euxo pipefail
+    if [ "$(uname)" = "Darwin" ]; then
+        sudo dscacheutil -flushcache
+        sudo killall -HUP mDNSResponder
+    else
+        sudo resolvectl flush-caches
+    fi
+
 # Run a specific Ansible playbook on a subset of machines
 install category playbook subset="homelab":
     #!/usr/bin/env sh
