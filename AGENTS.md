@@ -31,4 +31,9 @@ For YAML files (or templates for YAML files)
 For any request, unless explicitly asked
 - Do not concatenate files
 - Do not create new files such as unit tests
-- **CRITICAL:** Consider reviewing files individually, if the number of files to be reviewed is too large 
+- **CRITICAL:** Consider reviewing files individually, if the number of files to be reviewed is too large
+
+When attempting to answer a question or debug an issue
+- Assume `kubectl` is available for you to run locally and is connected to the cluster you are debugging
+- Query cluster services with `curl` (via IP or DNS) since the service and DNS load balancers are available on the LAN
+- Prevent build up of artifacts by uninstalling any additional Docker images, Helm charts, Kubernetes manifests, etc., that are used purely for debugging
