@@ -35,6 +35,7 @@ Ansible Playbooks to configure Ubuntu x86_64 machines and manage a Kubernetes ho
               nfs_server: <true|false>
               slurm_controller: <true|false>
               slurm_compute_node: <true|false>
+              vllm_host: <true|false>
     ```
 
 3.  Create a `group_vars/homelab.yml` file for group-level variables:

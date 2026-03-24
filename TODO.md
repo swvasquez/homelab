@@ -6,7 +6,17 @@
   ForwardAuth support in a future release, Traefik can be removed and all HTTPRoutes migrated back
   to a Cilium-managed Gateway.
 
-- **AMD GPU Operator** The existing nodes use Ryzen AI APUs (integrated graphics), not AMD Instinct data center GPUs. The Kubernetes AMD GPU Operator only supports AMD Instinct accelerators (MI100 through MI355X). Revisit installation of the AMD GPU Operator (or any of its constituent compnents) once supported.
+- **AMD GPU Operator** The existing nodes use Ryzen AI APUs (integrated graphics), not AMD Instinct data center GPUs. The Kubernetes AMD GPU Operator only supports AMD Instinct accelerators (MI100 through MI355X). Revisit installation of the AMD GPU Operator (or any of its constituent components) once supported.
+
+- **vLLM Helm chart** — vLLM is deployed via native Kubernetes manifests instead of the official Helm
+  chart because the chart does not support the ROCm container image. Revisit once the Helm chart adds
+  ROCm image configuration options.
+
+- **Centralized secrets management** — API keys and credentials are currently scattered across individual
+  Kubernetes Secrets, generated ad-hoc per service (e.g. `vllm-credentials`, `immich-credentials`). As
+  the number of services and API consumers grows, consider deploying OpenBao (open-source Vault fork) to
+  centralize secret storage, rotation, auditing, and dynamic credential generation. The K8s integration
+  (Agent sidecar or CSI driver) would replace per-playbook `openssl rand` key generation.
 
 - **CA-backed TLS issuer** — cert-manager currently uses a `selfSigned` ClusterIssuer, meaning each
   certificate is self-signed individually with no common CA. This prevents pods from trusting internal

@@ -764,6 +764,16 @@
         state: absent
       when: bootstrap_node | default(false)
 
+    - name: Trigger ArgoCD hard refresh to detect new gitops commit
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch application immich -n {{ argocd_namespace }}
+          --type merge
+          -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+      changed_when: true
+      when: bootstrap_node | default(false)
+
     - name: Wait for ArgoCD to sync and deploy Immich
       ansible.builtin.command:
         cmd: >-

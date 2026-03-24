@@ -1,0 +1,145 @@
+{#
+  Native Kubernetes manifests for the vLLM deployment, deployed via ArgoCD.
+  Contains a DaemonSet that runs the vLLM OpenAI-compatible API server with
+  direct ROCm GPU access on every node labeled homelab.internal/vllm-host=true,
+  and a LoadBalancer Service for LAN exposure that distributes requests across
+  all vLLM pods.
+
+  GPU access is provided by mounting /dev/kfd and /dev/dri from the host directly
+  into the container, bypassing the need for a Kubernetes GPU device plugin. This
+  is necessary because the AMD GPU Operator does not support Ryzen AI APUs. The
+  container runs in privileged mode to access these device files.
+
+  The Hugging Face model cache is stored on a hostPath so each node maintains its
+  own local copy. A PVC cannot be used because DaemonSets do not support
+  volumeClaimTemplates and a single RWO PVC cannot be shared across nodes.
+
+  Variables:
+    vllm_namespace:           Kubernetes namespace where vLLM is deployed.
+    vllm_image:               Docker image for the vLLM server.
+    vllm_image_tag:           Docker image tag for the vLLM server.
+    vllm_model:               Hugging Face model ID to serve.
+    vllm_dtype:               Data type for model weights (e.g. float16, bfloat16).
+    vllm_gpu_memory_util:     Fraction of GPU memory vLLM is allowed to use.
+    vllm_max_model_len:       Maximum sequence length the model can handle.
+    vllm_api_port:            Port for the OpenAI-compatible API server.
+    vllm_api_key_enabled:     Whether to require an API key for requests.
+    vllm_cache_host_path:     Host path for the Hugging Face model cache.
+    vllm_hostname:            DNS hostname for the LoadBalancer service.
+#}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: vllm
+  namespace: '{{ vllm_namespace }}'
+  labels:
+    app.kubernetes.io/name: vllm
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vllm
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vllm
+    spec:
+      nodeSelector:
+        homelab.internal/vllm-host: 'true'
+      securityContext:
+        fsGroup: 0
+      containers:
+        - name: vllm
+          image: '{{ vllm_image }}:{{ vllm_image_tag }}'
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          args:
+            - --model
+            - '{{ vllm_model }}'
+            - --dtype
+            - '{{ vllm_dtype }}'
+            - --gpu-memory-utilization
+            - '{{ vllm_gpu_memory_util }}'
+            - --max-model-len
+            - '{{ vllm_max_model_len }}'
+            - --host
+            - 0.0.0.0
+            - --port
+            - '{{ vllm_api_port }}'
+{% if vllm_api_key_enabled %}
+            - --api-key
+            - $(VLLM_API_KEY)
+{% endif %}
+          env:
+            - name: HF_HOME
+              value: /root/.cache/huggingface
+{% if vllm_api_key_enabled %}
+            - name: VLLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vllm-credentials
+                  key: api-key
+{% endif %}
+{% if vllm_hf_token_enabled %}
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: vllm-credentials
+                  key: hf-token
+{% endif %}
+          ports:
+            - name: http
+              containerPort: {{ vllm_api_port }}
+              protocol: TCP
+          volumeMounts:
+            - name: model-cache
+              mountPath: /root/.cache/huggingface
+            - name: dev-kfd
+              mountPath: /dev/kfd
+            - name: dev-dri
+              mountPath: /dev/dri
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: {{ vllm_api_port }}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: {{ vllm_api_port }}
+            initialDelaySeconds: 120
+            periodSeconds: 30
+      volumes:
+        - name: model-cache
+          hostPath:
+            path: '{{ vllm_cache_host_path }}'
+            type: DirectoryOrCreate
+        - name: dev-kfd
+          hostPath:
+            path: /dev/kfd
+            type: CharDevice
+        - name: dev-dri
+          hostPath:
+            path: /dev/dri
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-api
+  namespace: '{{ vllm_namespace }}'
+  annotations:
+    external-dns.alpha.kubernetes.io/hostname: '{{ vllm_hostname }}'
+  labels:
+    app.kubernetes.io/name: vllm
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: vllm
+  ports:
+    - name: http
+      port: {{ vllm_api_port }}
+      targetPort: {{ vllm_api_port }}
+      protocol: TCP
