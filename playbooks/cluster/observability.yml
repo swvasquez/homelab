@@ -17,27 +17,32 @@
 # so authentication.yml can protect them behind Authentik by re-applying the
 # templates with with_forward_auth: true.
 #
+# Custom Grafana dashboards are deployed as ConfigMaps labelled
+# grafana_dashboard: '1'. The Grafana sidecar watches for these ConfigMaps
+# across all namespaces and provisions them automatically. The node temperature
+# dashboard is set as the Grafana home page.
+#
 # Variables:
-#   bootstrap_node:          Boolean indicating if the host is the control
-#                            plane bootstrap node where Helm commands run.
-#                            Read from inventory host vars.
-#   dns_zone:                DNS zone (e.g. homelab.internal). Read from
-#                            group_vars.
-#   observability_namespace: Kubernetes namespace for the observability stack
-#                            (default: observability).
-#   prometheus_chart_version:      Helm chart version of kube-prometheus-stack to
-#                            install (default: 70.4.2).
-#   prometheus_hostname:     FQDN for the Prometheus UI, derived from dns_zone
-#                            (default: prometheus.<dns_zone>).
-#   grafana_hostname:        FQDN for the Grafana UI, derived from dns_zone
-#                            (default: grafana.<dns_zone>).
-#   alertmanager_hostname:   FQDN for the Alertmanager UI, derived from
-#                            dns_zone (default: alertmanager.<dns_zone>).
-#   kubectl_config_path:          Full path to the kubectl config file
-#                                 (default: /home/<ansible_user>/.kube/config).
-#   observability_httproutes:     List of HTTPRoute definitions for Prometheus,
-#                                 Grafana, and Alertmanager. Derived from the
-#                                 hostname variables above — do not set manually.
+#   bootstrap_node:           Boolean indicating if the host is the control
+#                             plane bootstrap node where Helm commands run.
+#                             Read from inventory host vars.
+#   dns_zone:                 DNS zone (e.g. homelab.internal). Read from
+#                             group_vars.
+#   observability_namespace:  Kubernetes namespace for the observability stack
+#                             (default: observability).
+#   prometheus_chart_version: Helm chart version of kube-prometheus-stack to
+#                             install (default: 70.4.2).
+#   prometheus_hostname:      FQDN for the Prometheus UI, derived from dns_zone
+#                             (default: prometheus.<dns_zone>).
+#   grafana_hostname:         FQDN for the Grafana UI, derived from dns_zone
+#                             (default: grafana.<dns_zone>).
+#   alertmanager_hostname:    FQDN for the Alertmanager UI, derived from
+#                             dns_zone (default: alertmanager.<dns_zone>).
+#   kubectl_config_path:      Full path to the kubectl config file
+#                             (default: /home/<ansible_user>/.kube/config).
+#   observability_httproutes: List of HTTPRoute definitions for Prometheus,
+#                             Grafana, and Alertmanager. Derived from the
+#                             hostname variables above — do not set manually.
 
 - name: Install Prometheus observability stack
   hosts: homelab
@@ -178,6 +183,36 @@
     - name: Clean up kube-prometheus-stack values file
       ansible.builtin.file:
         path: /tmp/prometheus-values.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Grafana Dashboards
+    # Deploys custom Grafana dashboards as ConfigMaps labelled grafana_dashboard:
+    # '1'. The Grafana sidecar watches for these ConfigMaps across all namespaces
+    # and provisions them automatically without requiring a pod restart.
+    # -------------------------------------------------------------------------
+    - name: Write node temperature dashboard ConfigMap manifest
+      ansible.builtin.template:
+        src: node-temperature-dashboard-configmap.yml.j2
+        dest: /tmp/node-temperature-dashboard-configmap.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply node temperature dashboard ConfigMap
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/node-temperature-dashboard-configmap.yml
+      register: node_temp_dashboard_result
+      changed_when: >-
+        'created' in node_temp_dashboard_result.stdout or
+        'configured' in node_temp_dashboard_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up node temperature dashboard ConfigMap manifest
+      ansible.builtin.file:
+        path: /tmp/node-temperature-dashboard-configmap.yml
         state: absent
       when: bootstrap_node | default(false)
 

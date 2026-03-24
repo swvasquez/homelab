@@ -1,0 +1,221 @@
+{#
+  ConfigMap containing the Node Temperatures Grafana dashboard JSON. The Grafana
+  sidecar watches for ConfigMaps with the label grafana_dashboard: '1' in the
+  observability namespace and automatically provisions them as dashboards.
+
+  The dashboard uses the node_hwmon_temp_celsius metric from node-exporter, which
+  exposes hardware sensor readings (CPU, motherboard, NVMe, etc.) per chip and
+  sensor. The $nodename template variable drives panel repetition so each node
+  gets its own dedicated stat row and time series plot, laid out side by side.
+  Each panel also plots the average temperature across all sensors as a bold blue
+  line for emphasis.
+
+  The raw block below prevents Jinja2 from interpreting Grafana's legend format
+  strings (e.g. {{chip}}) as template expressions.
+#}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: node-temperature-dashboard
+  namespace: '{{ observability_namespace }}'
+  labels:
+    grafana_dashboard: '1'
+data:
+  node-temperature.json: |
+    {% raw %}{
+      "annotations": {
+        "list": [
+          {
+            "builtIn": 1,
+            "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+            "enable": true,
+            "hide": true,
+            "iconColor": "rgba(0, 211, 255, 1)",
+            "name": "Annotations & Alerts",
+            "type": "dashboard"
+          }
+        ]
+      },
+      "description": "Hardware temperature readings for each cluster node via node-exporter hwmon metrics.",
+      "editable": true,
+      "graphTooltip": 1,
+      "links": [],
+      "panels": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "thresholds"},
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {"color": "green", "value": null},
+                  {"color": "yellow", "value": 60},
+                  {"color": "orange", "value": 75},
+                  {"color": "red",    "value": 85}
+                ]
+              },
+              "unit": "celsius"
+            },
+            "overrides": [
+              {
+                "matcher": {"id": "byFrameRefID", "options": "B"},
+                "properties": [
+                  {"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}
+                ]
+              }
+            ]
+          },
+          "gridPos": {"h": 4, "w": 12, "x": 0, "y": 0},
+          "id": 1,
+          "maxPerRow": 2,
+          "options": {
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": ["lastNotNull"],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "auto"
+          },
+          "repeat": "nodename",
+          "repeatDirection": "h",
+          "targets": [
+            {
+              "datasource": {"type": "prometheus", "uid": "prometheus"},
+              "expr": "node_hwmon_temp_celsius * on(instance) group_left(nodename) node_uname_info{nodename=\"$nodename\"}",
+              "instant": true,
+              "legendFormat": "{{chip}} {{sensor}}",
+              "refId": "A"
+            },
+            {
+              "datasource": {"type": "prometheus", "uid": "prometheus"},
+              "expr": "avg(node_hwmon_temp_celsius * on(instance) group_left(nodename) node_uname_info{nodename=\"$nodename\"})",
+              "instant": true,
+              "legendFormat": "Average",
+              "refId": "B"
+            }
+          ],
+          "title": "$nodename — Current Temperatures",
+          "type": "stat"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {"legend": false, "tooltip": false, "viz": false},
+                "lineInterpolation": "smooth",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {"type": "linear"},
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {"group": "A", "mode": "none"},
+                "thresholdsStyle": {"mode": "line+area"},
+                "axisSoftMax": 100
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {"color": "green", "value": null},
+                  {"color": "yellow", "value": 60},
+                  {"color": "orange", "value": 75},
+                  {"color": "red",    "value": 85}
+                ]
+              },
+              "unit": "celsius"
+            },
+            "overrides": [
+              {
+                "matcher": {"id": "byFrameRefID", "options": "B"},
+                "properties": [
+                  {"id": "custom.lineWidth", "value": 3},
+                  {"id": "custom.fillOpacity", "value": 25},
+                  {"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}},
+                  {"id": "displayName", "value": "Average"},
+                  {"id": "custom.zIndex", "value": 3}
+                ]
+              }
+            ]
+          },
+          "gridPos": {"h": 12, "w": 12, "x": 0, "y": 4},
+          "id": 2,
+          "maxPerRow": 2,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {"mode": "multi", "sort": "desc"}
+          },
+          "repeat": "nodename",
+          "repeatDirection": "h",
+          "targets": [
+            {
+              "datasource": {"type": "prometheus", "uid": "prometheus"},
+              "expr": "node_hwmon_temp_celsius * on(instance) group_left(nodename) node_uname_info{nodename=\"$nodename\"}",
+              "legendFormat": "{{chip}} {{sensor}}",
+              "refId": "A"
+            },
+            {
+              "datasource": {"type": "prometheus", "uid": "prometheus"},
+              "expr": "avg(node_hwmon_temp_celsius * on(instance) group_left(nodename) node_uname_info{nodename=\"$nodename\"})",
+              "legendFormat": "Average",
+              "refId": "B"
+            }
+          ],
+          "title": "$nodename — Temperature History",
+          "type": "timeseries"
+        }
+      ],
+      "refresh": "30s",
+      "schemaVersion": 38,
+      "tags": ["nodes", "temperature", "hardware"],
+      "templating": {
+        "list": [
+          {
+            "current": {},
+            "datasource": {"type": "prometheus", "uid": "prometheus"},
+            "definition": "label_values(node_uname_info, nodename)",
+            "hide": 0,
+            "includeAll": true,
+            "label": "Node",
+            "multi": true,
+            "name": "nodename",
+            "options": [],
+            "query": {
+              "query": "label_values(node_uname_info, nodename)",
+              "refId": "StandardVariableQuery"
+            },
+            "refresh": 2,
+            "regex": "",
+            "sort": 1,
+            "type": "query"
+          }
+        ]
+      },
+      "time": {"from": "now-3h", "to": "now"},
+      "timepicker": {},
+      "timezone": "browser",
+      "title": "Node Temperatures",
+      "uid": "node-temperatures",
+      "version": 1
+    }{% endraw %}

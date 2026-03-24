@@ -8,6 +8,10 @@
   Grafana's root_url is set to the HTTPS hostname so that redirect links and
   OAuth callbacks resolve correctly.
 
+  The Grafana sidecar is configured to watch for ConfigMaps labelled
+  grafana_dashboard: '1' in all namespaces and provision them automatically as
+  dashboards.
+
   Variables:
     grafana_hostname:       FQDN for the Grafana UI (e.g. grafana.homelab.internal).
     grafana_admin_password: Grafana admin password read from the grafana-credentials
@@ -24,6 +28,14 @@ grafana:
     auth.anonymous:
       enabled: true
       org_role: Admin
+    dashboards:
+      default_home_dashboard_path: /tmp/dashboards/node-temperature.json
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: '1'
+      searchNamespace: ALL
 
 prometheus:
   ingress:
