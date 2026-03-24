@@ -325,6 +325,11 @@
         mode: "0644"
       when: bootstrap_node | default(false)
 
+    # --force is required to avoid a recurring Helm upgrade conflict where
+    # Kubernetes rejects patching the Traefik Deployment in-place due to
+    # readinessProbe handler type changes between chart versions. --force
+    # deletes and recreates resources that cannot be patched, causing a brief
+    # Traefik restart on each run.
     - name: Install or upgrade Traefik via Helm
       ansible.builtin.command:
         cmd: >-
@@ -334,6 +339,7 @@
           --kubeconfig {{ kubectl_config_path }}
           --values /tmp/traefik-values.yml
           --version {{ traefik_chart_version }}
+          --force
       changed_when: true
       when: bootstrap_node | default(false)
 

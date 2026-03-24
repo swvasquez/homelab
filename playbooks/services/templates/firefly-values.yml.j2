@@ -1,0 +1,59 @@
+{#
+  Firefly III Helm values for the homelab deployment. Deployed by ArgoCD using the
+  multi-source feature, with this file stored in the Gitea gitops repository and
+  the Firefly III Helm chart sourced from the upstream repository.
+
+  PostgreSQL is provided by a CloudNativePG Cluster (firefly-db) provisioned by the
+  firefly.yml Ansible playbook. The database password and Laravel APP_KEY are loaded
+  from the firefly-credentials Kubernetes Secret via config.existingSecret so that they
+  are never committed to the gitops repository. The secret must contain keys named
+  APP_KEY and DB_PASSWORD.
+
+  The bundled Bitnami postgresql subchart is disabled in favour of the cnpg-managed
+  database. Ingress is disabled in favour of a Traefik HTTPRoute with Authentik
+  ForwardAuth, managed by cluster/authentication.yml.
+
+  Note: MAIL_MAILER is set to 'log' to suppress mail delivery errors in a homelab
+  environment where no SMTP server is configured.
+
+  Note: live currency exchange rate fetching is blocked by the egress NetworkPolicy
+  applied by firefly.yml. The cron job will log an error for the exchange rate task
+  but all other scheduled tasks will continue to run normally.
+
+  Variables:
+    dns_zone:               DNS zone used to derive the APP_URL (e.g. homelab.internal).
+    firefly_namespace:      Kubernetes namespace where Firefly III is deployed.
+    firefly_db_name:        PostgreSQL database name.
+    firefly_db_username:    PostgreSQL username.
+    firefly_storage_class:  Kubernetes StorageClass for the uploads PVC.
+    firefly_storage_size:   Size of the uploads PVC.
+#}
+config:
+  env:
+    APP_URL: 'https://firefly.{{ dns_zone }}'
+    DB_CONNECTION: pgsql
+    DB_HOST: 'firefly-db-rw.{{ firefly_namespace }}.svc'
+    DB_PORT: '5432'
+    DB_DATABASE: '{{ firefly_db_name }}'
+    DB_USERNAME: '{{ firefly_db_username }}'
+    MAIL_MAILER: log
+    TRUSTED_PROXIES: '**'
+  existingSecret: firefly-credentials
+
+persistence:
+  enabled: true
+  storageClassName: '{{ firefly_storage_class }}'
+  storage: '{{ firefly_storage_size }}'
+  accessMode: ReadWriteOnce
+
+cronjob:
+  enabled: true
+
+importer:
+  enabled: false
+
+ingress:
+  enabled: false
+
+postgresql:
+  enabled: false

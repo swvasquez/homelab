@@ -73,6 +73,10 @@
 #                                (default: open-webui).
 #   openwebui_hostname:          FQDN for the Open WebUI, derived from dns_zone
 #                                (default: chat.<dns_zone>).
+#   firefly_namespace:           Kubernetes namespace for Firefly III
+#                                (default: firefly-iii).
+#   firefly_hostname:            FQDN for the Firefly III UI, derived from
+#                                dns_zone (default: firefly.<dns_zone>).
 #   kubectl_config_path:         Full path to the kubectl config file
 #                                (default: /home/<ansible_user>/.kube/config).
 #   authentik_bootstrap_token:   API token auto-generated on first run and
@@ -126,6 +130,8 @@
     syncthing_hostname: 'syncthing.{{ dns_zone }}'
     openwebui_namespace: open-webui
     openwebui_hostname: 'chat.{{ dns_zone }}'
+    firefly_namespace: firefly-iii
+    firefly_hostname: 'firefly.{{ dns_zone }}'
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
     protected_httproutes:
       - name: hubble-ui
@@ -193,6 +199,12 @@
         hostname: '{{ openwebui_hostname }}'
         backend_name: open-webui
         backend_ns: '{{ openwebui_namespace }}'
+        backend_port: 80
+      - name: firefly-iii
+        route_ns: '{{ firefly_namespace }}'
+        hostname: '{{ firefly_hostname }}'
+        backend_name: firefly-iii
+        backend_ns: '{{ firefly_namespace }}'
         backend_port: 80
 
   tasks:
