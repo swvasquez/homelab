@@ -1,0 +1,353 @@
+---
+# ==============================================================================
+# Playbook: Deploy Open WebUI via ArgoCD GitOps
+# ==============================================================================
+# This playbook configures and deploys Open WebUI to the Kubernetes cluster via
+# ArgoCD GitOps using the upstream Open WebUI Helm chart with custom values
+# stored in the Gitea gitops repository.
+#
+# Open WebUI provides a web-based chat interface for interacting with LLMs. It
+# connects to the vLLM OpenAI-compatible API as its backend and uses the vLLM
+# API key from the existing vllm-credentials Secret. The bundled Ollama and
+# Pipelines subcharts are disabled.
+#
+# Open WebUI's built-in authentication is disabled. Access control is handled
+# entirely by Traefik ForwardAuth backed by Authentik, which gates all requests
+# before they reach the Open WebUI pod.
+#
+# The web UI is exposed via a ClusterIP service and an HTTPRoute through Traefik
+# with Authentik ForwardAuth. After deploying this playbook, re-run
+# cluster/authentication.yml to apply the HTTPRoute and ForwardAuth middleware.
+#
+# Run order:
+#   1. cluster/authentication.yml
+#   2. services/gitea.yml
+#   3. services/argocd.yml
+#   4. services/vllm.yml
+#   5. services/openwebui.yml (this playbook)
+#   6. cluster/authentication.yml (to apply HTTPRoute and ForwardAuth)
+#
+# Input Variables:
+#   bootstrap_node:              Boolean indicating if the host is the control
+#                                plane bootstrap node. Read from inventory.
+#   dns_zone:                    DNS zone (e.g. homelab.internal). Read from
+#                                group_vars.
+#   openwebui_namespace:         Kubernetes namespace for Open WebUI
+#                                (default: open-webui).
+#   openwebui_chart_version:     Helm chart version for Open WebUI
+#                                (default: 6.12.0).
+#   openwebui_storage_size:      Storage size for the Open WebUI data PVC
+#                                (default: 2Gi).
+#   openwebui_storage_class:     Kubernetes StorageClass for the data PVC
+#                                (default: longhorn).
+#   openwebui_gitops_path:       Path within the gitops repository where
+#                                Open WebUI values are stored
+#                                (default: apps/open-webui).
+#   vllm_namespace:              Kubernetes namespace where vLLM is deployed
+#                                (default: vllm).
+#   vllm_api_port:               Port of the vLLM API endpoint
+#                                (default: 8000).
+#   kubectl_config_path:         Full path to the kubectl config file
+#                                (default: /home/<ansible_user>/.kube/config).
+#   gitea_namespace:             Kubernetes namespace where Gitea is deployed
+#                                (default: gitea).
+#   gitea_admin_username:        Username of the Gitea admin account used to
+#                                push to the gitops repository
+#                                (default: gitea_admin).
+#   gitea_gitops_repo:           Name of the Gitea gitops repository
+#                                (default: gitops).
+#   argocd_namespace:            Kubernetes namespace where ArgoCD is deployed
+#                                (default: argocd).
+
+- name: Deploy Open WebUI via ArgoCD GitOps
+  hosts: homelab
+  become: true
+  become_exe: sudo.ws
+  vars:
+    openwebui_namespace: open-webui
+    openwebui_chart_version: "6.12.0"
+    openwebui_storage_size: 2Gi
+    openwebui_storage_class: longhorn
+    openwebui_gitops_path: apps/open-webui
+    vllm_namespace: vllm
+    vllm_api_port: 8000
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    gitea_namespace: gitea
+    gitea_admin_username: gitea_admin
+    gitea_gitops_repo: gitops
+    argocd_namespace: argocd
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Namespace
+    # -------------------------------------------------------------------------
+    # Creates the Open WebUI namespace before any other resources so that the
+    # credentials Secrets can be stored there before ArgoCD first syncs the
+    # Helm release.
+    # -------------------------------------------------------------------------
+    - name: Create Open WebUI namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create namespace {{ openwebui_namespace }}
+      register: openwebui_ns_result
+      changed_when: "'created' in openwebui_ns_result.stdout"
+      failed_when:
+        - openwebui_ns_result.rc != 0
+        - "'already exists' not in openwebui_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Credentials
+    # -------------------------------------------------------------------------
+    # Generates a random secret key for the Open WebUI application and copies
+    # the vLLM API key into the Open WebUI namespace so Helm values can
+    # reference it via secretKeyRef.
+    # -------------------------------------------------------------------------
+    - name: Check if Open WebUI credentials Secret exists
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret openwebui-credentials -n {{ openwebui_namespace }}
+      register: openwebui_secret_check
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Generate random secret key for Open WebUI
+      ansible.builtin.command:
+        cmd: openssl rand -hex 32
+      register: openwebui_secret_key_gen
+      changed_when: false
+      when:
+        - bootstrap_node | default(false)
+        - openwebui_secret_check.rc != 0
+
+    - name: Create Open WebUI credentials Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic openwebui-credentials
+          -n {{ openwebui_namespace }}
+          --from-literal=secret-key={{ openwebui_secret_key_gen.stdout }}
+      register: openwebui_secret_result
+      changed_when: "'created' in openwebui_secret_result.stdout"
+      when:
+        - bootstrap_node | default(false)
+        - openwebui_secret_check.rc != 0
+      no_log: true
+
+    - name: Read vLLM API key from credentials Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret vllm-credentials -n {{ vllm_namespace }}
+          -o jsonpath='{.data.api-key}'
+      register: vllm_api_key_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Check if vLLM credentials Secret exists in Open WebUI namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret vllm-credentials -n {{ openwebui_namespace }}
+      register: vllm_secret_in_openwebui_check
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Copy vLLM credentials Secret to Open WebUI namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic vllm-credentials
+          -n {{ openwebui_namespace }}
+          --from-literal=api-key={{ vllm_api_key_b64.stdout | b64decode }}
+      register: vllm_secret_copy_result
+      changed_when: "'created' in vllm_secret_copy_result.stdout"
+      when:
+        - bootstrap_node | default(false)
+        - vllm_secret_in_openwebui_check.rc != 0
+      no_log: true
+
+    # -------------------------------------------------------------------------
+    # GitOps - Helm Values Management
+    # -------------------------------------------------------------------------
+    # Renders the Open WebUI Helm values from a Jinja2 template and commits
+    # them to the Gitea gitops repository. ArgoCD watches this path and
+    # automatically syncs the Helm release to the cluster.
+    # -------------------------------------------------------------------------
+    - name: Ensure git is installed
+      ansible.builtin.apt:
+        name: git
+        state: present
+      when: bootstrap_node | default(false)
+
+    - name: Get Gitea pod IP
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get pod -n {{ gitea_namespace }}
+          -l app.kubernetes.io/name=gitea,app.kubernetes.io/instance=gitea
+          -o jsonpath='{.items[0].status.podIP}'
+      register: gitea_pod_ip
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Read Gitea admin password from Kubernetes secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret gitea-credentials -n {{ gitea_namespace }}
+          -o jsonpath='{.data.admin-password}'
+      register: gitea_admin_password_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Gitea admin password fact
+      ansible.builtin.set_fact:
+        gitea_admin_password: "{{ gitea_admin_password_b64.stdout | b64decode }}"
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Clone or update gitops repository in temporary directory
+      ansible.builtin.git:
+        repo: >-
+          http://{{ gitea_admin_username }}:{{ gitea_admin_password }}@{{ gitea_pod_ip.stdout }}:3000/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}
+        dest: /tmp/gitops-openwebui
+        version: main
+        update: true
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Create Open WebUI directory in gitops repository
+      ansible.builtin.file:
+        path: "/tmp/gitops-openwebui/{{ openwebui_gitops_path }}"
+        state: directory
+        mode: "0755"
+      when: bootstrap_node | default(false)
+
+    - name: Write Open WebUI Helm values to gitops repository
+      ansible.builtin.template:
+        src: templates/openwebui-values.yml.j2
+        dest: "/tmp/gitops-openwebui/{{ openwebui_gitops_path }}/values.yml"
+        mode: "0644"
+      when: bootstrap_node | default(false)
+
+    - name: Configure git user email for commit # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-openwebui config user.email
+          'ansible@{{ dns_zone | default("homelab.internal") }}'
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Configure git user name for commit # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-openwebui config user.name Ansible
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set gitops repository remote URL with credentials for push # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-openwebui remote set-url origin
+          http://{{ gitea_admin_username }}:{{ gitea_admin_password }}@{{ gitea_pod_ip.stdout }}:3000/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}
+      no_log: true
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Stage Open WebUI values in gitops repository # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-openwebui add
+          {{ openwebui_gitops_path }}/values.yml
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Check for staged changes in gitops repository # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-openwebui diff --cached --exit-code
+      register: gitops_diff_result
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Commit Open WebUI values to gitops repository # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-openwebui commit
+          -m 'chore: update open-webui values'
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - gitops_diff_result.rc != 0
+
+    - name: Push Open WebUI values commit to Gitea # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-openwebui push origin main
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - gitops_diff_result.rc != 0
+
+    - name: Remove gitops temporary directory
+      ansible.builtin.file:
+        path: /tmp/gitops-openwebui
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ArgoCD Application
+    # -------------------------------------------------------------------------
+    # Applies the ArgoCD Application manifest that tracks the Gitea repository
+    # and the upstream Open WebUI Helm chart. This initiates the deployment of
+    # the Open WebUI resources to the cluster.
+    # -------------------------------------------------------------------------
+    - name: Write ArgoCD Application manifest for Open WebUI
+      ansible.builtin.template:
+        src: templates/openwebui-app.yml.j2
+        dest: /tmp/openwebui-app.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ArgoCD Application manifest for Open WebUI
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/openwebui-app.yml
+      register: argocd_app_result
+      changed_when: >-
+        'configured' in argocd_app_result.stdout or
+        'created' in argocd_app_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Remove ArgoCD Application manifest temporary file
+      ansible.builtin.file:
+        path: /tmp/openwebui-app.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Trigger ArgoCD hard refresh to detect new gitops commit
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch application open-webui -n {{ argocd_namespace }}
+          --type merge
+          -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Wait for ArgoCD to sync and deploy Open WebUI
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get application open-webui -n {{ argocd_namespace }}
+          -o jsonpath='{.status.sync.status},{.status.health.status}'
+      register: argocd_status
+      until: argocd_status.stdout == 'Synced,Healthy'
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: bootstrap_node | default(false)

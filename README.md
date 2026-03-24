@@ -114,6 +114,7 @@ just lint playbooks/cluster/bootstrap.yml
   just install services <SERVICE>
   just install cluster authentication
   ```
+- **Open WebUI and vLLM**: Open WebUI (`services/openwebui.yml`) connects to vLLM (`services/vllm.yml`) using the vLLM API key from the `vllm-credentials` Secret. vLLM must be deployed first. Open WebUI's built-in authentication is disabled — access is gated entirely by Traefik ForwardAuth (Authentik). The `vllm_host` inventory variable controls which nodes run a vLLM instance.
 - **Local DNS Resolution**: To resolve homelab services (e.g., `*.homelab.internal`) from your local machine, configure your OS to use the cluster's Bind9 LoadBalancer IP as its nameserver. Note that Syncthing sync traffic uses a **dedicated LoadBalancer IP** (separate from the web GUI) to ensure high-performance data transfer.
   - **macOS Setup**:
     ```sh

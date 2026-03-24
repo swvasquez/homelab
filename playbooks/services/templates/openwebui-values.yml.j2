@@ -1,0 +1,48 @@
+{#
+  Open WebUI Helm values for the homelab deployment. Deployed by ArgoCD using the
+  multi-source feature, with this file stored in the Gitea gitops repository and
+  the Open WebUI Helm chart sourced from the upstream repository.
+
+  The vLLM API key is read from the existing vllm-credentials Kubernetes Secret
+  via extraEnvVars so that it is never committed to the gitops repository.
+
+  Open WebUI's built-in authentication is disabled (WEBUI_AUTH=false). Access
+  control is handled entirely by Traefik ForwardAuth backed by Authentik, which
+  gates all requests before they reach the Open WebUI pod.
+
+  Variables:
+    openwebui_storage_class:        Kubernetes StorageClass for the data PVC.
+    openwebui_storage_size:         Size of the data PVC.
+    vllm_api_port:                  Port of the vLLM API endpoint.
+#}
+ollama:
+  enabled: false
+
+pipelines:
+  enabled: false
+
+openaiBaseApiUrl: 'http://vllm-api.vllm.svc.cluster.local:{{ vllm_api_port }}/v1'
+
+extraEnvVars:
+  - name: OPENAI_API_KEY
+    valueFrom:
+      secretKeyRef:
+        name: vllm-credentials
+        key: api-key
+  - name: WEBUI_SECRET_KEY
+    valueFrom:
+      secretKeyRef:
+        name: openwebui-credentials
+        key: secret-key
+  - name: WEBUI_AUTH
+    value: 'false'
+
+persistence:
+  enabled: true
+  size: '{{ openwebui_storage_size }}'
+  storageClass: '{{ openwebui_storage_class }}'
+  accessModes:
+    - ReadWriteOnce
+
+ingress:
+  enabled: false

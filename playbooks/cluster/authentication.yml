@@ -17,11 +17,11 @@
 # it is the identity provider.
 #
 # After Authentik is deployed, a Traefik ForwardAuth Middleware is applied to
-# the kube-system, longhorn-system, observability, gitea, argocd, immich, and
-# syncthing namespaces, and the Hubble, Traefik dashboard, Longhorn, Prometheus,
-# Grafana, Alertmanager, Gitea, ArgoCD, Immich, and Syncthing HTTPRoutes are
-# re-applied with the middleware enabled. This protects those UIs behind
-# Authentik authentication.
+# the kube-system, longhorn-system, observability, gitea, argocd, immich,
+# syncthing, and open-webui namespaces, and the Hubble, Traefik dashboard,
+# Longhorn, Prometheus, Grafana, Alertmanager, Gitea, ArgoCD, Immich,
+# Syncthing, and Open WebUI HTTPRoutes are re-applied with the middleware
+# enabled. This protects those UIs behind Authentik authentication.
 #
 # Variables:
 #   bootstrap_node:              Boolean indicating if the host is the control
@@ -69,6 +69,10 @@
 #                                (default: syncthing).
 #   syncthing_hostname:          FQDN for the Syncthing UI, derived from dns_zone
 #                                (default: syncthing.<dns_zone>).
+#   openwebui_namespace:         Kubernetes namespace for Open WebUI
+#                                (default: open-webui).
+#   openwebui_hostname:          FQDN for the Open WebUI, derived from dns_zone
+#                                (default: chat.<dns_zone>).
 #   kubectl_config_path:         Full path to the kubectl config file
 #                                (default: /home/<ansible_user>/.kube/config).
 #   authentik_bootstrap_token:   API token auto-generated on first run and
@@ -120,6 +124,8 @@
     immich_hostname: 'immich.{{ dns_zone }}'
     syncthing_namespace: syncthing
     syncthing_hostname: 'syncthing.{{ dns_zone }}'
+    openwebui_namespace: open-webui
+    openwebui_hostname: 'chat.{{ dns_zone }}'
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
     protected_httproutes:
       - name: hubble-ui
@@ -182,6 +188,12 @@
         backend_name: syncthing-gui
         backend_ns: '{{ syncthing_namespace }}'
         backend_port: 8384
+      - name: open-webui
+        route_ns: '{{ openwebui_namespace }}'
+        hostname: '{{ openwebui_hostname }}'
+        backend_name: open-webui
+        backend_ns: '{{ openwebui_namespace }}'
+        backend_port: 80
 
   tasks:
     # -------------------------------------------------------------------------
@@ -711,12 +723,12 @@
     # -------------------------------------------------------------------------
     # Protected HTTPRoutes
     # Re-applies the Hubble, Traefik dashboard, Longhorn, Prometheus, Grafana,
-    # Alertmanager, Gitea, ArgoCD, Immich, and Syncthing HTTPRoutes with the ForwardAuth
-    # middleware enabled. This replaces the unauthenticated HTTPRoutes deployed
-    # by network.yml, storage.yml, and observability.yml. Service HTTPRoutes are
-    # managed here rather than in their individual service playbooks. If
-    # authentication.yml is not run, those services remain accessible without
-    # authentication.
+    # Alertmanager, Gitea, ArgoCD, Immich, Syncthing, and Open WebUI HTTPRoutes
+    # with the ForwardAuth middleware enabled. This replaces the unauthenticated
+    # HTTPRoutes deployed by network.yml, storage.yml, and observability.yml.
+    # Service HTTPRoutes are managed here rather than in their individual service
+    # playbooks. If authentication.yml is not run, those services remain
+    # accessible without authentication.
     # -------------------------------------------------------------------------
     - name: Write Protected HTTPRoute manifests with ForwardAuth
       ansible.builtin.template:
