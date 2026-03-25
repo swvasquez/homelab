@@ -12,13 +12,15 @@
 # resource provisioned in the firefly-iii namespace before ArgoCD first syncs
 # the Helm release. The bundled Bitnami postgresql subchart is disabled.
 #
-# A Kubernetes NetworkPolicy is applied to restrict egress from all pods in the
-# firefly-iii namespace. Only intra-namespace traffic and kube-dns (UDP/TCP 53)
-# are permitted. All external egress is blocked, including live currency
-# exchange rate fetching. The Firefly III cron job will log an error for the
-# exchange rate task but all other scheduled tasks will run normally. To
-# re-enable exchange rate fetching, remove the NetworkPolicy or add an explicit
-# egress rule for the upstream exchange rate endpoint.
+# A Kubernetes NetworkPolicy is applied to restrict egress from the Firefly III
+# app pod to intra-namespace traffic and kube-dns (UDP/TCP 53) only. The policy
+# is scoped to pods with app.kubernetes.io/name=firefly-iii so that
+# CloudNativePG database pods retain unrestricted egress (required for
+# Kubernetes API server access). All external egress from the app is blocked,
+# including live currency exchange rate fetching. The Firefly III cron job will
+# log an error for the exchange rate task but all other scheduled tasks will run
+# normally. To re-enable exchange rate fetching, remove the NetworkPolicy or add
+# an explicit egress rule for the upstream exchange rate endpoint.
 #
 # The Laravel APP_KEY, database password, and database credentials are generated
 # on first run and stored in Kubernetes Secrets. The Helm values file references
@@ -111,13 +113,20 @@
     # -------------------------------------------------------------------------
     # Credentials
     # -------------------------------------------------------------------------
-    # Generates a Laravel APP_KEY and a database password on first run and
-    # stores them in a Kubernetes Secret named firefly-credentials with keys
-    # APP_KEY and DB_PASSWORD. These names match the env var names the chart
-    # loads via config.existingSecret. A separate cnpg-formatted Secret
-    # (firefly-db-credentials) is created for the CloudNativePG operator.
-    # On subsequent runs the existing Secrets are reused so credentials remain
+    # Generates a Laravel APP_KEY and database password on first run and stores
+    # them in a Kubernetes Secret named firefly-credentials with keys APP_KEY
+    # and DB_PASSWORD. These names match the env var names the chart loads via
+    # config.existingSecret. A separate cnpg-formatted Secret
+    # (firefly-db-credentials) is created for the CloudNativePG operator. On
+    # subsequent runs the existing Secrets are reused so credentials remain
     # stable across upgrades.
+    #
+    # A separate 32-character chart app key is read from the chart-managed
+    # firefly-iii-app-key Secret if it exists, or generated with
+    # openssl rand -hex 16 on first run. This key is pinned in the Helm values
+    # file via secrets.appKey to prevent the chart from regenerating it on every
+    # render, which would cause the firefly-iii-app-key Secret to be
+    # perpetually OutOfSync in ArgoCD.
     # -------------------------------------------------------------------------
     - name: Check if Firefly III credentials Secret exists
       ansible.builtin.command:
@@ -169,6 +178,46 @@
         - bootstrap_node | default(false)
         - firefly_secret_check.rc != 0
       no_log: true
+
+    - name: Check if Firefly III chart app key Secret exists
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret firefly-iii-app-key -n {{ firefly_namespace }}
+      register: firefly_chart_key_check
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Read Firefly III chart app key from existing Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret firefly-iii-app-key -n {{ firefly_namespace }}
+          -o jsonpath='{.data.APP_KEY}'
+      register: firefly_chart_key_b64
+      changed_when: false
+      when:
+        - bootstrap_node | default(false)
+        - firefly_chart_key_check.rc == 0
+
+    - name: Generate Firefly III chart app key
+      ansible.builtin.command:
+        cmd: openssl rand -hex 16
+      register: firefly_chart_key_gen
+      changed_when: false
+      when:
+        - bootstrap_node | default(false)
+        - firefly_chart_key_check.rc != 0
+
+    - name: Set Firefly III chart app key fact for values template
+      ansible.builtin.set_fact:
+        firefly_app_key_pinned: >-
+          {{ firefly_chart_key_b64.stdout | b64decode
+          if firefly_chart_key_check.rc == 0
+          else firefly_chart_key_gen.stdout }}
+      no_log: true
+      when: bootstrap_node | default(false)
 
     - name: Read Firefly III database password from credentials Secret
       ansible.builtin.command:
@@ -261,13 +310,15 @@
     # -------------------------------------------------------------------------
     # Network Policy
     # -------------------------------------------------------------------------
-    # Applies an egress NetworkPolicy that restricts all pods in the firefly-iii
-    # namespace to intra-namespace traffic and kube-dns only. This blocks all
-    # external internet access, including live currency exchange rate fetching.
-    # The cron job will log an error for the exchange rate task but all other
-    # scheduled tasks will continue to run. To re-enable exchange rate fetching,
-    # remove this NetworkPolicy or add an explicit egress rule for the upstream
-    # exchange rate endpoint.
+    # Applies an egress NetworkPolicy that restricts the Firefly III app pod to
+    # intra-namespace traffic and kube-dns only. The policy is scoped to pods
+    # with app.kubernetes.io/name=firefly-iii so that CloudNativePG database
+    # pods retain unrestricted egress (required for Kubernetes API server access).
+    # This blocks all external internet access from the app, including live
+    # currency exchange rate fetching. The cron job will log an error for the
+    # exchange rate task but all other scheduled tasks will continue to run. To
+    # re-enable exchange rate fetching, remove this NetworkPolicy or add an
+    # explicit egress rule for the upstream exchange rate endpoint.
     # -------------------------------------------------------------------------
     - name: Write Firefly III egress NetworkPolicy manifest
       ansible.builtin.copy:
@@ -280,7 +331,9 @@
             name: firefly-egress-restrict
             namespace: '{{ firefly_namespace }}'
           spec:
-            podSelector: {}
+            podSelector:
+              matchLabels:
+                app.kubernetes.io/name: firefly-iii
             policyTypes:
               - Egress
             egress:
@@ -468,13 +521,13 @@
         state: absent
       when: bootstrap_node | default(false)
 
-    - name: Trigger ArgoCD hard refresh to detect new gitops commit
+    - name: Trigger ArgoCD sync for Firefly III
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
           patch application firefly-iii -n {{ argocd_namespace }}
           --type merge
-          -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+          -p '{"operation":{"sync":{"revision":"HEAD","syncOptions":["CreateNamespace=true"]}}}'
       changed_when: true
       when: bootstrap_node | default(false)
 
@@ -486,7 +539,7 @@
           -o jsonpath='{.status.sync.status},{.status.health.status}'
       register: argocd_status
       until: argocd_status.stdout == 'Synced,Healthy'
-      retries: 30
+      retries: 60
       delay: 10
       changed_when: false
       when: bootstrap_node | default(false)

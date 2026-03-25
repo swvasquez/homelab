@@ -21,13 +21,22 @@
   but all other scheduled tasks will continue to run normally.
 
   Variables:
-    dns_zone:               DNS zone used to derive the APP_URL (e.g. homelab.internal).
-    firefly_namespace:      Kubernetes namespace where Firefly III is deployed.
-    firefly_db_name:        PostgreSQL database name.
-    firefly_db_username:    PostgreSQL username.
-    firefly_storage_class:  Kubernetes StorageClass for the uploads PVC.
-    firefly_storage_size:   Size of the uploads PVC.
+    dns_zone:                 DNS zone used to derive the APP_URL (e.g. homelab.internal).
+    firefly_namespace:        Kubernetes namespace where Firefly III is deployed.
+    firefly_db_name:          PostgreSQL database name.
+    firefly_db_username:      PostgreSQL username.
+    firefly_storage_class:    Kubernetes StorageClass for the uploads PVC.
+    firefly_storage_size:     Size of the uploads PVC.
+    firefly_app_key_pinned:   Exactly 32-character key for the chart-managed
+                              firefly-iii-app-key Secret. Read from the existing
+                              firefly-iii-app-key Secret if present, otherwise generated
+                              with openssl rand -hex 16. Pinned via secrets.appKey to
+                              prevent the Helm chart from calling randAlphaNum on each
+                              render, which would cause perpetual OutOfSync in ArgoCD.
 #}
+secrets:
+  appKey: '{{ firefly_app_key_pinned }}'
+
 config:
   env:
     APP_URL: 'https://firefly.{{ dns_zone }}'
