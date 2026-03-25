@@ -1,25 +1,27 @@
 ---
-#
+# ==============================================================================
+# Playbook: Install Common CLI Tools
+# ==============================================================================
 # Installs a curated collection of modern and common command-line utilities
 # to enhance shell productivity.
 #
 # This playbook installs the following packages:
-#   - chrony: A versatile NTP client and server for time synchronization.
-#   - fd-find: A simple, fast, and user-friendly alternative to 'find'.
-#   - fzf: A general-purpose command-line fuzzy finder.
-#   - jq: A lightweight and flexible command-line JSON processor.
+#   - chrony:    A versatile NTP client and server for time synchronization.
+#   - fd-find:   A simple, fast, and user-friendly alternative to 'find'.
+#   - fzf:       A general-purpose command-line fuzzy finder.
+#   - jq:        A lightweight and flexible command-line JSON processor.
 #   - hyperfine: A command-line benchmarking tool.
-#   - parallel: A shell tool for executing jobs in parallel.
-#   - pigz: A parallel implementation of gzip.
-#   - ripgrep: A line-oriented search tool that recursively searches the
-#     current directory for a regex pattern.
-#   - unzip: Utility for extracting ZIP archives.
-#   - vim: A highly configurable text editor.
-#   - yq: A portable command-line YAML processor.
+#   - parallel:  A shell tool for executing jobs in parallel.
+#   - pigz:      A parallel implementation of gzip.
+#   - ripgrep:   A line-oriented search tool that recursively searches the
+#                current directory for a regex pattern.
+#   - unzip:     Utility for extracting ZIP archives.
+#   - vim:       A highly configurable text editor.
+#   - yq:        A portable command-line YAML processor.
 #
 # Variables:
-#   - util_packages: List of APT packages to install as common CLI utilities.
-#
+#   util_packages:  List of APT packages to install as common CLI utilities
+#                   (default: [chrony, fd-find, fzf, ...]).
 
 - name: Install common CLI tools
   hosts: homelab
@@ -38,7 +40,13 @@
       - unzip
       - vim
       - yq
+
   tasks:
+    # -------------------------------------------------------------------------
+    # Installation
+    # Installs common CLI utilities from the OS package manager, making them
+    # available system-wide to all users.
+    # -------------------------------------------------------------------------
     - name: Install common CLI tool packages
       ansible.builtin.apt:
         name: "{{ util_packages }}"

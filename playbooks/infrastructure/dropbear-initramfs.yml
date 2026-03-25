@@ -1,5 +1,7 @@
 ---
-#
+# ==============================================================================
+# Playbook: Configure Dropbear Initramfs
+# ==============================================================================
 # Configures remote unlocking of LUKS-encrypted drives using Dropbear SSH
 # within the initramfs environment.
 #
@@ -13,17 +15,16 @@
 #      - Rebuilds the initramfs to apply all changes.
 #
 # Variables (set in inventory.yml per host):
-#   - private_ip:        The static IP address assigned to this host in the
-#                        initramfs environment (e.g., '192.168.1.100').
-#   - network_interface: The network interface name to configure in initramfs
-#                        (e.g., 'eth0').
+#   private_ip:        The static IP address assigned to this host in the
+#                      initramfs environment (e.g., 192.168.1.100).
+#   network_interface: The network interface name to configure in initramfs
+#                      (e.g., eth0).
 #
-# Variables (set in group_vars):
-#   - router_private_ip: The gateway IP address for the initramfs environment
-#                        (e.g., '192.168.1.1').
-#   - dropbear_port:     The SSH port Dropbear will listen on in initramfs
-#                        (e.g., 2222).
-#
+# Variables (set in group_vars/homelab.yml):
+#   router_private_ip: The gateway IP address for the initramfs environment
+#                      (e.g., 192.168.1.1).
+#   dropbear_port:     The SSH port Dropbear will listen on in initramfs
+#                      (e.g., 2222).
 
 - name: Generate Dropbear SSH key on localhost
   hosts: localhost
@@ -36,8 +37,8 @@
     # private key is used to connect and unlock the LUKS volume remotely.
     # -------------------------------------------------------------------------
     - name: Generate Dropbear ED25519 keypair locally
-      ansible.builtin.command: "ssh-keygen -t ed25519 -f ~/.ssh/dropbear -N ''"
-      args:
+      ansible.builtin.command:
+        cmd: "ssh-keygen -t ed25519 -f ~/.ssh/dropbear -N ''"
         creates: ~/.ssh/dropbear
 
 - name: Install and configure Dropbear for initramfs
@@ -89,6 +90,7 @@
         mode: '0644'
 
     - name: Rebuild initramfs to apply changes
-      ansible.builtin.command: update-initramfs -u -k all
+      ansible.builtin.command:
+        cmd: update-initramfs -u -k all
       register: update_initramfs_result
       changed_when: update_initramfs_result.stdout != ''

@@ -1,5 +1,7 @@
 ---
-#
+# ==============================================================================
+# Playbook: Install and Configure Tailscale
+# ==============================================================================
 # Installs and configures the Tailscale mesh VPN client.
 #
 # This playbook performs the following actions:
@@ -7,17 +9,25 @@
 #     exit node.
 #   - Adds the official Tailscale GPG key and APT repository.
 #   - Installs the Tailscale package.
-#   - Attempts to connect the machine to the Tailscale network using 'tailscale up'.
+#   - Attempts to connect the machine to the Tailscale network using
+#     'tailscale up'.
 #
 # Note: The 'tailscale up' command may require interactive browser-based
 # authentication. For a non-interactive setup, an auth key must be provided
 # as a command-line argument.
 #
+# Variables:
+#   tailscale_packages:  List of APT packages to install for Tailscale
+#                        (default: [tailscale]).
 
 - name: Install and configure Tailscale
   hosts: homelab
   become: true
   become_exe: sudo.ws
+  vars:
+    tailscale_packages:
+      - tailscale
+
   tasks:
     # -------------------------------------------------------------------------
     # System Configuration
@@ -69,7 +79,7 @@
     # -------------------------------------------------------------------------
     - name: Install Tailscale package
       ansible.builtin.apt:
-        name: tailscale
+        name: "{{ tailscale_packages }}"
         state: present
 
     - name: Connect to Tailscale network

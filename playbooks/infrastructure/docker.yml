@@ -1,19 +1,39 @@
 ---
-#
+# ==============================================================================
+# Playbook: Install and Configure Docker
+# ==============================================================================
 # Installs and configures Docker Engine and Docker Compose.
 #
 # This playbook performs the following actions:
 #   - Installs prerequisite packages (ca-certificates, curl).
 #   - Adds Docker's official GPG key and APT repository.
 #   - Installs Docker Engine, CLI, containerd, and Docker Compose plugin.
-#   - Adds the current user to the 'docker' group to manage Docker as a non-root user.
+#   - Adds the current user to the 'docker' group to manage Docker as a
+#     non-root user.
 #   - Starts and enables the Docker service.
 #
+# Variables:
+#   docker_prereq_packages:  List of APT packages required to add Docker's
+#                            repository (default: [ca-certificates, curl]).
+#   docker_packages:         List of Docker APT packages to install
+#                            (default: [docker-ce, docker-ce-cli, containerd.io,
+#                            docker-buildx-plugin, docker-compose-plugin]).
 
 - name: Install and configure Docker
   hosts: homelab
   become: true
   become_exe: sudo.ws
+  vars:
+    docker_prereq_packages:
+      - ca-certificates
+      - curl
+    docker_packages:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+
   tasks:
     # -------------------------------------------------------------------------
     # Prerequisites
@@ -22,9 +42,7 @@
     # -------------------------------------------------------------------------
     - name: Install prerequisite packages for Docker repository
       ansible.builtin.apt:
-        name:
-          - ca-certificates
-          - curl
+        name: "{{ docker_prereq_packages }}"
         state: present
 
     - name: Ensure /etc/apt/keyrings directory exists
@@ -60,12 +78,7 @@
     # -------------------------------------------------------------------------
     - name: Install Docker Engine, CLI, and plugins
       ansible.builtin.apt:
-        name:
-          - docker-ce
-          - docker-ce-cli
-          - containerd.io
-          - docker-buildx-plugin
-          - docker-compose-plugin
+        name: "{{ docker_packages }}"
         state: present
         update_cache: true
 

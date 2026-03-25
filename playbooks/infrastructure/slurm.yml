@@ -1,5 +1,7 @@
 ---
-#
+# ==============================================================================
+# Playbook: Install and Configure SLURM Cluster
+# ==============================================================================
 # Installs and configures a SLURM workload manager cluster.
 #
 # This playbook performs the following actions:
@@ -32,14 +34,14 @@
 #                                on the same host to make the controller also a compute node.
 #
 # Playbook variables:
-#   slurm_cluster_name:          SLURM cluster name (default: 'homelab').
-#   slurm_partition_name:        Default partition name (default: 'homelab').
+#   slurm_cluster_name:          SLURM cluster name (default: homelab).
+#   slurm_partition_name:        Default partition name (default: homelab).
 #   slurm_state_dir:             Local directory on the controller for slurmctld state.
 #                                Stores the job queue and node states so the controller
 #                                can recover after a restart without depending on NFS.
-#                                Must NOT be on NFS (default: '/var/lib/slurm/state').
+#                                Must NOT be on NFS (default: /var/lib/slurm/state).
 #   slurm_nfs_path:              Base path under the NFS mount for SLURM data
-#                                (default: '/mnt/nfs/slurm'). The 'jobs' subdirectory
+#                                (default: /mnt/nfs/slurm). The 'jobs' subdirectory
 #                                is created here. Job scripts should use
 #                                {{ slurm_nfs_path }}/jobs as their working directory.
 #   slurm_nfs_server_path:       Server-side export path for SLURM NFS directories.
@@ -47,13 +49,13 @@
 #                                server host (not the client mount point) so that
 #                                directory creation runs outside of root_squash.
 #                                Should be nfs_export_path + /slurm
-#                                (default: '/srv/nfs/data/slurm').
+#                                (default: /srv/nfs/data/slurm).
 #   slurm_log_dir:               Directory for slurmctld and slurmd log files
-#                                (default: '/var/log/slurm').
+#                                (default: /var/log/slurm).
 #   slurm_spool_dir:             Local per-node spool directory for slurmd; must NOT
-#                                be on NFS (default: '/var/spool/slurmd').
+#                                be on NFS (default: /var/spool/slurmd).
 #   slurm_max_time:              Maximum job run time for the default partition
-#                                (default: 'INFINITE'). Use 'd-hh:mm:ss' format to cap.
+#                                (default: INFINITE). Use d-hh:mm:ss format to cap.
 #   slurm_def_mem_per_cpu:       Default memory per CPU in MB. Set to 0 to disable the
 #                                constraint (default: 0).
 #   slurm_enable_job_container:  Enable per-job /scratch isolation via job_container/tmpfs.
@@ -61,15 +63,15 @@
 #                                as an isolated local directory (default: false).
 #   slurm_scratch_dir:           Base path for per-job scratch directories. Only used
 #                                when slurm_enable_job_container is true
-#                                (default: '/scratch').
+#                                (default: /scratch).
 #   slurm_scratch_lvm_vg_name:   LVM Volume Group to use for the scratch filesystem
-#                                (default: 'ubuntu-vg').
-#   slurm_scratch_lvm_lv_name:   LVM Logical Volume name for scratch (default: 'scratch_lv').
+#                                (default: ubuntu-vg).
+#   slurm_scratch_lvm_lv_name:   LVM Logical Volume name for scratch (default: scratch_lv).
 #   slurm_create_scratch_lv:     Boolean, whether to create and format a new scratch LV
 #                                (default: false). Set to false when the LV already exists
 #                                and only needs to be mounted.
 #   slurm_scratch_lvm_lv_size:   Size of the scratch LV, required when slurm_create_scratch_lv
-#                                is true (e.g., '100g').
+#                                is true (e.g., 100g).
 #   slurm_cgroup_constrain_cores:    Restrict jobs to their allocated CPU cores
 #                                    (default: true).
 #   slurm_cgroup_constrain_ram:      Kill jobs that exceed their memory allocation

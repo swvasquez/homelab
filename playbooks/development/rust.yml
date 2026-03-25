@@ -1,5 +1,7 @@
 ---
-#
+# ==============================================================================
+# Playbook: Install Rust and Common Tools System-Wide
+# ==============================================================================
 # Installs the Rust programming language, toolchain, and common utilities
 # for system-wide use.
 #
@@ -16,14 +18,13 @@
 #     - bacon
 #
 # Variables:
-#   - rustup_home:   Directory where rustup stores its toolchain data
+#   rustup_home:    Directory where rustup stores its toolchain data
 #                   (default: /usr/local/rustup).
-#   - cargo_home:   Directory where Cargo stores binaries and registry data
+#   cargo_home:     Directory where Cargo stores binaries and registry data
 #                   (default: /usr/local/cargo).
-#   - rust_packages: List of Cargo packages to install, each with a 'name'
+#   rust_packages:  List of Cargo packages to install, each with a 'name'
 #                   (crate name) and 'binary' (expected binary filename for
 #                   idempotency checks).
-#
 
 - name: Install Rust and common tools system-wide
   hosts: homelab

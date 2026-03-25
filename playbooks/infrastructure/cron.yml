@@ -1,23 +1,24 @@
 ---
-#
-# Configures system-wide cron jobs.
-#
-# This playbook creates and manages various cron jobs for system maintenance
-# and automation.
+# ==============================================================================
+# Playbook: Configure System Cron Jobs
+# ==============================================================================
+# Configures system-wide cron jobs for system maintenance and automation.
 #
 # Current tasks:
 #   - Scheduled System Shutdown: Shuts down the system at a configured time
 #     using '/usr/sbin/shutdown -h now'.
 #
-# Variables (set in group_vars or inventory):
-#   - shutdown_schedule: Cron schedule string for system shutdown.
-#     Must be in standard 5-field notation (e.g., '0 4 * * *').
-#
+# Variables:
+#   shutdown_schedule:  Cron schedule string for system shutdown in standard
+#                       5-field notation (e.g., '0 4 * * *'). Set in
+#                       group_vars/homelab.yml.
 
 - name: Configure system cron jobs
   hosts: homelab
   become: true
   become_exe: sudo.ws
+  vars:
+    shutdown_schedule: '0 4 * * *'
 
   tasks:
     # -------------------------------------------------------------------------

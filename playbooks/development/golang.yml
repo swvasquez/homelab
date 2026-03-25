@@ -1,5 +1,7 @@
 ---
-#
+# ==============================================================================
+# Playbook: Manage Golang Installation
+# ==============================================================================
 # Installs and configures the Go programming language and common tooling.
 #
 # This playbook dynamically finds the latest Go version from go.dev and
@@ -11,8 +13,7 @@
 #   - Installs common Go development tools ('gopls', 'dlv') into /usr/local/bin.
 #
 # Variables:
-#   - go_arch: Target CPU architecture for the Go binary (default: amd64).
-#
+#   go_arch:  Target CPU architecture for the Go binary (default: amd64).
 
 - name: Manage golang installation
   hosts: homelab

@@ -1,5 +1,7 @@
 ---
-#
+# ==============================================================================
+# Playbook: Configure Wake-on-LAN
+# ==============================================================================
 # Configures Wake-on-LAN (WoL) for a specified network interface using Netplan.
 #
 # This playbook performs the following actions:
@@ -9,15 +11,23 @@
 #   - Notifies a handler to apply the Netplan configuration.
 #
 # Variables (set in inventory.yml per host):
-#   - network_interface: The name of the network interface to configure (e.g., 'eno1').
-#   - mac_address:       The MAC address of the network interface
-#                        (e.g., '00:11:22:33:44:55').
+#   network_interface:  The name of the network interface to configure
+#                       (e.g., eno1).
+#   mac_address:        The MAC address of the network interface
+#                       (e.g., 00:11:22:33:44:55).
 #
+# Variables:
+#   wol_packages:  List of APT packages to install for WoL support
+#                  (default: [ethtool, wakeonlan]).
 
 - name: Configure Wake-on-LAN (WoL)
   hosts: homelab
   become: true
   become_exe: sudo.ws
+  vars:
+    wol_packages:
+      - ethtool
+      - wakeonlan
 
   tasks:
     # -------------------------------------------------------------------------
@@ -27,9 +37,7 @@
     # -------------------------------------------------------------------------
     - name: Install WoL and networking utilities
       ansible.builtin.apt:
-        name:
-          - ethtool
-          - wakeonlan
+        name: "{{ wol_packages }}"
         state: present
         update_cache: true
 

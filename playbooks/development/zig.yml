@@ -1,5 +1,7 @@
 ---
-#
+# ==============================================================================
+# Playbook: Manage Zig Installation
+# ==============================================================================
 # Installs and configures the Zig programming language.
 #
 # This playbook performs the following actions:
@@ -8,15 +10,14 @@
 #   - Sets up the system-wide PATH to include Zig's bin directory.
 #
 # Variables:
-#   - zig_arch:         Target CPU architecture (default: "x86_64").
-#   - zig_os:           Target operating system (default: "linux").
-#   - zig_archive:      Full archive filename to download from ziglang.org
-#                       (e.g., "zig-x86_64-linux-0.16.0-dev.1657+985a3565c.tar.xz").
-#   - zig_download_url: Full download URL for the Zig archive.
-#   - zig_version:      Version string used for idempotency checks; must match
-#                       the output of 'zig version' for the downloaded archive
-#                       (e.g., "0.16.0-dev.1657+985a3565c").
-#
+#   zig_arch:         Target CPU architecture (default: x86_64).
+#   zig_os:           Target operating system (default: linux).
+#   zig_archive:      Full archive filename to download from ziglang.org
+#                     (e.g., zig-x86_64-linux-0.16.0-dev.1657+985a3565c.tar.xz).
+#   zig_download_url: Full download URL for the Zig archive.
+#   zig_version:      Version string used for idempotency checks; must match
+#                     the output of 'zig version' for the downloaded archive
+#                     (e.g., 0.16.0-dev.1657+985a3565c).
 
 - name: Manage Zig installation
   hosts: homelab

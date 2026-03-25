@@ -1,5 +1,7 @@
 ---
-#
+# ==============================================================================
+# Playbook: Install and Configure NFS
+# ==============================================================================
 # Installs and configures an NFS server and client mount.
 #
 # This playbook performs the following actions:
@@ -131,7 +133,8 @@
         - nfs_create_lvm | default(false)
 
     - name: Check if Logical Volume already exists
-      ansible.builtin.command: "lvs /dev/{{ nfs_lvm_vg_name }}/{{ nfs_lvm_lv_name }}"
+      ansible.builtin.command:
+        cmd: "lvs /dev/{{ nfs_lvm_vg_name }}/{{ nfs_lvm_lv_name }}"
       register: lv_check
       failed_when: false
       changed_when: false
@@ -233,7 +236,8 @@
         state: restarted
 
     - name: Re-export NFS shares
-      ansible.builtin.command: "exportfs -ra"
+      ansible.builtin.command:
+        cmd: exportfs -ra
       changed_when: true
 
 # ------------------------------------------------------------------------------

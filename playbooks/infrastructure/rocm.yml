@@ -1,5 +1,7 @@
 ---
-#
+# ==============================================================================
+# Playbook: Install ROCm (Radeon Open Compute)
+# ==============================================================================
 # Installs the AMDGPU kernel driver and the ROCm (Radeon Open Compute) stack
 # for AMD GPUs.
 #
@@ -11,12 +13,11 @@
 #   - Installs additional ROCm and Python development packages.
 #
 # Variables:
-#   - amdgpu_install_version: Version string for the amdgpu-install .deb package
-#                             (default: "7.1.1.70101-1").
-#   - amdgpu_deb_url:         Full URL to download the amdgpu-install .deb package.
-#   - amdgpu_deb_path:        Temporary path to store the downloaded .deb file
-#                             (default: /tmp/amdgpu-install.deb).
-#
+#   amdgpu_install_version:  Version string for the amdgpu-install .deb package
+#                            (default: 7.1.1.70101-1).
+#   amdgpu_deb_url:          Full URL to download the amdgpu-install .deb package.
+#   amdgpu_deb_path:         Temporary path to store the downloaded .deb file
+#                            (default: /tmp/amdgpu-install.deb).
 
 - name: Install ROCm (Radeon Open Compute)
   hosts: homelab

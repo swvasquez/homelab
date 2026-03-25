@@ -1,5 +1,7 @@
 ---
-#
+# ==============================================================================
+# Playbook: Install Node.js and npm
+# ==============================================================================
 # Installs the Node.js JavaScript runtime and the npm package manager.
 #
 # This playbook performs the following actions:
@@ -8,11 +10,12 @@
 #
 # Note: This installs the version of Node.js available in the OS repositories.
 # For a specific or newer version, a repository configuration (like NodeSource)
-# would be required, but this playbook adheres to the standard package manager constraint.
+# would be required, but this playbook adheres to the standard package manager
+# constraint.
 #
 # Variables:
-#   - nodejs_packages: List of APT packages to install for Node.js and npm.
-#
+#   nodejs_packages:  List of APT packages to install for Node.js and npm
+#                     (default: [nodejs, npm]).
 
 - name: Install Node.js and npm
   hosts: homelab
