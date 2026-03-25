@@ -19,7 +19,7 @@
 #
 # Custom Grafana dashboards are deployed as ConfigMaps labelled
 # grafana_dashboard: '1'. The Grafana sidecar watches for these ConfigMaps
-# across all namespaces and provisions them automatically. The node temperature
+# across all namespaces and provisions them automatically. The node metrics
 # dashboard is set as the Grafana home page.
 #
 # Variables:
@@ -192,27 +192,27 @@
     # '1'. The Grafana sidecar watches for these ConfigMaps across all namespaces
     # and provisions them automatically without requiring a pod restart.
     # -------------------------------------------------------------------------
-    - name: Write node temperature dashboard ConfigMap manifest
+    - name: Write node metrics dashboard ConfigMap manifest
       ansible.builtin.template:
-        src: node-temperature-dashboard-configmap.yml.j2
-        dest: /tmp/node-temperature-dashboard-configmap.yml
+        src: node-metrics-dashboard-configmap.yml.j2
+        dest: /tmp/node-metrics-dashboard-configmap.yml
         mode: '0644'
       when: bootstrap_node | default(false)
 
-    - name: Apply node temperature dashboard ConfigMap
+    - name: Apply node metrics dashboard ConfigMap
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
-          apply -f /tmp/node-temperature-dashboard-configmap.yml
-      register: node_temp_dashboard_result
+          apply -f /tmp/node-metrics-dashboard-configmap.yml
+      register: node_metrics_dashboard_result
       changed_when: >-
-        'created' in node_temp_dashboard_result.stdout or
-        'configured' in node_temp_dashboard_result.stdout
+        'created' in node_metrics_dashboard_result.stdout or
+        'configured' in node_metrics_dashboard_result.stdout
       when: bootstrap_node | default(false)
 
-    - name: Clean up node temperature dashboard ConfigMap manifest
+    - name: Clean up node metrics dashboard ConfigMap manifest
       ansible.builtin.file:
-        path: /tmp/node-temperature-dashboard-configmap.yml
+        path: /tmp/node-metrics-dashboard-configmap.yml
         state: absent
       when: bootstrap_node | default(false)
 

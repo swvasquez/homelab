@@ -1,14 +1,19 @@
 {#
-  ConfigMap containing the Node Temperatures Grafana dashboard JSON. The Grafana
+  ConfigMap containing the Node Metrics Grafana dashboard JSON. The Grafana
   sidecar watches for ConfigMaps with the label grafana_dashboard: '1' in the
   observability namespace and automatically provisions them as dashboards.
 
-  The dashboard uses the node_hwmon_temp_celsius metric from node-exporter, which
-  exposes hardware sensor readings (CPU, motherboard, NVMe, etc.) per chip and
-  sensor. The $nodename template variable drives panel repetition so each node
-  gets its own dedicated stat row and time series plot, laid out side by side.
-  Each panel also plots the average temperature across all sensors as a bold blue
-  line for emphasis.
+  The temperature section uses the node_hwmon_temp_celsius metric from
+  node-exporter, which exposes hardware sensor readings (CPU, motherboard, NVMe,
+  etc.) per chip and sensor. The $nodename template variable drives panel
+  repetition so each node gets its own dedicated stat row and time series plot,
+  laid out side by side. Each panel also plots the average temperature across all
+  sensors as a bold blue line for emphasis.
+
+  The CPU section uses node_cpu_seconds_total from node-exporter. The stat panel
+  shows current overall CPU utilization (%) with threshold coloring. The time
+  series panel stacks per-mode rates (user, system, iowait, softirq, irq, nice)
+  so the breakdown of CPU time is visible at a glance.
 
   The raw block below prevents Jinja2 from interpreting Grafana's legend format
   strings (e.g. {{chip}}) as template expressions.
@@ -16,12 +21,12 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: node-temperature-dashboard
+  name: node-metrics-dashboard
   namespace: '{{ observability_namespace }}'
   labels:
     grafana_dashboard: '1'
 data:
-  node-temperature.json: |
+  node-metrics.json: |
     {% raw %}{
       "annotations": {
         "list": [
@@ -36,7 +41,7 @@ data:
           }
         ]
       },
-      "description": "Hardware temperature readings for each cluster node via node-exporter hwmon metrics.",
+      "description": "Hardware temperature and CPU utilization for each cluster node via node-exporter metrics.",
       "editable": true,
       "graphTooltip": 1,
       "links": [],
@@ -184,11 +189,145 @@ data:
           ],
           "title": "$nodename — Temperature History",
           "type": "timeseries"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "thresholds"},
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {"color": "green",  "value": null},
+                  {"color": "yellow", "value": 50},
+                  {"color": "orange", "value": 75},
+                  {"color": "red",    "value": 90}
+                ]
+              },
+              "unit": "percent",
+              "min": 0,
+              "max": 100
+            },
+            "overrides": []
+          },
+          "gridPos": {"h": 4, "w": 12, "x": 0, "y": 16},
+          "id": 3,
+          "maxPerRow": 2,
+          "options": {
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": ["lastNotNull"],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "auto"
+          },
+          "repeat": "nodename",
+          "repeatDirection": "h",
+          "targets": [
+            {
+              "datasource": {"type": "prometheus", "uid": "prometheus"},
+              "expr": "(1 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m]) * on(instance) group_left(nodename) node_uname_info{nodename=\"$nodename\"})) * 100",
+              "instant": true,
+              "legendFormat": "Total CPU Usage",
+              "refId": "A"
+            }
+          ],
+          "title": "$nodename — Current CPU Usage",
+          "type": "stat"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {"legend": false, "tooltip": false, "viz": false},
+                "lineInterpolation": "smooth",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {"type": "linear"},
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {"group": "A", "mode": "normal"},
+                "thresholdsStyle": {"mode": "line+area"},
+                "axisSoftMax": 100
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {"color": "green",  "value": null},
+                  {"color": "yellow", "value": 50},
+                  {"color": "orange", "value": 75},
+                  {"color": "red",    "value": 90}
+                ]
+              },
+              "unit": "percent",
+              "min": 0
+            },
+            "overrides": [
+              {
+                "matcher": {"id": "byFrameRefID", "options": "B"},
+                "properties": [
+                  {"id": "custom.lineWidth",   "value": 3},
+                  {"id": "custom.fillOpacity", "value": 0},
+                  {"id": "color",              "value": {"mode": "fixed", "fixedColor": "blue"}},
+                  {"id": "displayName",        "value": "Total"},
+                  {"id": "custom.zIndex",      "value": 3},
+                  {"id": "custom.stacking",    "value": {"group": "A", "mode": "none"}}
+                ]
+              }
+            ]
+          },
+          "gridPos": {"h": 12, "w": 12, "x": 0, "y": 20},
+          "id": 4,
+          "maxPerRow": 2,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {"mode": "multi", "sort": "desc"}
+          },
+          "repeat": "nodename",
+          "repeatDirection": "h",
+          "targets": [
+            {
+              "datasource": {"type": "prometheus", "uid": "prometheus"},
+              "expr": "avg by(mode) (rate(node_cpu_seconds_total{mode=~\"user|system|iowait|softirq|irq|nice\"}[5m]) * on(instance) group_left(nodename) node_uname_info{nodename=\"$nodename\"}) * 100",
+              "legendFormat": "{{mode}}",
+              "refId": "A"
+            },
+            {
+              "datasource": {"type": "prometheus", "uid": "prometheus"},
+              "expr": "(1 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m]) * on(instance) group_left(nodename) node_uname_info{nodename=\"$nodename\"})) * 100",
+              "legendFormat": "Total",
+              "refId": "B"
+            }
+          ],
+          "title": "$nodename — CPU Usage History",
+          "type": "timeseries"
         }
       ],
       "refresh": "30s",
       "schemaVersion": 38,
-      "tags": ["nodes", "temperature", "hardware"],
+      "tags": ["nodes", "temperature", "cpu", "hardware"],
       "templating": {
         "list": [
           {
@@ -215,7 +354,7 @@ data:
       "time": {"from": "now-3h", "to": "now"},
       "timepicker": {},
       "timezone": "browser",
-      "title": "Node Temperatures",
-      "uid": "node-temperatures",
+      "title": "Node Metrics",
+      "uid": "node-metrics",
       "version": 1
     }{% endraw %}
