@@ -18,10 +18,11 @@
 #
 # After Authentik is deployed, a Traefik ForwardAuth Middleware is applied to
 # the kube-system, longhorn-system, observability, gitea, argocd, immich,
-# syncthing, and open-webui namespaces, and the Hubble, Traefik dashboard,
-# Longhorn, Prometheus, Grafana, Alertmanager, Gitea, ArgoCD, Immich,
-# Syncthing, and Open WebUI HTTPRoutes are re-applied with the middleware
-# enabled. This protects those UIs behind Authentik authentication.
+# syncthing, open-webui, firefly-iii, and vaultwarden namespaces, and the
+# Hubble, Traefik dashboard, Longhorn, Prometheus, Grafana, Alertmanager,
+# Gitea, ArgoCD, Immich, Syncthing, Open WebUI, Firefly III, and Vaultwarden
+# HTTPRoutes are re-applied with the middleware enabled. This protects those
+# UIs behind Authentik authentication.
 #
 # Variables:
 #   bootstrap_node:              Boolean indicating if the host is the control
@@ -77,6 +78,10 @@
 #                                (default: firefly-iii).
 #   firefly_hostname:            FQDN for the Firefly III UI, derived from
 #                                dns_zone (default: firefly.<dns_zone>).
+#   vaultwarden_namespace:       Kubernetes namespace for Vaultwarden
+#                                (default: vaultwarden).
+#   vaultwarden_hostname:        FQDN for the Vaultwarden web vault, derived
+#                                from dns_zone (default: vault.<dns_zone>).
 #   kubectl_config_path:         Full path to the kubectl config file
 #                                (default: /home/<ansible_user>/.kube/config).
 #   authentik_bootstrap_token:   API token auto-generated on first run and
@@ -132,6 +137,8 @@
     openwebui_hostname: 'chat.{{ dns_zone }}'
     firefly_namespace: firefly-iii
     firefly_hostname: 'firefly.{{ dns_zone }}'
+    vaultwarden_namespace: vaultwarden
+    vaultwarden_hostname: 'vault.{{ dns_zone }}'
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
     protected_httproutes:
       - name: hubble-ui
@@ -205,6 +212,12 @@
         hostname: '{{ firefly_hostname }}'
         backend_name: firefly-iii
         backend_ns: '{{ firefly_namespace }}'
+        backend_port: 80
+      - name: vaultwarden
+        route_ns: '{{ vaultwarden_namespace }}'
+        hostname: '{{ vaultwarden_hostname }}'
+        backend_name: vaultwarden
+        backend_ns: '{{ vaultwarden_namespace }}'
         backend_port: 80
 
   tasks:

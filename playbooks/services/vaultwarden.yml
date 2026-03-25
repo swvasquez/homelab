@@ -1,0 +1,869 @@
+---
+# ==============================================================================
+# Playbook: Deploy Vaultwarden via ArgoCD GitOps
+# ==============================================================================
+# This playbook configures and deploys Vaultwarden, a lightweight self-hosted
+# Bitwarden-compatible password manager, to the Kubernetes cluster via ArgoCD
+# GitOps using native Kubernetes manifests stored in the Gitea gitops
+# repository.
+#
+# PostgreSQL is managed by the CloudNativePG operator using a cnpg Cluster
+# resource provisioned in the vaultwarden namespace before ArgoCD first syncs
+# the manifests.
+#
+# A Kubernetes NetworkPolicy restricts egress from all pods in the vaultwarden
+# namespace to intra-namespace traffic (PostgreSQL), kube-dns (UDP/TCP 53),
+# the Authentik namespace, and the Traefik namespace (port 8443 only). All
+# other external egress is blocked. The CoreDNS hosts override that resolves
+# authentik.homelab.internal to Traefik's ClusterIP is managed by
+# playbooks/cluster/network.yml.
+#
+# The full database connection URL is stored in the vaultwarden-db-url Secret
+# and injected into the Deployment via secretKeyRef.
+#
+# An OAuth2/OIDC provider and application are created in Authentik via the
+# REST API, enabling users to log in to the Vaultwarden web vault using their
+# Authentik credentials. The generated client ID and client secret are stored
+# in the vaultwarden-oidc Kubernetes Secret and injected into the Deployment
+# via secretKeyRef so that no credentials are committed to the gitops
+# repository. New user registrations are disabled; accounts are provisioned
+# automatically on first SSO login via Authentik.
+#
+# Access to the web vault is additionally gated by Traefik ForwardAuth backed
+# by Authentik, requiring an active Authentik session before the request
+# reaches Vaultwarden. Note that native Bitwarden clients (desktop, mobile,
+# browser extension) communicate with the Vaultwarden API and do not go through
+# the browser ForwardAuth flow. To support native clients, remove the
+# ForwardAuth filter from the vaultwarden HTTPRoute in
+# cluster/authentication.yml or create a separate API-only HTTPRoute without
+# the filter.
+#
+# Run order:
+#   1. cluster/authentication.yml (Authentik, Traefik, cert-manager)
+#   2. services/gitea.yml
+#   3. services/argocd.yml
+#   4. services/vaultwarden.yml (this playbook)
+#   5. cluster/authentication.yml (re-run to apply HTTPRoute and ForwardAuth)
+#
+# Input Variables:
+#   bootstrap_node:               Boolean indicating if the host is the control
+#                                 plane bootstrap node. Read from inventory.
+#   vaultwarden_namespace:        Kubernetes namespace for Vaultwarden
+#                                 (default: vaultwarden).
+#   vaultwarden_image:            Container image for Vaultwarden
+#                                 (default: vaultwarden/server).
+#   vaultwarden_image_tag:        Container image tag for Vaultwarden
+#                                 (default: latest).
+#   vaultwarden_storage_size:     Storage size for the Vaultwarden data PVC
+#                                 (default: 5Gi).
+#   vaultwarden_storage_class:    Kubernetes StorageClass for the data and
+#                                 database PVCs (default: longhorn).
+#   vaultwarden_db_storage_size:  Storage size for the cnpg database PVC
+#                                 (default: 5Gi).
+#   vaultwarden_db_name:          PostgreSQL database name
+#                                 (default: vaultwarden).
+#   vaultwarden_db_username:      PostgreSQL username (default: vaultwarden).
+#   vaultwarden_db_image:         Container image for the cnpg Cluster
+#                                 (default: ghcr.io/cloudnative-pg/postgresql:17).
+#   vaultwarden_gitops_path:      Path within the gitops repository where
+#                                 Vaultwarden manifests are stored
+#                                 (default: apps/vaultwarden).
+#   authentik_namespace:          Kubernetes namespace where Authentik is
+#                                 deployed (default: authentik).
+#   kubectl_config_path:          Full path to the kubectl config file
+#                                 (default: /home/<ansible_user>/.kube/config).
+#   gitea_namespace:              Kubernetes namespace where Gitea is deployed
+#                                 (default: gitea).
+#   gitea_admin_username:         Username of the Gitea admin account used to
+#                                 push to the gitops repository
+#                                 (default: gitea_admin).
+#   gitea_gitops_repo:            Name of the Gitea gitops repository
+#                                 (default: gitops).
+#   argocd_namespace:             Kubernetes namespace where ArgoCD is deployed
+#                                 (default: argocd).
+#   homelab_ca_cert:              PEM-encoded CA certificate for homelab TLS.
+#                                 Read at runtime from the wildcard-tls Secret
+#                                 in the kube-system namespace. Mounted into the
+#                                 Vaultwarden pod so its TLS client (reqwest/
+#                                 OpenSSL) trusts the self-signed wildcard cert
+#                                 used by Authentik and other internal services.
+#   traefik_namespace:            Kubernetes namespace where Traefik is deployed
+#                                 (default: traefik). Used in the egress
+#                                 NetworkPolicy to allow traffic to Traefik
+#                                 pods for OIDC discovery proxying.
+#   dns_zone:                     Internal DNS zone for homelab services.
+#                                 Read from group_vars. Used to construct
+#                                 the Authentik SSO authority URL.
+
+- name: Deploy Vaultwarden via ArgoCD GitOps
+  hosts: homelab
+  become: true
+  become_exe: sudo.ws
+  vars:
+    vaultwarden_namespace: vaultwarden
+    vaultwarden_image: vaultwarden/server
+    vaultwarden_image_tag: latest
+    vaultwarden_storage_size: '5Gi'
+    vaultwarden_storage_class: longhorn
+    vaultwarden_db_storage_size: '5Gi'
+    vaultwarden_db_name: vaultwarden
+    vaultwarden_db_username: vaultwarden
+    vaultwarden_db_image: 'ghcr.io/cloudnative-pg/postgresql:17'
+    vaultwarden_gitops_path: apps/vaultwarden
+    authentik_namespace: authentik
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    gitea_namespace: gitea
+    gitea_admin_username: gitea_admin
+    gitea_gitops_repo: gitops
+    argocd_namespace: argocd
+    traefik_namespace: traefik
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Namespace
+    # -------------------------------------------------------------------------
+    # Creates the vaultwarden namespace before any other resources so that
+    # Secrets can be stored there before ArgoCD first syncs the manifests.
+    # -------------------------------------------------------------------------
+    - name: Create Vaultwarden namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create namespace {{ vaultwarden_namespace }}
+      register: vaultwarden_ns_result
+      changed_when: "'created' in vaultwarden_ns_result.stdout"
+      failed_when:
+        - vaultwarden_ns_result.rc != 0
+        - "'already exists' not in vaultwarden_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Credentials
+    # -------------------------------------------------------------------------
+    # Generates a random Vaultwarden admin token and a PostgreSQL database
+    # password on first run and stores them in the vaultwarden-credentials
+    # Kubernetes Secret. A separate cnpg-formatted Secret
+    # (vaultwarden-db-credentials) is created for the CloudNativePG operator.
+    # A third Secret (vaultwarden-db-url) stores the full PostgreSQL connection
+    # URL used by the Vaultwarden Deployment. On subsequent runs the existing
+    # Secrets are reused so credentials remain stable across upgrades.
+    # -------------------------------------------------------------------------
+    - name: Check if Vaultwarden credentials Secret exists
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret vaultwarden-credentials -n {{ vaultwarden_namespace }}
+      register: vaultwarden_secret_check
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Generate Vaultwarden admin token
+      ansible.builtin.command:
+        cmd: openssl rand -base64 48
+      register: vaultwarden_admin_token_gen
+      changed_when: false
+      when:
+        - bootstrap_node | default(false)
+        - vaultwarden_secret_check.rc != 0
+
+    - name: Generate Vaultwarden database password
+      ansible.builtin.command:
+        cmd: openssl rand -hex 32
+      register: vaultwarden_db_password_gen
+      changed_when: false
+      when:
+        - bootstrap_node | default(false)
+        - vaultwarden_secret_check.rc != 0
+
+    - name: Create Vaultwarden credentials Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic vaultwarden-credentials
+          -n {{ vaultwarden_namespace }}
+          --from-literal=admin-token={{ vaultwarden_admin_token_gen.stdout }}
+          --from-literal=DB_PASSWORD={{ vaultwarden_db_password_gen.stdout }}
+      register: vaultwarden_secret_result
+      changed_when: "'created' in vaultwarden_secret_result.stdout"
+      when:
+        - bootstrap_node | default(false)
+        - vaultwarden_secret_check.rc != 0
+      no_log: true
+
+    - name: Read Vaultwarden database password from credentials Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret vaultwarden-credentials -n {{ vaultwarden_namespace }}
+          -o jsonpath='{.data.DB_PASSWORD}'
+      register: vaultwarden_db_password_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Create Vaultwarden cnpg database credentials Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic vaultwarden-db-credentials
+          -n {{ vaultwarden_namespace }}
+          --from-literal=username={{ vaultwarden_db_username }}
+          --from-literal=password={{ vaultwarden_db_password_b64.stdout | b64decode }}
+      register: vaultwarden_db_creds_result
+      changed_when: "'created' in vaultwarden_db_creds_result.stdout"
+      failed_when:
+        - vaultwarden_db_creds_result.rc != 0
+        - "'already exists' not in vaultwarden_db_creds_result.stderr"
+      when: bootstrap_node | default(false)
+      no_log: true
+
+    - name: Check if Vaultwarden database URL Secret exists
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret vaultwarden-db-url -n {{ vaultwarden_namespace }}
+      register: vaultwarden_db_url_check
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Vaultwarden database URL fact
+      ansible.builtin.set_fact:
+        vaultwarden_db_url: >-
+          postgresql://{{ vaultwarden_db_username }}:{{ vaultwarden_db_password_b64.stdout | b64decode
+          }}@vaultwarden-db-rw.{{ vaultwarden_namespace }}.svc:5432/{{ vaultwarden_db_name }}
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Create Vaultwarden database URL Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic vaultwarden-db-url
+          -n {{ vaultwarden_namespace }}
+          --from-literal=url={{ vaultwarden_db_url }}
+      register: vaultwarden_db_url_result
+      changed_when: "'created' in vaultwarden_db_url_result.stdout"
+      when:
+        - bootstrap_node | default(false)
+        - vaultwarden_db_url_check.rc != 0
+      no_log: true
+
+    # -------------------------------------------------------------------------
+    # Authentik OIDC Configuration
+    # -------------------------------------------------------------------------
+    # Creates an OAuth2/OIDC provider and application in Authentik for
+    # Vaultwarden SSO. The provider is configured as a confidential client with
+    # the Vaultwarden web vault redirect URI and the openid, email, and profile
+    # scopes. The Authentik-generated client ID and client secret are stored in
+    # the vaultwarden-oidc Kubernetes Secret so that the Deployment can load
+    # them via secretKeyRef without committing credentials to the gitops
+    # repository.
+    #
+    # All tasks are idempotent: the OIDC provider and application are created
+    # only if they do not already exist. The vaultwarden-oidc Secret is created
+    # only if it does not already exist, preserving credentials across
+    # subsequent playbook runs.
+    #
+    # API calls are made directly to the Authentik server ClusterIP, which is
+    # reachable from cluster nodes via Cilium's eBPF kube-proxy replacement.
+    # -------------------------------------------------------------------------
+    - name: Read Authentik bootstrap token from Kubernetes Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret authentik-credentials -n {{ authentik_namespace }}
+          -o jsonpath='{.data.bootstrap-token}'
+      register: authentik_bootstrap_token_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Authentik bootstrap token fact
+      ansible.builtin.set_fact:
+        authentik_bootstrap_token: '{{ authentik_bootstrap_token_b64.stdout | b64decode }}'
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Get Authentik server ClusterIP
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get svc authentik-server -n {{ authentik_namespace }}
+          -o jsonpath='{.spec.clusterIP}'
+      register: authentik_server_clusterip
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Authentik API base URL
+      ansible.builtin.set_fact:
+        authentik_api_url: 'http://{{ authentik_server_clusterip.stdout }}/api/v3'
+      when: bootstrap_node | default(false)
+
+    - name: Get default authorization flow UUID
+      ansible.builtin.uri:
+        url: >-
+          {{ authentik_api_url }}/flows/instances/?slug=default-provider-authorization-implicit-consent
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: vaultwarden_auth_flow_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set authorization flow UUID fact
+      ansible.builtin.set_fact:
+        vaultwarden_auth_flow_uuid: '{{ vaultwarden_auth_flow_result.json.results[0].pk }}'
+      when: bootstrap_node | default(false)
+
+    - name: Get default invalidation flow UUID
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/flows/instances/?slug=default-provider-invalidation-flow'
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: vaultwarden_invalidation_flow_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set invalidation flow UUID fact
+      ansible.builtin.set_fact:
+        vaultwarden_invalidation_flow_uuid: >-
+          {{ vaultwarden_invalidation_flow_result.json.results[0].pk }}
+      when: bootstrap_node | default(false)
+
+    - name: Get JWT signing key UUID
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/crypto/certificatekeypairs/?has_key=true'
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: vaultwarden_signing_key_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set signing key UUID fact
+      ansible.builtin.set_fact:
+        vaultwarden_signing_key_uuid: '{{ vaultwarden_signing_key_result.json.results[0].pk }}'
+      when: bootstrap_node | default(false)
+
+    - name: Get openid scope property mapping UUID
+      ansible.builtin.uri:
+        url: >-
+          {{ authentik_api_url }}/propertymappings/provider/scope/?managed=goauthentik.io%2Fproviders%2Foauth2%2Fscope-openid
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: vaultwarden_scope_openid_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Check if custom email scope property mapping already exists
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/propertymappings/provider/scope/?name=vaultwarden+email+scope'
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: vaultwarden_scope_email_check
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Create custom email scope property mapping with email_verified true
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/propertymappings/provider/scope/'
+        method: POST
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+        body_format: json
+        body:
+          name: 'vaultwarden email scope'
+          scope_name: email
+          expression: "return {\n    \"email\": request.user.email,\n    \"email_verified\": True\n}"
+        status_code: 201
+      register: vaultwarden_scope_email_create_result
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - vaultwarden_scope_email_check.json.pagination.count == 0
+
+    - name: Set email scope property mapping UUID fact
+      ansible.builtin.set_fact:
+        vaultwarden_scope_email_uuid: >-
+          {{
+            vaultwarden_scope_email_check.json.results[0].pk
+            if vaultwarden_scope_email_check.json.pagination.count > 0
+            else vaultwarden_scope_email_create_result.json.pk
+          }}
+      when: bootstrap_node | default(false)
+
+    - name: Get profile scope property mapping UUID
+      ansible.builtin.uri:
+        url: >-
+          {{ authentik_api_url }}/propertymappings/provider/scope/?managed=goauthentik.io%2Fproviders%2Foauth2%2Fscope-profile
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: vaultwarden_scope_profile_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set scope property mapping UUID facts
+      ansible.builtin.set_fact:
+        vaultwarden_scope_uuids:
+          - '{{ vaultwarden_scope_openid_result.json.results[0].pk }}'
+          - '{{ vaultwarden_scope_email_uuid }}'
+          - '{{ vaultwarden_scope_profile_result.json.results[0].pk }}'
+      when: bootstrap_node | default(false)
+
+    - name: Check if Vaultwarden OIDC provider already exists in Authentik
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/providers/oauth2/?name=vaultwarden-sso'
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: vaultwarden_provider_check
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Create Vaultwarden OAuth2/OIDC provider in Authentik
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/providers/oauth2/'
+        method: POST
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+        body_format: json
+        body:
+          name: vaultwarden-sso
+          authorization_flow: '{{ vaultwarden_auth_flow_uuid }}'
+          invalidation_flow: '{{ vaultwarden_invalidation_flow_uuid }}'
+          client_type: confidential
+          redirect_uris:
+            - matching_mode: strict
+              url: 'https://vault.{{ dns_zone }}/identity/connect/oidc-signin'
+          signing_key: '{{ vaultwarden_signing_key_uuid }}'
+          sub_mode: user_id
+          property_mappings: '{{ vaultwarden_scope_uuids }}'
+          include_claims_in_id_token: true
+        status_code: 201
+      register: vaultwarden_provider_create_result
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - vaultwarden_provider_check.json.pagination.count == 0
+
+    - name: Set OIDC provider facts from existing provider
+      ansible.builtin.set_fact:
+        vaultwarden_provider_id: '{{ vaultwarden_provider_check.json.results[0].pk }}'
+        vaultwarden_oidc_client_id: '{{ vaultwarden_provider_check.json.results[0].client_id }}'
+        vaultwarden_oidc_client_secret: >-
+          {{ vaultwarden_provider_check.json.results[0].client_secret }}
+      no_log: true
+      when:
+        - bootstrap_node | default(false)
+        - vaultwarden_provider_check.json.pagination.count > 0
+
+    - name: Set OIDC provider facts from newly created provider
+      ansible.builtin.set_fact:
+        vaultwarden_provider_id: '{{ vaultwarden_provider_create_result.json.pk }}'
+        vaultwarden_oidc_client_id: '{{ vaultwarden_provider_create_result.json.client_id }}'
+        vaultwarden_oidc_client_secret: >-
+          {{ vaultwarden_provider_create_result.json.client_secret }}
+      no_log: true
+      when:
+        - bootstrap_node | default(false)
+        - vaultwarden_provider_check.json.pagination.count == 0
+
+    - name: Check if Vaultwarden application already exists in Authentik
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/core/applications/vaultwarden-sso/'
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+        status_code: [200, 404]
+      register: vaultwarden_app_check
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Create Authentik application for Vaultwarden SSO
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/core/applications/'
+        method: POST
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+        body_format: json
+        body:
+          name: Vaultwarden
+          slug: vaultwarden-sso
+          provider: '{{ vaultwarden_provider_id }}'
+        status_code: 201
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - vaultwarden_app_check.status == 404
+
+    - name: Ensure Authentik application is linked to the OIDC provider
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/core/applications/vaultwarden-sso/'
+        method: PATCH
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+        body_format: json
+        body:
+          provider: '{{ vaultwarden_provider_id }}'
+        status_code: 200
+      register: vaultwarden_app_link_result
+      changed_when: >-
+        vaultwarden_app_link_result.json.provider | string != vaultwarden_provider_id | string
+      when: bootstrap_node | default(false)
+
+    - name: Check if Vaultwarden OIDC credentials Secret exists
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret vaultwarden-oidc -n {{ vaultwarden_namespace }}
+      register: vaultwarden_oidc_secret_check
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Create Vaultwarden OIDC credentials Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic vaultwarden-oidc
+          -n {{ vaultwarden_namespace }}
+          --from-literal=SSO_CLIENT_ID={{ vaultwarden_oidc_client_id }}
+          --from-literal=SSO_CLIENT_SECRET={{ vaultwarden_oidc_client_secret }}
+      register: vaultwarden_oidc_secret_result
+      changed_when: "'created' in vaultwarden_oidc_secret_result.stdout"
+      when:
+        - bootstrap_node | default(false)
+        - vaultwarden_oidc_secret_check.rc != 0
+      no_log: true
+
+    # -------------------------------------------------------------------------
+    # Database
+    # -------------------------------------------------------------------------
+    # Provisions a CloudNativePG Cluster for Vaultwarden's PostgreSQL database.
+    # The Cluster is provisioned before ArgoCD first syncs the manifests so
+    # that the database is available when the Vaultwarden pod starts.
+    # -------------------------------------------------------------------------
+    - name: Write Vaultwarden cnpg Cluster manifest
+      ansible.builtin.copy:
+        dest: /tmp/vaultwarden-db-cluster.yml
+        mode: '0600'
+        content: |
+          apiVersion: postgresql.cnpg.io/v1
+          kind: Cluster
+          metadata:
+            name: vaultwarden-db
+            namespace: '{{ vaultwarden_namespace }}'
+          spec:
+            instances: 1
+            imageName: '{{ vaultwarden_db_image }}'
+            storage:
+              storageClass: '{{ vaultwarden_storage_class }}'
+              size: '{{ vaultwarden_db_storage_size }}'
+            bootstrap:
+              initdb:
+                database: '{{ vaultwarden_db_name }}'
+                owner: '{{ vaultwarden_db_username }}'
+                secret:
+                  name: vaultwarden-db-credentials
+      when: bootstrap_node | default(false)
+
+    - name: Apply Vaultwarden cnpg Cluster manifest
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/vaultwarden-db-cluster.yml
+      register: vaultwarden_db_cluster_result
+      changed_when: >-
+        'created' in vaultwarden_db_cluster_result.stdout or
+        'configured' in vaultwarden_db_cluster_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Remove Vaultwarden cnpg Cluster manifest temporary file
+      ansible.builtin.file:
+        path: /tmp/vaultwarden-db-cluster.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Wait for Vaultwarden cnpg Cluster to become healthy
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get cluster vaultwarden-db -n {{ vaultwarden_namespace }}
+          -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: vaultwarden_db_ready
+      until: vaultwarden_db_ready.stdout == 'True'
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Network Policy
+    # -------------------------------------------------------------------------
+    # Applies an egress NetworkPolicy that restricts all pods in the
+    # vaultwarden namespace to four allowed egress targets: intra-namespace
+    # traffic (PostgreSQL via cnpg), kube-dns (UDP/TCP 53), the authentik
+    # namespace (direct service access), and the traefik namespace (required
+    # because authentik.homelab.internal resolves to Traefik's ClusterIP via
+    # the CoreDNS override above, which then proxies to Authentik).
+    # All other external egress is blocked.
+    # -------------------------------------------------------------------------
+    - name: Write Vaultwarden egress NetworkPolicy manifest
+      ansible.builtin.copy:
+        dest: /tmp/vaultwarden-netpol.yml
+        mode: '0600'
+        content: |
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: vaultwarden-egress-restrict
+            namespace: '{{ vaultwarden_namespace }}'
+          spec:
+            podSelector: {}
+            policyTypes:
+              - Egress
+            egress:
+              - ports:
+                  - port: 53
+                    protocol: UDP
+                  - port: 53
+                    protocol: TCP
+              - to:
+                  - podSelector: {}
+              - to:
+                  - namespaceSelector:
+                      matchLabels:
+                        kubernetes.io/metadata.name: '{{ authentik_namespace }}'
+              - to:
+                  - namespaceSelector:
+                      matchLabels:
+                        kubernetes.io/metadata.name: '{{ traefik_namespace }}'
+                ports:
+                  - port: 8443
+                    protocol: TCP
+      when: bootstrap_node | default(false)
+
+    - name: Apply Vaultwarden egress NetworkPolicy
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/vaultwarden-netpol.yml
+      register: vaultwarden_netpol_result
+      changed_when: >-
+        'created' in vaultwarden_netpol_result.stdout or
+        'configured' in vaultwarden_netpol_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Remove Vaultwarden egress NetworkPolicy manifest temporary file
+      ansible.builtin.file:
+        path: /tmp/vaultwarden-netpol.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # TLS / CA Certificate
+    # -------------------------------------------------------------------------
+    # Reads the self-signed wildcard TLS certificate from the wildcard-tls
+    # Secret in kube-system and stores it as a fact. The certificate is rendered
+    # into a ConfigMap via the Jinja2 manifest template and mounted into the
+    # Vaultwarden pod at /etc/ssl/certs/homelab-ca.crt. The SSL_CERT_FILE
+    # environment variable points to this path so that Vaultwarden's TLS client
+    # (reqwest/OpenSSL) trusts the certificate when connecting to Authentik for
+    # OIDC discovery.
+    # -------------------------------------------------------------------------
+    - name: Read homelab CA certificate from wildcard-tls Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret -n kube-system wildcard-tls
+          -o jsonpath='{.data.tls\.crt}'
+      register: homelab_ca_cert_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set homelab CA certificate fact
+      ansible.builtin.set_fact:
+        homelab_ca_cert: '{{ homelab_ca_cert_b64.stdout | b64decode }}'
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # GitOps - Manifest Management
+    # -------------------------------------------------------------------------
+    # Renders the Vaultwarden Kubernetes manifests from a Jinja2 template and
+    # commits them to the Gitea gitops repository. ArgoCD watches this path and
+    # automatically syncs the manifests to the cluster.
+    # -------------------------------------------------------------------------
+    - name: Ensure git is installed
+      ansible.builtin.apt:
+        name: git
+        state: present
+      when: bootstrap_node | default(false)
+
+    - name: Get Gitea pod IP
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get pod -n {{ gitea_namespace }}
+          -l app.kubernetes.io/name=gitea,app.kubernetes.io/instance=gitea
+          -o jsonpath='{.items[0].status.podIP}'
+      register: gitea_pod_ip
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Read Gitea admin password from Kubernetes Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret gitea-credentials -n {{ gitea_namespace }}
+          -o jsonpath='{.data.admin-password}'
+      register: gitea_admin_password_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Gitea admin password fact
+      ansible.builtin.set_fact:
+        gitea_admin_password: '{{ gitea_admin_password_b64.stdout | b64decode }}'
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Set Gitea authenticated repository URL fact
+      ansible.builtin.set_fact:
+        gitea_repo_url: >-
+          http://{{ gitea_admin_username }}:{{ gitea_admin_password
+          }}@{{ gitea_pod_ip.stdout }}:3000/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Clone or update gitops repository in temporary directory
+      ansible.builtin.git:
+        repo: '{{ gitea_repo_url }}'
+        dest: /tmp/gitops-vaultwarden
+        version: main
+        update: true
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Create Vaultwarden directory in gitops repository
+      ansible.builtin.file:
+        path: '/tmp/gitops-vaultwarden/{{ vaultwarden_gitops_path }}'
+        state: directory
+        mode: '0755'
+      when: bootstrap_node | default(false)
+
+    - name: Write Vaultwarden manifests to gitops repository
+      ansible.builtin.template:
+        src: templates/vaultwarden-manifests.yml.j2
+        dest: '/tmp/gitops-vaultwarden/{{ vaultwarden_gitops_path }}/manifests.yml'
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Configure git user email for commit  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-vaultwarden config user.email
+          'ansible@{{ dns_zone }}'
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Configure git user name for commit  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-vaultwarden config user.name Ansible
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set gitops repository remote URL with credentials for push  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-vaultwarden remote set-url origin {{ gitea_repo_url }}
+      no_log: true
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Stage Vaultwarden manifests in gitops repository  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-vaultwarden add
+          {{ vaultwarden_gitops_path }}/manifests.yml
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Check for staged changes in gitops repository  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-vaultwarden diff --cached --exit-code
+      register: gitops_diff_result
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Commit Vaultwarden manifests to gitops repository  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-vaultwarden commit
+          -m 'chore: update vaultwarden manifests'
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - gitops_diff_result.rc != 0
+
+    - name: Push Vaultwarden manifests commit to Gitea  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-vaultwarden push origin main
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - gitops_diff_result.rc != 0
+
+    - name: Remove gitops temporary directory
+      ansible.builtin.file:
+        path: /tmp/gitops-vaultwarden
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ArgoCD Application
+    # -------------------------------------------------------------------------
+    # Applies the ArgoCD Application manifest that tracks the Gitea repository
+    # path containing the Vaultwarden Kubernetes manifests. This initiates the
+    # deployment of all Vaultwarden resources to the cluster.
+    # -------------------------------------------------------------------------
+    - name: Write ArgoCD Application manifest for Vaultwarden
+      ansible.builtin.template:
+        src: templates/vaultwarden-app.yml.j2
+        dest: /tmp/vaultwarden-app.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ArgoCD Application manifest for Vaultwarden
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/vaultwarden-app.yml
+      register: argocd_app_result
+      changed_when: >-
+        'configured' in argocd_app_result.stdout or
+        'created' in argocd_app_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Remove ArgoCD Application manifest temporary file
+      ansible.builtin.file:
+        path: /tmp/vaultwarden-app.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Trigger ArgoCD hard refresh to detect new gitops commit
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch application vaultwarden -n {{ argocd_namespace }}
+          --type merge
+          -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Wait for ArgoCD to sync and deploy Vaultwarden
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get application vaultwarden -n {{ argocd_namespace }}
+          -o jsonpath='{.status.sync.status},{.status.health.status}'
+      register: argocd_status
+      until: argocd_status.stdout == 'Synced,Healthy'
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: bootstrap_node | default(false)

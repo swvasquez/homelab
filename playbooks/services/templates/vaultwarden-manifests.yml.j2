@@ -1,0 +1,155 @@
+{#
+  Native Kubernetes manifests for the Vaultwarden deployment, deployed via ArgoCD.
+  Contains a ConfigMap for the homelab CA certificate, the PersistentVolumeClaim
+  for data storage, the ClusterIP Service, and the Deployment that runs the
+  Vaultwarden container.
+
+  The admin token, database URL, and OIDC client credentials are injected via
+  secretKeyRef from Kubernetes Secrets provisioned by vaultwarden.yml:
+    - vaultwarden-credentials  admin-token
+    - vaultwarden-db-url       url (full PostgreSQL connection string)
+    - vaultwarden-oidc         SSO_CLIENT_ID, SSO_CLIENT_SECRET
+
+  The homelab CA certificate is mounted into the pod and SSL_CERT_FILE is set
+  so that Vaultwarden's TLS client (reqwest/OpenSSL) trusts the self-signed
+  wildcard certificate used by Authentik and other internal services.
+
+  Variables:
+    dns_zone:                   DNS zone used to derive DOMAIN and SSO_AUTHORITY
+                                (e.g. homelab.internal).
+    vaultwarden_namespace:      Kubernetes namespace where Vaultwarden is deployed.
+    vaultwarden_image:          Container image for Vaultwarden.
+    vaultwarden_image_tag:      Container image tag for Vaultwarden.
+    vaultwarden_storage_size:   Size of the data PVC.
+    vaultwarden_storage_class:  Kubernetes StorageClass for the data PVC.
+    homelab_ca_cert:            PEM-encoded CA certificate for homelab services.
+                                Read from the wildcard-tls Secret by vaultwarden.yml.
+#}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vaultwarden-ca
+  namespace: '{{ vaultwarden_namespace }}'
+  labels:
+    app.kubernetes.io/name: vaultwarden
+data:
+  ca.crt: |
+    {{ homelab_ca_cert | indent(4) }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vaultwarden-data
+  namespace: '{{ vaultwarden_namespace }}'
+  labels:
+    app.kubernetes.io/name: vaultwarden
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: '{{ vaultwarden_storage_class }}'
+  resources:
+    requests:
+      storage: '{{ vaultwarden_storage_size }}'
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vaultwarden
+  namespace: '{{ vaultwarden_namespace }}'
+  labels:
+    app.kubernetes.io/name: vaultwarden
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: vaultwarden
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vaultwarden
+  namespace: '{{ vaultwarden_namespace }}'
+  labels:
+    app.kubernetes.io/name: vaultwarden
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vaultwarden
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vaultwarden
+    spec:
+      containers:
+        - name: vaultwarden
+          image: '{{ vaultwarden_image }}:{{ vaultwarden_image_tag }}'
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+          env:
+            - name: ROCKET_PORT
+              value: '80'
+            - name: DOMAIN
+              value: 'https://vault.{{ dns_zone }}'
+            - name: SIGNUPS_ALLOWED
+              value: 'false'
+            - name: SSO_ENABLED
+              value: 'true'
+            - name: SSO_AUTHORITY
+              value: 'https://authentik.{{ dns_zone }}/application/o/vaultwarden-sso/'
+            - name: ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: vaultwarden-credentials
+                  key: admin-token
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: vaultwarden-db-url
+                  key: url
+            - name: SSO_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: vaultwarden-oidc
+                  key: SSO_CLIENT_ID
+            - name: SSO_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: vaultwarden-oidc
+                  key: SSO_CLIENT_SECRET
+            - name: SSL_CERT_FILE
+              value: /etc/ssl/certs/homelab-ca.crt
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: ca-cert
+              mountPath: /etc/ssl/certs/homelab-ca.crt
+              subPath: ca.crt
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /alive
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /alive
+              port: 80
+            initialDelaySeconds: 30
+            periodSeconds: 20
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: vaultwarden-data
+        - name: ca-cert
+          configMap:
+            name: vaultwarden-ca

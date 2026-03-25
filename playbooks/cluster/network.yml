@@ -723,11 +723,17 @@
     # -------------------------------------------------------------------------
     # CoreDNS Configuration
     # Patches the CoreDNS ConfigMap to add a dedicated forwarding block for the
-    # homelab DNS zone. The homelab zone is forwarded to the Bind9 ClusterIP,
-    # which is always reachable within the cluster via Cilium's eBPF datapath.
-    # The default zone forwards to explicit upstream DNS IPs (upstream_dns)
-    # rather than /etc/resolv.conf because nodes use systemd-resolved with a
-    # stub listener at 127.0.0.53, which is not reachable from pod network IPs.
+    # homelab DNS zone. The homelab zone includes a hosts override that resolves
+    # authentik.<dns_zone> to Traefik's ClusterIP. This is required because
+    # Cilium LB-IPAM external IPs are announced at L2 on the LAN but are not
+    # routable from within the pod network overlay, so services that need to
+    # reach Authentik internally (e.g. Vaultwarden for OIDC discovery) must
+    # route through Traefik's ClusterIP instead. Non-overridden homelab zone
+    # queries are forwarded to the Bind9 ClusterIP, which is always reachable
+    # within the cluster via Cilium's eBPF datapath. The default zone forwards
+    # to explicit upstream DNS IPs (upstream_dns) rather than /etc/resolv.conf
+    # because nodes use systemd-resolved with a stub listener at 127.0.0.53,
+    # which is not reachable from pod network IPs.
     # -------------------------------------------------------------------------
     - name: Fetch Bind9 ClusterIP for CoreDNS forwarding configuration
       ansible.builtin.command:
@@ -739,11 +745,25 @@
       changed_when: false
       when: bootstrap_node | default(false)
 
+    - name: Fetch Traefik ClusterIP for CoreDNS hosts block override
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get service traefik -n {{ traefik_namespace }}
+          -o jsonpath='{.spec.clusterIP}'
+      register: traefik_cluster_ip_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
     - name: Assemble CoreDNS Corefile content with homelab zone forward block
       ansible.builtin.set_fact:
         coredns_corefile: |
           {{ dns_zone }}:53 {
               errors
+              hosts {
+                  {{ traefik_cluster_ip_result.stdout | default('') }} authentik.{{ dns_zone }}
+                  fallthrough
+              }
               forward . {{ bind9_cluster_ip_result.stdout }}
               cache 30
           }
