@@ -44,10 +44,80 @@ Ansible Playbooks to configure Ubuntu x86_64 machines and manage a Kubernetes ho
     dns_zone: <DNS_ZONE>
     lb_ip_pool_cidr: <CIDR>
     router_private_ip: <ROUTER_IP>
-    dropbear_port: <DROPBEAR_PORT>
     shutdown_schedule: <SHUTDOWN_SCHEDULE>
     admin_email: <ADMIN_EMAIL>
     bootstrap_admin_password: <BOOTSTRAP_ADMIN_PASSWORD>
+    ufw_allowed_ports:
+      ssh:
+        port: <PORT>
+        protocol: tcp
+      dropbear:
+        port: <PORT>
+        protocol: tcp
+      kubernetes_api:
+        port: <PORT>
+        protocol: tcp
+      kubelet:
+        port: <PORT>
+        protocol: tcp
+        node_only: true
+      etcd_client:
+        port: <PORT>
+        protocol: tcp
+        node_only: true
+      etcd_peer:
+        port: <PORT>
+        protocol: tcp
+        node_only: true
+      cilium_vxlan:
+        port: <PORT>
+        protocol: udp
+        node_only: true
+      cilium_health:
+        port: <PORT>
+        protocol: tcp
+        node_only: true
+      traefik_http:
+        port: <PORT>
+        protocol: tcp
+      traefik_https:
+        port: <PORT>
+        protocol: tcp
+      bind9_dns_tcp:
+        port: <PORT>
+        protocol: tcp
+      bind9_dns_udp:
+        port: <PORT>
+        protocol: udp
+      gitea_ssh:
+        port: <PORT>
+        protocol: tcp
+      vllm_api:
+        port: <PORT>
+        protocol: tcp
+      nfs:
+        port: <PORT>
+        protocol: tcp
+      tailscale:
+        port: <PORT>
+        protocol: udp
+      slurm_ctld:
+        port: <PORT>
+        protocol: tcp
+        node_only: true
+      slurm_d:
+        port: <PORT>
+        protocol: tcp
+        node_only: true
+      syncthing_sync_tcp:
+        port: <PORT>
+        protocol: tcp
+      syncthing_sync_udp:
+        port: <PORT>
+        protocol: udp
+      syncthing_discovery:
+        port: <PORT>
+        protocol: udp
     ```
 
 ## Directory Structure
@@ -106,6 +176,7 @@ just lint playbooks/cluster/bootstrap.yml
 
 ## Notes
 
+- **Fixed-port services**: The following `ufw_allowed_ports` entries have standard ports that are not consumed by any playbook configuration — the port values defined here are used only by the UFW firewall rules and must match what the service actually listens on: `ssh`, `kubelet`, `etcd_client`, `etcd_peer`, `cilium_vxlan`, `cilium_health`, and `nfs`.
 - **`become_exe` configuration**: `become_exe` must be set to `sudo.ws` to resolve an issue
   with Ansible. See [Ansible Issue #85837](https://github.com/ansible/ansible/issues/85837)
   for details.

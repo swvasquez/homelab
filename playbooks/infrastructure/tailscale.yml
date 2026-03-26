@@ -19,6 +19,10 @@
 # Variables:
 #   tailscale_packages:  List of APT packages to install for Tailscale
 #                        (default: [tailscale]).
+#   tailscale_port:      UDP port the tailscaled daemon binds for WireGuard peer
+#                        connections. Written to /etc/default/tailscaled as
+#                        FLAGS="--port=<value>". Derived from
+#                        ufw_allowed_ports.tailscale.port.
 
 - name: Install and configure Tailscale
   hosts: homelab
@@ -27,6 +31,7 @@
   vars:
     tailscale_packages:
       - tailscale
+    tailscale_port: '{{ ufw_allowed_ports.tailscale.port }}'
 
   tasks:
     # -------------------------------------------------------------------------
@@ -82,9 +87,24 @@
         name: "{{ tailscale_packages }}"
         state: present
 
+    - name: Set Tailscale WireGuard listen port in daemon configuration
+      ansible.builtin.lineinfile:
+        path: /etc/default/tailscaled
+        regexp: '^FLAGS='
+        line: 'FLAGS="--port={{ tailscale_port }}"'
+        create: true
+        mode: '0644'
+      notify: Restart tailscaled
+
     - name: Connect to Tailscale network
       ansible.builtin.command:
         cmd: tailscale up
       changed_when: false
       # This may require interactive authentication.
       # For non-interactive setup, pass '--authkey' and other flags.
+
+  handlers:
+    - name: Restart tailscaled
+      ansible.builtin.service:
+        name: tailscaled
+        state: restarted

@@ -26,6 +26,11 @@
                               from the gitea-credentials Kubernetes Secret.
     gitea_hostname:           FQDN for the Gitea web UI
                               (e.g. gitea.homelab.internal).
+    gitea_ssh_hostname:       FQDN for the Gitea SSH LoadBalancer service.
+                              Used in clone URLs and ExternalDNS annotation
+                              (e.g. gitea-ssh.homelab.internal).
+    gitea_ssh_port:           External port for the SSH LoadBalancer service.
+                              Derived from ufw_allowed_ports.gitea_ssh.port.
     authentik_hostname:       FQDN for the Authentik UI, used to construct
                               the OIDC discovery and icon URLs.
     gitea_oidc_client_id:     OAuth2 client ID from the Authentik provider.
@@ -49,6 +54,8 @@ gitea:
     server:
       DOMAIN: '{{ gitea_hostname }}'
       ROOT_URL: 'https://{{ gitea_hostname }}'
+      SSH_DOMAIN: '{{ gitea_ssh_hostname }}'
+      SSH_PORT: '{{ gitea_ssh_port }}'
     service:
       DISABLE_REGISTRATION: false
       ALLOW_ONLY_EXTERNAL_REGISTRATION: true
@@ -85,8 +92,10 @@ service:
     type: ClusterIP
     port: 3000
   ssh:
-    type: ClusterIP
-    port: 22
+    type: LoadBalancer
+    port: {{ gitea_ssh_port }}
+    annotations:
+      external-dns.alpha.kubernetes.io/hostname: '{{ gitea_ssh_hostname }}'
 
 # Combines the Alpine system CA bundle with the homelab self-signed CA so that
 # Gitea trusts the cluster wildcard certificate. A preExtraInitContainer writes

@@ -6,16 +6,19 @@
   that Middleware resources defined in one namespace can be referenced by routes in
   other namespaces. The kubernetesIngress provider is disabled as Gateway API HTTPRoutes
   are used exclusively. A LoadBalancer service is created so Traefik receives a stable
-  LAN IP from the Cilium IP pool. HTTP traffic on port 80 is redirected to HTTPS by the
-  web entrypoint redirect. The built-in dashboard ingressRoute is disabled in favour of
+  LAN IP from the Cilium IP pool. HTTP traffic is redirected to HTTPS by the web
+  entrypoint redirect. The built-in dashboard ingressRoute is disabled in favor of
   the manually created HTTPRoute. Access logs are enabled for observability.
 
   Variables:
-    None — this template does not use Jinja variables. The kubernetesCRD
-    namespaces allowlist is hardcoded below. IMPORTANT: every time a new service
-    is deployed with an ExtensionRef middleware filter (e.g. ForwardAuth) in its
-    HTTPRoute, its namespace must be added to this list and cluster/network.yml
-    must be re-run, or Traefik will silently drop the filter and return 500.
+    traefik_http_port:  External LoadBalancer port for HTTP (the web entrypoint).
+                        Derived from ufw_allowed_ports.traefik_http.port in group_vars.
+    traefik_https_port: External LoadBalancer port for HTTPS (the websecure entrypoint).
+                        Derived from ufw_allowed_ports.traefik_https.port in group_vars.
+    IMPORTANT: every time a new service is deployed with an ExtensionRef middleware
+    filter (e.g. ForwardAuth) in its HTTPRoute, its namespace must be added to the
+    kubernetesCRD namespaces allowlist below and cluster/network.yml must be re-run,
+    or Traefik will silently drop the filter and return 500.
 #}
 providers:
   kubernetesGateway:
@@ -46,10 +49,13 @@ ports:
     expose:
       default: true
   web:
+    exposedPort: {{ traefik_http_port }}
     redirections:
       entryPoint:
         to: websecure
         scheme: https
+  websecure:
+    exposedPort: {{ traefik_https_port }}
 
 gateway:
   enabled: false

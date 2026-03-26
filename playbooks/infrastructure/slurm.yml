@@ -34,6 +34,10 @@
 #                                on the same host to make the controller also a compute node.
 #
 # Playbook variables:
+#   slurm_ctld_port:             Port slurmctld listens on. Derived from
+#                                ufw_allowed_ports.slurm_ctld.port.
+#   slurm_d_port:                Port slurmd listens on. Derived from
+#                                ufw_allowed_ports.slurm_d.port.
 #   slurm_cluster_name:          SLURM cluster name (default: homelab).
 #   slurm_partition_name:        Default partition name (default: homelab).
 #   slurm_state_dir:             Local directory on the controller for slurmctld state.
@@ -94,6 +98,8 @@
     - hardware
   gather_timeout: 30
   vars:
+    slurm_ctld_port: '{{ ufw_allowed_ports.slurm_ctld.port }}'
+    slurm_d_port: '{{ ufw_allowed_ports.slurm_d.port }}'
     slurm_cluster_name: homelab
     slurm_partition_name: homelab
     slurm_nfs_path: /mnt/nfs/slurm

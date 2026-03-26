@@ -48,13 +48,17 @@
 #   gateway_api_version:     Version of the Gateway API CRDs to install.
 #                            Must be compatible with the Cilium version in use
 #                            (default: 1.4.1).
-#   traefik_chart_version:         Version of the Traefik Helm chart (default: 34.4.1).
+#   traefik_chart_version:   Version of the Traefik Helm chart (default: 34.4.1).
 #   traefik_namespace:       Kubernetes namespace where Traefik is deployed
 #                            (default: traefik).
 #   traefik_hostname:        Fully qualified hostname for the Traefik dashboard,
 #                            derived from dns_zone
 #                            (default: traefik.<dns_zone>).
-#   cert_manager_chart_version:    Version of the cert-manager Helm chart
+#   traefik_http_port:       External LoadBalancer port for HTTP traffic. Derived
+#                            from ufw_allowed_ports.traefik_http.port.
+#   traefik_https_port:      External LoadBalancer port for HTTPS traffic. Derived
+#                            from ufw_allowed_ports.traefik_https.port.
+#   cert_manager_chart_version:   Version of the cert-manager Helm chart
 #                            (default: 1.20.0).
 #   cert_manager_namespace:  Kubernetes namespace for cert-manager
 #                            (default: cert-manager).
@@ -68,7 +72,9 @@
 #   bind9_pvc_size:          Size of the PersistentVolumeClaim used to store
 #                            Bind9 zone data across pod restarts
 #                            (default: 128Mi).
-#   externaldns_chart_version:     Version of the kubernetes-sigs ExternalDNS
+#   bind9_dns_port:          Port Bind9 listens on for DNS queries (TCP and UDP).
+#                            Derived from ufw_allowed_ports.bind9_dns_tcp.port.
+#   externaldns_chart_version:    Version of the kubernetes-sigs ExternalDNS
 #                            Helm chart (default: 1.19.0).
 #   upstream_dns:            Space-separated list of upstream DNS servers used
 #                            by CoreDNS to resolve non-cluster, non-homelab
@@ -113,11 +119,14 @@
     traefik_chart_version: 34.4.1
     traefik_namespace: traefik
     traefik_hostname: 'traefik.{{ dns_zone }}'
+    traefik_http_port: '{{ ufw_allowed_ports.traefik_http.port }}'
+    traefik_https_port: '{{ ufw_allowed_ports.traefik_https.port }}'
     cert_manager_chart_version: 1.20.0
     cert_manager_namespace: cert-manager
     bind9_image: "internetsystemsconsortium/bind9:9.20"
     bind9_namespace: kube-system
     bind9_pvc_size: 128Mi
+    bind9_dns_port: '{{ ufw_allowed_ports.bind9_dns_tcp.port }}'
     externaldns_chart_version: 1.19.0
     upstream_dns: 8.8.8.8 1.1.1.1
 
@@ -209,7 +218,7 @@
           --kubeconfig {{ kubectl_config_path }}
           --set kubeProxyReplacement=true
           --set k8sServiceHost={{ control_plane_ip }}
-          --set k8sServicePort=6443
+          --set k8sServicePort={{ ufw_allowed_ports.kubernetes_api.port }}
           --set gatewayAPI.enabled=true
           --set hubble.enabled=true
           --set hubble.relay.enabled=true

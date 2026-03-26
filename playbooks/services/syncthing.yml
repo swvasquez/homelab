@@ -93,8 +93,8 @@
     syncthing_default_folder_path: /var/syncthing/Sync
     syncthing_sync_hostname: 'syncthing-sync.{{ dns_zone }}'
     syncthing_gui_port: 8384
-    syncthing_sync_port: 22000
-    syncthing_discovery_port: 21027
+    syncthing_sync_port: '{{ ufw_allowed_ports.syncthing_sync_tcp.port }}'
+    syncthing_discovery_port: '{{ ufw_allowed_ports.syncthing_discovery.port }}'
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
     gitea_namespace: gitea
     gitea_admin_username: gitea_admin

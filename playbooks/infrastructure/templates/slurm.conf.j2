@@ -13,6 +13,8 @@
 #   slurm_spool_dir:            Per-node local spool directory for slurmd.
 #   slurm_max_time:             MaxTime for the default partition (e.g. "INFINITE").
 #   slurm_def_mem_per_cpu:      Default memory per CPU in MB; 0 disables constraint.
+#   slurm_ctld_port:            Port slurmctld listens on.
+#   slurm_d_port:               Port slurmd listens on.
 #   _slurm_controller_hostname: Derived hostname of the slurmctld node.
 #   _slurm_controller_ip:       Derived IP address of the slurmctld node.
 #}
@@ -25,9 +27,9 @@ MpiDefault=none
 ProctrackType=proctrack/linuxproc
 ReturnToService=1
 SlurmctldPidFile=/var/run/slurmctld.pid
-SlurmctldPort=6817
+SlurmctldPort={{ slurm_ctld_port }}
 SlurmdPidFile=/var/run/slurmd.pid
-SlurmdPort=6818
+SlurmdPort={{ slurm_d_port }}
 SlurmdSpoolDir={{ slurm_spool_dir }}
 SlurmUser=slurm
 StateSaveLocation={{ slurm_state_dir }}

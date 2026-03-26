@@ -60,8 +60,8 @@
 #                            (default: 0.90).
 #   vllm_max_model_len:      Maximum sequence length the model can handle
 #                            (default: 2048).
-#   vllm_api_port:           Port for the OpenAI-compatible API server
-#                            (default: 8000).
+#   vllm_api_port:           Port for the OpenAI-compatible API server.
+#                            Derived from ufw_allowed_ports.vllm_api.port.
 #   vllm_api_key_enabled:    Whether to require an API key for requests.
 #                            When true, a random key is generated and stored
 #                            in the vllm-credentials Secret
@@ -109,7 +109,7 @@
     vllm_dtype: float16
     vllm_gpu_memory_util: "0.90"
     vllm_max_model_len: "2048"
-    vllm_api_port: 8000
+    vllm_api_port: '{{ ufw_allowed_ports.vllm_api.port }}'
     vllm_api_key_enabled: true
     vllm_hf_token_enabled: false
     vllm_hf_token: ""

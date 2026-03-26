@@ -23,8 +23,8 @@
 # Variables (set in group_vars/homelab.yml):
 #   router_private_ip: The gateway IP address for the initramfs environment
 #                      (e.g., 192.168.1.1).
-#   dropbear_port:     The SSH port Dropbear will listen on in initramfs
-#                      (e.g., 2222).
+#   dropbear_port:     The SSH port Dropbear will listen on in initramfs.
+#                      Derived from ufw_allowed_ports.dropbear.port.
 
 - name: Generate Dropbear SSH key on localhost
   hosts: localhost
@@ -45,6 +45,8 @@
   hosts: homelab
   become: true
   become_exe: sudo.ws
+  vars:
+    dropbear_port: '{{ ufw_allowed_ports.dropbear.port }}'
 
   tasks:
     # -------------------------------------------------------------------------

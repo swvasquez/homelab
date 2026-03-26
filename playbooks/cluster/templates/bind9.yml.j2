@@ -5,7 +5,7 @@
     - PersistentVolumeClaim:    Stores zone data written by ExternalDNS across pod restarts.
     - Deployment:               Runs the Bind9 container with an initContainer that copies
                                 the initial zone file to the PVC on first boot.
-    - Service (LoadBalancer):   Exposes Bind9 on UDP and TCP port 53 with a dedicated
+    - Service (LoadBalancer):   Exposes Bind9 on UDP and TCP with a dedicated
                                 LAN IP from the Cilium IP pool.
 
   Variables:
@@ -14,6 +14,8 @@
     bind9_pvc_size:    Size of the PersistentVolumeClaim for zone data (e.g. 128Mi).
     bind9_tsig_secret: TSIG shared secret for RFC 2136 dynamic updates. Auto-generated
                        on first run and stored in the bind9-tsig Kubernetes Secret.
+    bind9_dns_port:    Port Bind9 listens on for DNS queries (TCP and UDP).
+                       Derived from ufw_allowed_ports.bind9_dns_tcp.port in group_vars.
     dns_zone:          DNS zone served by Bind9 (e.g. homelab.internal).
                        Read from group_vars.
 #}
@@ -109,9 +111,9 @@ spec:
         - name: bind9
           image: '{{ bind9_image }}'
           ports:
-            - containerPort: 53
+            - containerPort: {{ bind9_dns_port }}
               protocol: UDP
-            - containerPort: 53
+            - containerPort: {{ bind9_dns_port }}
               protocol: TCP
           volumeMounts:
             - name: config
@@ -148,10 +150,10 @@ spec:
     app: bind9
   ports:
     - name: dns-udp
-      port: 53
+      port: {{ bind9_dns_port }}
       protocol: UDP
-      targetPort: 53
+      targetPort: {{ bind9_dns_port }}
     - name: dns-tcp
-      port: 53
+      port: {{ bind9_dns_port }}
       protocol: TCP
-      targetPort: 53
+      targetPort: {{ bind9_dns_port }}
