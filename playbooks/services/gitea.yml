@@ -6,6 +6,12 @@
 # cluster via Helm. Gitea provides repository hosting, issue tracking, and a
 # CI/CD pipeline (Gitea Actions) for the homelab.
 #
+# Gitea exposes its own SSH server for git operations (clone, push, pull). This
+# is a purpose-built SSH server that runs independently of the system SSH daemon
+# and is unaffected by system SSH configuration. Arbitrary shell commands cannot
+# be run through it regardless of configuration, as Gitea never provides a
+# shell.
+#
 # Gitea admin and PostgreSQL credentials are auto-generated on first run and
 # stored in a Kubernetes Secret named gitea-credentials in the gitea namespace.
 # On subsequent runs the existing Secret is reused so credentials remain stable

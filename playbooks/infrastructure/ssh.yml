@@ -1,0 +1,89 @@
+---
+# ==============================================================================
+# Playbook: Configure SSH
+# ==============================================================================
+# Hardens the SSH daemon configuration on all hosts.
+#
+# Current tasks:
+#   - Create SSH Group: Creates a dedicated 'ssh' group used to control which
+#     users are permitted to log in via SSH.
+#   - Add Users to SSH Group: Adds specified users to the 'ssh' group.
+#   - Disable Password Authentication: Requires all logins to use SSH keys.
+#     Key passphrases are unaffected — they unlock the local private key and
+#     are never sent to the server.
+#   - Disable Root Login: Prevents the root account from logging in via SSH
+#     directly. Root access is still possible via sudo after logging in as an
+#     authorized user.
+#   - Disable Empty Passwords: Prevents accounts with no password set from
+#     logging in via SSH.
+#   - Disable X11 Forwarding: Disables X11 display forwarding, reducing the
+#     attack surface on headless server hosts.
+#   - Restrict SSH Access by Group: Only users in the 'ssh' group are permitted
+#     to connect via SSH.
+#
+# Variables:
+#   ssh_config_dir:      Directory for SSH daemon config snippets
+#                        (default: /etc/ssh/sshd_config.d).
+#   ssh_users:           List of users to add to the 'ssh' group. These are the
+#                        only users that will be permitted to log in via SSH. Set
+#                        in group_vars/homelab.yml.
+#   ufw_allowed_ports:   Port map read from group_vars/homelab.yml. The SSH
+#                        daemon port is sourced from ufw_allowed_ports.ssh.port.
+#                        Must match ansible_port in inventory.yml.
+#
+# NOTE: Misconfiguring SSH can block all remote access to the hosts. Review
+# all changes carefully before deploying.
+
+- name: Configure SSH
+  hosts: homelab
+  become: true
+  become_exe: sudo.ws
+  vars:
+    ssh_config_dir: /etc/ssh/sshd_config.d
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # SSH Group
+    # Creates the 'ssh' group and adds the specified users to it. Only members
+    # of this group will be permitted to connect via SSH, as enforced by the
+    # AllowGroups directive applied in the next section.
+    # -------------------------------------------------------------------------
+    - name: Create ssh group
+      ansible.builtin.group:
+        name: ssh
+        state: present
+
+    - name: Add users to ssh group
+      ansible.builtin.user:
+        name: '{{ item }}'
+        groups: ssh
+        append: true
+      loop: '{{ ssh_users }}'
+
+    # -------------------------------------------------------------------------
+    # SSH Daemon Configuration
+    # Drops a config snippet into sshd_config.d that disables password-based
+    # logins and restricts access to members of the 'ssh' group. Using
+    # sshd_config.d keeps changes isolated and avoids modifying the main
+    # sshd_config file directly.
+    # -------------------------------------------------------------------------
+    - name: Configure SSH daemon hardening
+      ansible.builtin.copy:
+        dest: '{{ ssh_config_dir }}/99-hardening.conf'
+        content: |
+          Port {{ ufw_allowed_ports.ssh.port }}
+          PasswordAuthentication no
+          PermitRootLogin no
+          PermitEmptyPasswords no
+          X11Forwarding no
+          AllowGroups ssh
+        owner: root
+        group: root
+        mode: '0600'
+      notify: Reload sshd
+
+  handlers:
+    - name: Reload sshd
+      ansible.builtin.service:
+        name: sshd
+        state: reloaded

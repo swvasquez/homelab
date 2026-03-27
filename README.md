@@ -23,6 +23,8 @@ Ansible Playbooks to configure Ubuntu x86_64 machines and manage a Kubernetes ho
     all:
       children:
         homelab:
+          vars:
+            ansible_port: <SSH_PORT>
           hosts:
             <HOSTNAME>:
               ansible_user: <USER>
@@ -41,6 +43,9 @@ Ansible Playbooks to configure Ubuntu x86_64 machines and manage a Kubernetes ho
 3.  Create a `group_vars/homelab.yml` file for group-level variables:
 
     ```yaml
+    ssh_users:
+      - <USER>
+      - <ANSIBLE_USER>
     dns_zone: <DNS_ZONE>
     lb_ip_pool_cidr: <CIDR>
     router_private_ip: <ROUTER_IP>
@@ -177,6 +182,7 @@ just lint playbooks/cluster/bootstrap.yml
 ## Notes
 
 - **Fixed-port services**: The following `ufw_allowed_ports` entries have standard ports that are not consumed by any playbook configuration — the port values defined here are used only by the UFW firewall rules and must match what the service actually listens on: `ssh`, `kubelet`, `etcd_client`, `etcd_peer`, `cilium_vxlan`, `cilium_health`, and `nfs`.
+- **SSH port**: `ufw_allowed_ports.ssh.port` in `group_vars/homelab.yml` must match `ansible_port` in `inventory.yml`.
 - **`become_exe` configuration**: `become_exe` must be set to `sudo.ws` to resolve an issue
   with Ansible. See [Ansible Issue #85837](https://github.com/ansible/ansible/issues/85837)
   for details.
