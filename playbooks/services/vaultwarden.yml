@@ -11,12 +11,13 @@
 # resource provisioned in the vaultwarden namespace before ArgoCD first syncs
 # the manifests.
 #
-# A Kubernetes NetworkPolicy restricts egress from all pods in the vaultwarden
-# namespace to intra-namespace traffic (PostgreSQL), kube-dns (UDP/TCP 53),
-# the Authentik namespace, and the Traefik namespace (port 8443 only). All
-# other external egress is blocked. The CoreDNS hosts override that resolves
-# authentik.homelab.internal to Traefik's ClusterIP is managed by
-# playbooks/cluster/network.yml.
+# A Kubernetes NetworkPolicy restricts egress from the Vaultwarden app pod to
+# intra-namespace traffic (PostgreSQL), kube-dns (UDP/TCP 53), the Authentik
+# namespace, and the Traefik namespace (port 8443 only). The policy is scoped
+# to the app pod only — cnpg database pods are left unrestricted so they can
+# reach the Kubernetes API server as required by the cnpg operator. The
+# CoreDNS hosts override that resolves authentik.homelab.internal to Traefik's
+# ClusterIP is managed by playbooks/cluster/network.yml.
 #
 # The full database connection URL is stored in the vaultwarden-db-url Secret
 # and injected into the Deployment via secretKeyRef.
@@ -596,13 +597,18 @@
     # -------------------------------------------------------------------------
     # Network Policy
     # -------------------------------------------------------------------------
-    # Applies an egress NetworkPolicy that restricts all pods in the
-    # vaultwarden namespace to four allowed egress targets: intra-namespace
-    # traffic (PostgreSQL via cnpg), kube-dns (UDP/TCP 53), the authentik
-    # namespace (direct service access), and the traefik namespace (required
-    # because authentik.homelab.internal resolves to Traefik's ClusterIP via
-    # the CoreDNS override above, which then proxies to Authentik).
-    # All other external egress is blocked.
+    # Applies an egress NetworkPolicy scoped to the Vaultwarden app pod only
+    # (not the cnpg database pods). The cnpg database pods are intentionally
+    # left unrestricted so they can reach the Kubernetes API server to manage
+    # the cluster — a requirement of the cnpg operator that cannot be satisfied
+    # with a simple ipBlock rule under Cilium due to DNAT evaluation order.
+    #
+    # The Vaultwarden app pod is restricted to four egress targets:
+    # intra-namespace traffic (PostgreSQL via cnpg), kube-dns (UDP/TCP 53),
+    # the Authentik namespace (direct service access), and the Traefik namespace
+    # (required because authentik.homelab.internal resolves to Traefik's
+    # ClusterIP via the CoreDNS override, which then proxies to Authentik).
+    # All other external egress from the app pod is blocked.
     # -------------------------------------------------------------------------
     - name: Write Vaultwarden egress NetworkPolicy manifest
       ansible.builtin.copy:
@@ -615,7 +621,9 @@
             name: vaultwarden-egress-restrict
             namespace: '{{ vaultwarden_namespace }}'
           spec:
-            podSelector: {}
+            podSelector:
+              matchLabels:
+                app.kubernetes.io/name: vaultwarden
             policyTypes:
               - Egress
             egress:
