@@ -48,6 +48,7 @@ Ansible Playbooks to configure Ubuntu x86_64 machines and manage a Kubernetes ho
       - <ANSIBLE_USER>
     dns_zone: <DNS_ZONE>
     lb_ip_pool_cidr: <CIDR>
+    lan_cidr: <CIDR>
     router_private_ip: <ROUTER_IP>
     shutdown_schedule: <SHUTDOWN_SCHEDULE>
     admin_email: <ADMIN_EMAIL>
@@ -123,6 +124,9 @@ Ansible Playbooks to configure Ubuntu x86_64 machines and manage a Kubernetes ho
       syncthing_discovery:
         port: <PORT>
         protocol: udp
+      plex:
+        port: <PORT>
+        protocol: tcp
     ```
 
 ## Directory Structure

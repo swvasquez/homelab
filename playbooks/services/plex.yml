@@ -1,0 +1,348 @@
+---
+# ==============================================================================
+# Playbook: Deploy Plex Media Server via ArgoCD GitOps
+# ==============================================================================
+# This playbook configures and deploys Plex Media Server to the Kubernetes
+# cluster via ArgoCD GitOps using native Kubernetes manifests stored in the
+# Gitea gitops repository.
+#
+# Two PersistentVolumeClaims are provisioned via Longhorn: one for Plex
+# configuration and metadata (plex-config) and one for media files
+# (plex-media). Adjust plex_media_storage_size to suit your library size; for
+# very large libraries consider substituting an NFS-backed StorageClass.
+#
+# Plex uses plex.tv account-based authentication natively. The optional
+# PLEX_CLAIM token, retrieved from https://plex.tv/claim, binds the server to
+# a plex.tv account on first startup and is consumed immediately. If the server
+# is already claimed or initial setup will be performed via the Plex web UI,
+# leave plex_claim_token empty (the default). The token is stored in the
+# plex-credentials Kubernetes Secret so it is never committed to the gitops
+# repository.
+#
+# Plex authenticates users via plex.tv accounts natively and does not support
+# OIDC or any external identity provider. Traefik ForwardAuth is therefore not
+# applied — adding it would break native Plex clients (mobile, desktop, TV
+# apps) that communicate directly with the server on port 32400.
+#
+# WARNING: Plex authentication is NOT self-contained. Even on a local network,
+# signing in requires a round-trip to plex.tv to verify the user account. Do
+# NOT apply an egress NetworkPolicy to the plex namespace or authentication
+# will fail entirely. If self-contained auth is required, use Jellyfin instead
+# (see TODO.md). The HTTPRoute
+# is committed to the gitops repository and managed by ArgoCD; re-running
+# cluster/authentication.yml is not required. A dedicated LoadBalancer service
+# (plex-direct) exposes port 32400 for native Plex clients on the LAN. A
+# NetworkPolicy restricts ingress on that port to the LAN subnet
+# (plex_lan_cidr) so it is unreachable from outside the local network.
+#
+# Run order:
+#   1. cluster/authentication.yml (Authentik, Traefik, cert-manager)
+#   2. services/gitea.yml
+#   3. services/argocd.yml
+#   4. services/plex.yml (this playbook)
+#
+# Input Variables:
+#   bootstrap_node:           Boolean indicating if the host is the control
+#                             plane bootstrap node. Read from inventory.
+#   dns_zone:                 Internal DNS zone for homelab services.
+#                             Read from group_vars.
+#   plex_namespace:           Kubernetes namespace for Plex
+#                             (default: plex).
+#   plex_image:               Container image for Plex Media Server
+#                             (default: plexinc/pms-docker).
+#   plex_image_tag:           Container image tag for Plex Media Server
+#                             (default: latest).
+#   plex_config_storage_size: Storage size for the Plex configuration PVC
+#                             (default: 10Gi).
+#   plex_media_storage_size:  Storage size for the Plex media PVC
+#                             (default: 100Gi).
+#   plex_storage_class:       Kubernetes StorageClass for both PVCs
+#                             (default: longhorn).
+#   plex_timezone:            Timezone injected into the container
+#                             (default: UTC).
+#   plex_port:                Port that Plex listens on (default: 32400).
+#   plex_claim_token:         Optional plex.tv claim token for initial server
+#                             binding. Retrieve from https://plex.tv/claim
+#                             (expires in 4 minutes). Leave empty if the
+#                             server is already claimed or if initial setup
+#                             will be performed via the web UI (default: '').
+#   plex_hostname:            FQDN for the Plex web UI HTTPRoute, derived from
+#                             dns_zone (default: plex.<dns_zone>).
+#   plex_server_hostname:     FQDN for the native client LoadBalancer service,
+#                             registered in DNS via ExternalDNS
+#                             (default: plex-server.<dns_zone>).
+#   plex_lan_cidr:            LAN subnet CIDR used by the ingress NetworkPolicy
+#                             to restrict direct port access to local clients.
+#                             Read from group_vars (default: lan_cidr).
+#   plex_gitops_path:         Path within the gitops repository where the
+#                             Plex manifests are stored (default: apps/plex).
+#   kubectl_config_path:      Full path to the kubectl config file
+#                             (default: /home/<ansible_user>/.kube/config).
+#   gitea_namespace:          Kubernetes namespace where Gitea is deployed
+#                             (default: gitea).
+#   gitea_admin_username:     Username of the Gitea admin account used to
+#                             push to the gitops repository
+#                             (default: gitea_admin).
+#   gitea_gitops_repo:        Name of the Gitea gitops repository
+#                             (default: gitops).
+#   argocd_namespace:         Kubernetes namespace where ArgoCD is deployed
+#                             (default: argocd).
+
+- name: Deploy Plex Media Server via ArgoCD GitOps
+  hosts: homelab
+  become: true
+  become_exe: sudo.ws
+  vars:
+    plex_namespace: plex
+    plex_image: plexinc/pms-docker
+    plex_image_tag: latest
+    plex_config_storage_size: 10Gi
+    plex_media_storage_size: 25Gi
+    plex_storage_class: longhorn
+    plex_timezone: UTC
+    plex_port: '{{ ufw_allowed_ports.plex.port }}'
+    plex_claim_token: ''
+    plex_hostname: 'plex.{{ dns_zone }}'
+    plex_server_hostname: 'plex-server.{{ dns_zone }}'
+    plex_lan_cidr: '{{ lan_cidr }}'
+    plex_gitops_path: apps/plex
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    gitea_namespace: gitea
+    gitea_admin_username: gitea_admin
+    gitea_gitops_repo: gitops
+    argocd_namespace: argocd
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Namespace
+    # -------------------------------------------------------------------------
+    # Creates the plex namespace before any other resources so that the
+    # plex-credentials Secret can be stored there before ArgoCD first syncs
+    # the manifests.
+    # -------------------------------------------------------------------------
+    - name: Create Plex namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create namespace {{ plex_namespace }}
+      register: plex_ns_result
+      changed_when: "'created' in plex_ns_result.stdout"
+      failed_when:
+        - plex_ns_result.rc != 0
+        - "'already exists' not in plex_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Credentials
+    # -------------------------------------------------------------------------
+    # Stores the optional Plex claim token in a Kubernetes Secret so it is
+    # never committed to the gitops repository. The token is read by the
+    # Deployment as the PLEX_CLAIM environment variable and consumed by Plex
+    # on first startup to bind the server to the plex.tv account. On
+    # subsequent runs the existing Secret is reused so the token is not
+    # overwritten after the server has already been claimed.
+    # -------------------------------------------------------------------------
+    - name: Check if Plex credentials Secret exists
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret plex-credentials -n {{ plex_namespace }}
+      register: plex_secret_check
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Create Plex credentials Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic plex-credentials
+          -n {{ plex_namespace }}
+          --from-literal=claim-token={{ plex_claim_token }}
+      register: plex_secret_result
+      changed_when: "'created' in plex_secret_result.stdout"
+      when:
+        - bootstrap_node | default(false)
+        - plex_secret_check.rc != 0
+      no_log: true
+
+    # -------------------------------------------------------------------------
+    # GitOps - Manifest Management
+    # -------------------------------------------------------------------------
+    # Renders the Plex native Kubernetes manifests from a Jinja2 template and
+    # commits them to the Gitea gitops repository. ArgoCD watches this path
+    # and automatically syncs the manifests to the cluster.
+    # -------------------------------------------------------------------------
+    - name: Ensure git is installed
+      ansible.builtin.apt:
+        name: git
+        state: present
+      when: bootstrap_node | default(false)
+
+    - name: Get Gitea pod IP
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get pod -n {{ gitea_namespace }}
+          -l app.kubernetes.io/name=gitea,app.kubernetes.io/instance=gitea
+          -o jsonpath='{.items[0].status.podIP}'
+      register: gitea_pod_ip
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Read Gitea admin password from Kubernetes Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret gitea-credentials -n {{ gitea_namespace }}
+          -o jsonpath='{.data.admin-password}'
+      register: gitea_admin_password_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Gitea admin password fact
+      ansible.builtin.set_fact:
+        gitea_admin_password: '{{ gitea_admin_password_b64.stdout | b64decode }}'
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Set Gitea authenticated repository URL fact
+      ansible.builtin.set_fact:
+        gitea_repo_url: >-
+          http://{{ gitea_admin_username }}:{{ gitea_admin_password
+          }}@{{ gitea_pod_ip.stdout }}:3000/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Clone or update gitops repository in temporary directory
+      ansible.builtin.git:
+        repo: '{{ gitea_repo_url }}'
+        dest: /tmp/gitops-plex
+        version: main
+        update: true
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Create Plex directory in gitops repository
+      ansible.builtin.file:
+        path: '/tmp/gitops-plex/{{ plex_gitops_path }}'
+        state: directory
+        mode: '0755'
+      when: bootstrap_node | default(false)
+
+    - name: Write Plex manifests to gitops repository
+      ansible.builtin.template:
+        src: templates/plex-manifests.yml.j2
+        dest: '/tmp/gitops-plex/{{ plex_gitops_path }}/manifests.yml'
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Configure git user email for commit  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-plex config user.email 'ansible@{{ dns_zone }}'
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Configure git user name for commit  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-plex config user.name Ansible
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set gitops repository remote URL with credentials for push  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-plex remote set-url origin {{ gitea_repo_url }}
+      no_log: true
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Stage Plex manifests in gitops repository  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-plex add {{ plex_gitops_path }}/manifests.yml
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Check for staged changes in gitops repository  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-plex diff --cached --exit-code
+      register: gitops_diff_result
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Commit Plex manifests to gitops repository  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-plex commit -m 'chore: update plex manifests'
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - gitops_diff_result.rc != 0
+
+    - name: Push Plex manifests commit to Gitea  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-plex push origin main
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - gitops_diff_result.rc != 0
+
+    - name: Remove gitops temporary directory
+      ansible.builtin.file:
+        path: /tmp/gitops-plex
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ArgoCD Application
+    # -------------------------------------------------------------------------
+    # Applies the ArgoCD Application manifest that tracks the Gitea repository
+    # path containing the Plex Kubernetes manifests. This initiates the
+    # deployment of all Plex resources to the cluster.
+    # -------------------------------------------------------------------------
+    - name: Write ArgoCD Application manifest for Plex
+      ansible.builtin.template:
+        src: templates/plex-app.yml.j2
+        dest: /tmp/plex-app.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ArgoCD Application manifest for Plex
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/plex-app.yml
+      register: argocd_app_result
+      changed_when: >-
+        'configured' in argocd_app_result.stdout or
+        'created' in argocd_app_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Remove ArgoCD Application manifest temporary file
+      ansible.builtin.file:
+        path: /tmp/plex-app.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Trigger ArgoCD hard refresh to detect new gitops commit
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch application plex -n {{ argocd_namespace }}
+          --type merge
+          -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Wait for ArgoCD to sync and deploy Plex
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get application plex -n {{ argocd_namespace }}
+          -o jsonpath='{.status.sync.status},{.status.health.status}'
+      register: argocd_status
+      until: argocd_status.stdout == 'Synced,Healthy'
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: bootstrap_node | default(false)

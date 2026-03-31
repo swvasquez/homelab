@@ -18,6 +18,11 @@
   centralize secret storage, rotation, auditing, and dynamic credential generation. The K8s integration
   (Agent sidecar or CSI driver) would replace per-playbook `openssl rand` key generation.
 
+- **Jellyfin** — Replace Plex with Jellyfin (`services/jellyfin.yml`) for self-contained media
+  server auth. Unlike Plex, Jellyfin uses a local user database with no dependency on external
+  services, making it suitable for air-gapped or egress-restricted deployments. The existing
+  `services/plex.yml` playbook can serve as a reference.
+
 - **CA-backed TLS issuer** — cert-manager currently uses a `selfSigned` ClusterIssuer, meaning each
   certificate is self-signed individually with no common CA. This prevents pods from trusting internal
   HTTPS endpoints (e.g. Immich calling Authentik for OIDC). The workaround is `NODE_TLS_REJECT_UNAUTHORIZED=0`
