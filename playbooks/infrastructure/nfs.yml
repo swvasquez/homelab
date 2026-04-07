@@ -18,6 +18,9 @@
 #       The SGID bit ensures new files and subdirectories inherit the group of the parent
 #       directory rather than the creating user's primary group, and subdirectories also
 #       inherit the SGID bit — keeping group ownership consistent throughout the tree.
+#     - Creates the Kubernetes NFS subdirectory (nfs_k8s_path) with the same
+#       ownership and permissions, providing a dedicated area for Kubernetes
+#       workload volumes separate from other NFS consumers.
 #     - Explicitly enables NFSv3 and NFSv4 in /etc/nfs.conf.
 #       Both versions are served simultaneously. Linux clients default to NFSv4;
 #       macOS clients should mount with nfsvers=3 for better compatibility.
@@ -34,8 +37,11 @@
 #   nfs_server:       Boolean, set to true on the node that should run the NFS server.
 #
 # Playbook variables:
-#   nfs_group:        Group name for NFS access (default: "nfs_users").
-#   nfs_group_gid:    GID for the NFS group, must be consistent across nodes (default: 3000).
+#   nfs_group:        Group name for NFS access. Read from group_vars.
+#   nfs_group_gid:    GID for the NFS group, must be consistent across nodes.
+#                     Read from group_vars.
+#   nfs_k8s_path:     Path for Kubernetes workload volumes on the NFS server.
+#                     Read from group_vars.
 #   nfs_export_path:  Directory to export from the server (e.g. /srv/nfs/data).
 #   nfs_export_opts:  Export options (default: "*(rw,sync,no_subtree_check)").
 #   nfs_mount_point:  Local directory to mount the NFS share on clients (e.g. /mnt/nfs).
@@ -84,9 +90,6 @@
   hosts: homelab
   become: true
   become_exe: sudo.ws
-  vars:
-    nfs_group: "nfs_users"
-    nfs_group_gid: 3000
   tasks:
     - name: Create NFS group with consistent GID
       ansible.builtin.group:
@@ -108,7 +111,6 @@
   become: true
   become_exe: sudo.ws
   vars:
-    nfs_group: "nfs_users"
     nfs_export_path: "/srv/nfs/data"
     nfs_export_opts: "*(rw,sync,no_subtree_check)"
     nfs_lvm_vg_name: "ubuntu-vg"
@@ -186,6 +188,15 @@
     - name: Create NFS export directory
       ansible.builtin.file:
         path: "{{ nfs_export_path }}"
+        state: directory
+        owner: "root"
+        group: "{{ nfs_group }}"
+        mode: "2775"
+      when: nfs_server | default(false)
+
+    - name: Create Kubernetes NFS directory
+      ansible.builtin.file:
+        path: "{{ nfs_k8s_path }}"
         state: directory
         owner: "root"
         group: "{{ nfs_group }}"

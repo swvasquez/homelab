@@ -18,11 +18,11 @@
 #
 # After Authentik is deployed, a Traefik ForwardAuth Middleware is applied to
 # the kube-system, longhorn-system, observability, gitea, argocd, immich,
-# syncthing, open-webui, firefly-iii, and vaultwarden namespaces, and the
-# Hubble, Traefik dashboard, Longhorn, Prometheus, Grafana, Alertmanager,
-# Gitea, ArgoCD, Immich, Syncthing, Open WebUI, Firefly III, and Vaultwarden
-# HTTPRoutes are re-applied with the middleware enabled. This protects those
-# UIs behind Authentik authentication.
+# syncthing, open-webui, firefly-iii, vaultwarden, and jellyfin namespaces,
+# and the Hubble, Traefik dashboard, Longhorn, Prometheus, Grafana,
+# Alertmanager, Gitea, ArgoCD, Immich, Syncthing, Open WebUI, Firefly III,
+# Vaultwarden, and Jellyfin HTTPRoutes are re-applied with the middleware
+# enabled. This protects those UIs behind Authentik authentication.
 #
 # Variables:
 #   bootstrap_node:              Boolean indicating if the host is the control
@@ -82,6 +82,10 @@
 #                                (default: vaultwarden).
 #   vaultwarden_hostname:        FQDN for the Vaultwarden web vault, derived
 #                                from dns_zone (default: vault.<dns_zone>).
+#   jellyfin_namespace:          Kubernetes namespace for Jellyfin
+#                                (default: jellyfin).
+#   jellyfin_hostname:           FQDN for the Jellyfin UI, derived from
+#                                dns_zone (default: jellyfin.<dns_zone>).
 #   kubectl_config_path:         Full path to the kubectl config file
 #                                (default: /home/<ansible_user>/.kube/config).
 #   authentik_bootstrap_token:   API token auto-generated on first run and
@@ -139,6 +143,8 @@
     firefly_hostname: 'firefly.{{ dns_zone }}'
     vaultwarden_namespace: vaultwarden
     vaultwarden_hostname: 'vault.{{ dns_zone }}'
+    jellyfin_namespace: jellyfin
+    jellyfin_hostname: 'jellyfin.{{ dns_zone }}'
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
     protected_httproutes:
       - name: hubble-ui
@@ -219,6 +225,12 @@
         backend_name: vaultwarden
         backend_ns: '{{ vaultwarden_namespace }}'
         backend_port: 80
+      - name: jellyfin
+        route_ns: '{{ jellyfin_namespace }}'
+        hostname: '{{ jellyfin_hostname }}'
+        backend_name: jellyfin
+        backend_ns: '{{ jellyfin_namespace }}'
+        backend_port: 8096
 
   tasks:
     # -------------------------------------------------------------------------

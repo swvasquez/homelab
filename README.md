@@ -47,6 +47,9 @@ Ansible Playbooks to configure Ubuntu x86_64 machines and manage a Kubernetes ho
       - <USER>
       - <ANSIBLE_USER>
     dns_zone: <DNS_ZONE>
+    nfs_k8s_path: <NFS_K8S_PATH>
+    nfs_group: <NFS_GROUP>
+    nfs_group_gid: <NFS_GROUP_GID>
     lb_ip_pool_cidr: <CIDR>
     lan_cidr: <CIDR>
     router_private_ip: <ROUTER_IP>
@@ -196,6 +199,7 @@ just lint playbooks/cluster/bootstrap.yml
   just install cluster authentication
   ```
 - **Open WebUI and vLLM**: Open WebUI (`services/openwebui.yml`) connects to vLLM (`services/vllm.yml`) using the vLLM API key from the `vllm-credentials` Secret. vLLM must be deployed first. Open WebUI's built-in authentication is disabled — access is gated entirely by Traefik ForwardAuth (Authentik). The `vllm_host` inventory variable controls which nodes run a vLLM instance.
+- **Jellyfin**: Jellyfin (`services/jellyfin.yml`) is a self-hosted media server deployed via the official Helm chart. All access is gated by Traefik ForwardAuth backed by Authentik — no OIDC plugin is required. After deploying, re-run `cluster/authentication.yml` to apply the HTTPRoute and ForwardAuth middleware.
 - **Local DNS Resolution**: To resolve homelab services (e.g., `*.homelab.internal`) from your local machine, configure your OS to use the cluster's Bind9 LoadBalancer IP as its nameserver. Note that Syncthing sync traffic uses a **dedicated LoadBalancer IP** (separate from the web GUI) to ensure high-performance data transfer.
   - **macOS Setup**:
     ```sh

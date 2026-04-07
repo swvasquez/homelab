@@ -1,0 +1,341 @@
+---
+# ==============================================================================
+# Playbook: Deploy Jellyfin Media Server via ArgoCD GitOps
+# ==============================================================================
+# This playbook configures and deploys Jellyfin Media Server to the Kubernetes
+# cluster via ArgoCD GitOps using the upstream Jellyfin Helm chart with custom
+# values stored in the Gitea gitops repository.
+#
+# The Jellyfin configuration PVC is provisioned via Longhorn. Media files are
+# stored on the homelab NFS share under nfs_k8s_path/jellyfin, backed by a
+# static PersistentVolume applied before ArgoCD syncs the Helm release.
+# The Jellyfin pod runs with supplementalGroups set to nfs_group_gid so it has
+# write access to the NFS export directory (owned by root:nfs_users, mode 2775).
+#
+# All access to the Jellyfin web UI is gated by Traefik ForwardAuth backed by
+# Authentik, requiring an active Authentik session before requests reach
+# Jellyfin. Jellyfin's own user management can still be used for per-user
+# library permissions after the ForwardAuth layer grants access.
+#
+# After deploying this playbook, re-run cluster/authentication.yml to apply
+# the HTTPRoute and ForwardAuth middleware to the jellyfin namespace.
+#
+# Run order:
+#   1. infrastructure/nfs.yml (NFS server and Kubernetes NFS path)
+#   2. cluster/authentication.yml (Authentik, Traefik, cert-manager)
+#   3. services/gitea.yml
+#   4. services/argocd.yml
+#   5. services/jellyfin.yml (this playbook)
+#   6. cluster/authentication.yml (re-run to apply HTTPRoute and ForwardAuth)
+#
+# Input Variables:
+#   bootstrap_node:              Boolean indicating if the host is the control
+#                                plane bootstrap node. Read from inventory.
+#   dns_zone:                    DNS zone (e.g. homelab.internal). Read from
+#                                group_vars.
+#   jellyfin_namespace:          Kubernetes namespace for Jellyfin
+#                                (default: jellyfin).
+#   jellyfin_chart_version:      Helm chart version for Jellyfin
+#                                (default: 3.0.0).
+#   jellyfin_config_storage_size: Storage size for the Jellyfin configuration
+#                                PVC on Longhorn (default: 3Gi).
+#   jellyfin_media_storage_size: Nominal size annotation for the NFS media PV
+#                                and PVC. NFS does not enforce quotas via PVC
+#                                size (default: 10Gi).
+#   jellyfin_storage_class:      Kubernetes StorageClass for the config PVC
+#                                (default: longhorn).
+#   nfs_k8s_path:                Base NFS path for Kubernetes workloads.
+#                                Read from group_vars.
+#   nfs_group:                   Name of the NFS users group. Read from
+#                                group_vars.
+#   nfs_group_gid:               GID of the nfs_users group. Read from
+#                                group_vars.
+#   nfs_server_ip:               IP address of the NFS server, derived from
+#                                inventory hostvars at runtime.
+#   jellyfin_hostname:           FQDN for the Jellyfin web UI HTTPRoute,
+#                                derived from dns_zone
+#                                (default: jellyfin.<dns_zone>).
+#   jellyfin_gitops_path:        Path within the gitops repository where
+#                                Jellyfin values are stored
+#                                (default: apps/jellyfin).
+#   kubectl_config_path:         Full path to the kubectl config file
+#                                (default: /home/<ansible_user>/.kube/config).
+#   gitea_namespace:             Kubernetes namespace where Gitea is deployed
+#                                (default: gitea).
+#   gitea_admin_username:        Username of the Gitea admin account used to
+#                                push to the gitops repository
+#                                (default: gitea_admin).
+#   gitea_gitops_repo:           Name of the Gitea gitops repository
+#                                (default: gitops).
+#   argocd_namespace:            Kubernetes namespace where ArgoCD is deployed
+#                                (default: argocd).
+
+- name: Deploy Jellyfin Media Server via ArgoCD GitOps
+  hosts: homelab
+  become: true
+  become_exe: sudo.ws
+  vars:
+    jellyfin_namespace: jellyfin
+    jellyfin_chart_version: 3.0.0
+    jellyfin_config_storage_size: 3Gi
+    jellyfin_media_storage_size: 10Gi
+    jellyfin_storage_class: longhorn
+    nfs_server_ip: >-
+      {{ hostvars | dict2items
+         | selectattr('value.nfs_server', 'defined')
+         | selectattr('value.nfs_server', 'equalto', true)
+         | map(attribute='value.private_ip')
+         | first }}
+    jellyfin_hostname: 'jellyfin.{{ dns_zone }}'
+    jellyfin_gitops_path: apps/jellyfin
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    gitea_namespace: gitea
+    gitea_admin_username: gitea_admin
+    gitea_gitops_repo: gitops
+    argocd_namespace: argocd
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Namespace
+    # -------------------------------------------------------------------------
+    # Creates the Jellyfin namespace before any other resources so that ArgoCD
+    # can sync the Helm release into it on first run.
+    # -------------------------------------------------------------------------
+    - name: Create Jellyfin namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create namespace {{ jellyfin_namespace }}
+      register: jellyfin_ns_result
+      changed_when: "'created' in jellyfin_ns_result.stdout"
+      failed_when:
+        - jellyfin_ns_result.rc != 0
+        - "'already exists' not in jellyfin_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # NFS Media Directory
+    # -------------------------------------------------------------------------
+    # Creates the Jellyfin subdirectory within the Kubernetes NFS path. Runs
+    # on the NFS server node to operate directly on the server filesystem,
+    # bypassing NFS root_squash restrictions. infrastructure/nfs.yml must have
+    # been run first to create nfs_k8s_path.
+    # -------------------------------------------------------------------------
+    - name: Create Jellyfin media directory on NFS server
+      ansible.builtin.file:
+        path: '{{ nfs_k8s_path }}/jellyfin'
+        state: directory
+        owner: root
+        group: '{{ nfs_group }}'
+        mode: '2775'
+      when: nfs_server | default(false)
+
+    # -------------------------------------------------------------------------
+    # NFS Media PersistentVolume
+    # -------------------------------------------------------------------------
+    # Applies a static PersistentVolume and PersistentVolumeClaim for the
+    # Jellyfin media volume backed by the NFS share. These are applied before
+    # ArgoCD syncs the Helm release so the PVC exists when the chart references
+    # it via existingClaim. The PV uses Retain reclaim policy so media files are
+    # not deleted if the PVC is removed.
+    # -------------------------------------------------------------------------
+    - name: Write Jellyfin NFS media PV manifest
+      ansible.builtin.template:
+        src: templates/jellyfin-nfs-media-pv.yml.j2
+        dest: /tmp/jellyfin-nfs-media-pv.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Apply Jellyfin NFS media PV and PVC
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/jellyfin-nfs-media-pv.yml
+      register: jellyfin_pv_result
+      changed_when: >-
+        'configured' in jellyfin_pv_result.stdout or
+        'created' in jellyfin_pv_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Remove Jellyfin NFS media PV manifest temporary file
+      ansible.builtin.file:
+        path: /tmp/jellyfin-nfs-media-pv.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # GitOps - Helm Values Management
+    # -------------------------------------------------------------------------
+    # Renders the Jellyfin Helm values from a Jinja2 template and commits them
+    # to the Gitea gitops repository. ArgoCD watches this path and
+    # automatically syncs the Helm release to the cluster.
+    # -------------------------------------------------------------------------
+    - name: Ensure git is installed
+      ansible.builtin.apt:
+        name: git
+        state: present
+      when: bootstrap_node | default(false)
+
+    - name: Get Gitea pod IP
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get pod -n {{ gitea_namespace }}
+          -l app.kubernetes.io/name=gitea,app.kubernetes.io/instance=gitea
+          -o jsonpath='{.items[0].status.podIP}'
+      register: gitea_pod_ip
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Read Gitea admin password from Kubernetes Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret gitea-credentials -n {{ gitea_namespace }}
+          -o jsonpath='{.data.admin-password}'
+      register: gitea_admin_password_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Gitea admin password fact
+      ansible.builtin.set_fact:
+        gitea_admin_password: '{{ gitea_admin_password_b64.stdout | b64decode }}'
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Clone or update gitops repository in temporary directory
+      ansible.builtin.git:
+        repo: >-
+          http://{{ gitea_admin_username }}:{{ gitea_admin_password
+          }}@{{ gitea_pod_ip.stdout }}:3000/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}
+        dest: /tmp/gitops-jellyfin
+        version: main
+        update: true
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Create Jellyfin directory in gitops repository
+      ansible.builtin.file:
+        path: '/tmp/gitops-jellyfin/{{ jellyfin_gitops_path }}'
+        state: directory
+        mode: '0755'
+      when: bootstrap_node | default(false)
+
+    - name: Write Jellyfin Helm values to gitops repository
+      ansible.builtin.template:
+        src: templates/jellyfin-values.yml.j2
+        dest: '/tmp/gitops-jellyfin/{{ jellyfin_gitops_path }}/values.yml'
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Configure git user email for commit  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-jellyfin config user.email 'ansible@{{ dns_zone }}'
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Configure git user name for commit  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-jellyfin config user.name Ansible
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set gitops repository remote URL with credentials for push  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-jellyfin remote set-url origin
+          http://{{ gitea_admin_username }}:{{ gitea_admin_password
+          }}@{{ gitea_pod_ip.stdout }}:3000/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}
+      no_log: true
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Stage Jellyfin values in gitops repository  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-jellyfin add {{ jellyfin_gitops_path }}/values.yml
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Check for staged changes in gitops repository  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-jellyfin diff --cached --exit-code
+      register: gitops_diff_result
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Commit Jellyfin values to gitops repository  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: "git -C /tmp/gitops-jellyfin commit -m 'chore: update jellyfin values'"
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - gitops_diff_result.rc != 0
+
+    - name: Push Jellyfin values commit to Gitea  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-jellyfin push origin main
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - gitops_diff_result.rc != 0
+
+    - name: Remove gitops temporary directory
+      ansible.builtin.file:
+        path: /tmp/gitops-jellyfin
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ArgoCD Application
+    # -------------------------------------------------------------------------
+    # Applies the ArgoCD Application manifest that tracks the Gitea repository
+    # and the upstream Jellyfin Helm chart. This initiates the deployment of
+    # the Jellyfin resources to the cluster.
+    # -------------------------------------------------------------------------
+    - name: Write ArgoCD Application manifest for Jellyfin
+      ansible.builtin.template:
+        src: templates/jellyfin-app.yml.j2
+        dest: /tmp/jellyfin-app.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ArgoCD Application manifest for Jellyfin
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/jellyfin-app.yml
+      register: argocd_app_result
+      changed_when: >-
+        'configured' in argocd_app_result.stdout or
+        'created' in argocd_app_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Remove ArgoCD Application manifest temporary file
+      ansible.builtin.file:
+        path: /tmp/jellyfin-app.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Trigger ArgoCD hard refresh to detect new gitops commit
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch application jellyfin -n {{ argocd_namespace }}
+          --type merge
+          -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Wait for ArgoCD to sync and deploy Jellyfin
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get application jellyfin -n {{ argocd_namespace }}
+          -o jsonpath='{.status.sync.status},{.status.health.status}'
+      register: argocd_status
+      until: argocd_status.stdout == 'Synced,Healthy'
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: bootstrap_node | default(false)

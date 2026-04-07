@@ -1,0 +1,48 @@
+{#
+  ArgoCD Application manifest for the Jellyfin deployment. Uses the multi-source
+  feature to pull the Jellyfin Helm chart from the upstream chart repository while
+  reading the Helm values file from the Gitea gitops repository. Any push to the
+  gitops repository triggers an immediate sync via the Gitea webhook registered
+  by argocd.yml.
+
+  Variables:
+    argocd_namespace:          Kubernetes namespace where ArgoCD is deployed.
+    jellyfin_namespace:        Kubernetes namespace where Jellyfin will be deployed.
+    jellyfin_chart_version:    Helm chart version of Jellyfin to deploy.
+    jellyfin_gitops_path:      Path within the gitops repository to the Jellyfin
+                               values file (e.g. apps/jellyfin).
+    gitea_namespace:           Kubernetes namespace where Gitea is deployed.
+    gitea_admin_username:      Gitea admin username that owns the gitops repository.
+    gitea_gitops_repo:         Name of the Gitea gitops repository.
+#}
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: jellyfin
+  namespace: '{{ argocd_namespace }}'
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  sources:
+    - repoURL: https://jellyfin.github.io/jellyfin-helm
+      chart: jellyfin
+      targetRevision: '{{ jellyfin_chart_version }}'
+      helm:
+        releaseName: jellyfin
+        valueFiles:
+          - '$values/{{ jellyfin_gitops_path }}/values.yml'
+    - repoURL: >-
+        http://gitea-http.{{ gitea_namespace }}.svc.cluster.local:3000/{{ gitea_admin_username
+        }}/{{ gitea_gitops_repo }}
+      targetRevision: HEAD
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: '{{ jellyfin_namespace }}'
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

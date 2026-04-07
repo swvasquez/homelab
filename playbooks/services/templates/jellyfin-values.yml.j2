@@ -1,0 +1,37 @@
+{#
+  Helm values for the Jellyfin deployment. Deployed by ArgoCD using the multi-source
+  feature, with this file stored in the Gitea gitops repository and the Jellyfin Helm
+  chart sourced from the upstream repository.
+
+  The configuration PVC is provisioned by Longhorn. The media PVC is pre-created by
+  jellyfin.yml as a static NFS-backed PersistentVolume and referenced here via
+  existingClaim so the Helm chart does not manage its lifecycle.
+
+  The pod runs with supplementalGroups set to nfs_group_gid so the Jellyfin process
+  has write access to the NFS export directory (owned by root:nfs_users, mode 2775).
+
+  Jellyfin's built-in authentication is not used for initial access. All requests are
+  gated by Traefik ForwardAuth backed by Authentik before reaching the Jellyfin pod.
+  Jellyfin's own user management can still be used for per-user library permissions
+  after the ForwardAuth layer grants access.
+
+  Variables:
+    jellyfin_config_storage_size: Size of the PVC for Jellyfin configuration and metadata.
+    jellyfin_storage_class:       Kubernetes StorageClass for the config PVC.
+    nfs_group_gid:                GID of the nfs_users group on the NFS server.
+#}
+podSecurityContext:
+  supplementalGroups:
+    - {{ nfs_group_gid }}
+
+persistence:
+  config:
+    enabled: true
+    size: '{{ jellyfin_config_storage_size }}'
+    storageClass: '{{ jellyfin_storage_class }}'
+    accessMode: ReadWriteOnce
+  media:
+    existingClaim: jellyfin-media
+
+ingress:
+  enabled: false

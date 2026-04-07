@@ -1,0 +1,53 @@
+{#
+  Static PersistentVolume and PersistentVolumeClaim for Jellyfin media storage
+  backed by the homelab NFS share. Applied directly by jellyfin.yml before ArgoCD
+  syncs the Helm release. The PVC is pre-created so the Helm chart can reference
+  it via existingClaim without managing its lifecycle.
+
+  The storageClassName is set to '' and volumeName is set explicitly to force
+  binding to this specific PV and prevent the default StorageClass from
+  interfering.
+
+  NFS supports ReadWriteMany, allowing multiple pods to mount the volume
+  simultaneously if needed (e.g. Plex and Jellyfin sharing the same library).
+
+  Variables:
+    jellyfin_namespace:           Kubernetes namespace where Jellyfin is deployed.
+    jellyfin_media_storage_size:  Nominal size annotation for the PV and PVC.
+                                  NFS does not enforce quotas via PVC size.
+    nfs_server_ip:                IP address of the NFS server.
+    nfs_k8s_path:                 Base path on the NFS server for Kubernetes
+                                  workloads (e.g. /srv/nfs/data/kubernetes).
+#}
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: jellyfin-media
+  labels:
+    app.kubernetes.io/name: jellyfin
+spec:
+  capacity:
+    storage: '{{ jellyfin_media_storage_size }}'
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ''
+  nfs:
+    server: '{{ nfs_server_ip }}'
+    path: '{{ nfs_k8s_path }}/jellyfin'
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jellyfin-media
+  namespace: '{{ jellyfin_namespace }}'
+  labels:
+    app.kubernetes.io/name: jellyfin
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ''
+  volumeName: jellyfin-media
+  resources:
+    requests:
+      storage: '{{ jellyfin_media_storage_size }}'
