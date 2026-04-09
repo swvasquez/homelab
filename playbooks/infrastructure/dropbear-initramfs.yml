@@ -85,6 +85,7 @@
     - name: Configure static IP for initramfs
       ansible.builtin.lineinfile:
         path: /etc/initramfs-tools/initramfs.conf
+        regexp: '^IP='
         line: >-
           IP={{ private_ip }}::{{ router_private_ip }}:255.255.255.0:{{ ansible_host }}:{{ network_interface }}
         state: present

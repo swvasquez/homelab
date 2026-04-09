@@ -18,6 +18,14 @@
     nfs_server_ip:                IP address of the NFS server.
     nfs_k8s_path:                 Base path on the NFS server for Kubernetes
                                   workloads (e.g. /srv/nfs/data/kubernetes).
+
+  Mount options:
+    soft       Instructs the kernel to return EIO after the timeout rather than
+               retrying indefinitely. Allows Kubernetes to restart the pod and
+               recover automatically once the NFS server is reachable, rather
+               than hanging in uninterruptible D state.
+    timeo=600  Initial RPC timeout in tenths of a second (60 seconds) before
+               returning EIO to the calling process under soft mount semantics.
 #}
 apiVersion: v1
 kind: PersistentVolume
@@ -32,6 +40,9 @@ spec:
     - ReadWriteMany
   persistentVolumeReclaimPolicy: Retain
   storageClassName: ''
+  mountOptions:
+    - soft
+    - timeo=600
   nfs:
     server: '{{ nfs_server_ip }}'
     path: '{{ nfs_k8s_path }}/jellyfin'
