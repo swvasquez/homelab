@@ -45,7 +45,7 @@
 #   syncthing_image:            Docker image for the Syncthing server
 #                               (default: syncthing/syncthing).
 #   syncthing_image_tag:        Docker image tag for the Syncthing server
-#                               (default: latest).
+#                               (default: 2.0.16).
 #   syncthing_storage_size:     Storage size for the Syncthing StatefulSet PVC
 #                               (default: 10Gi).
 #   syncthing_storage_class:    Kubernetes StorageClass used to provision the
@@ -85,7 +85,7 @@
   vars:
     syncthing_namespace: syncthing
     syncthing_image: syncthing/syncthing
-    syncthing_image_tag: latest
+    syncthing_image_tag: '2.0.16'
     syncthing_storage_size: 10Gi
     syncthing_storage_class: longhorn
     syncthing_gitops_path: apps/syncthing
