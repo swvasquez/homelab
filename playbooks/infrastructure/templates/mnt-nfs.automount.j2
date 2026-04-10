@@ -1,0 +1,19 @@
+{#
+  systemd automount unit for the NFS self-mount on the NFS server node.
+
+  Explicit unit with DefaultDependencies=no and WantedBy=remote-fs.target to
+  prevent the fstab-generator from placing it in local-fs.target, which causes
+  a dependency cycle with nfs-kernel-server via nfs-mountd at boot.
+  (systemd upstream bugs #17657 and #34164 — unfixed as of 2026.)
+#}
+[Unit]
+Description={{ nfs_mount_point }} automount
+DefaultDependencies=no
+After=network-online.target
+
+[Automount]
+Where={{ nfs_mount_point }}
+TimeoutIdleSec=0
+
+[Install]
+WantedBy=remote-fs.target

@@ -1,0 +1,32 @@
+{#
+  systemd mount unit for the NFS self-mount on the NFS server node.
+
+  On the server node, fstab-based NFS mounts with x-systemd.automount create a
+  dependency cycle: nfs-server depends on nfs-mountd, which depends on
+  local-fs.target, which pulls in the automount unit (placed there by the
+  fstab-generator), which needs nfs-server to succeed. systemd breaks the cycle
+  by dropping nfs-mountd, preventing the server from starting.
+  (systemd upstream bugs #17657 and #34164 — unfixed as of 2026.)
+
+  An explicit unit file with DefaultDependencies=no and WantedBy=remote-fs.target
+  bypasses the fstab-generator logic that incorrectly places automount units in
+  local-fs.target regardless of the _netdev flag, breaking the cycle entirely.
+  After=nfs-kernel-server.service is safe to include here because the automount
+  unit is no longer in local-fs.target, so the cycle path no longer exists.
+#}
+[Unit]
+Description={{ nfs_mount_point }}
+DefaultDependencies=no
+After=network-online.target
+After=nfs-kernel-server.service
+Wants=nfs-kernel-server.service
+
+[Mount]
+What={{ _nfs_server_host }}:{{ nfs_export_path }}
+Where={{ nfs_mount_point }}
+Type=nfs
+Options=soft,timeo=600,nfsvers=4
+TimeoutSec=15
+
+[Install]
+WantedBy=remote-fs.target

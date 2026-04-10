@@ -136,6 +136,11 @@
     #   - sysctl params: Enables dual-stack (IPv4/IPv6) IP forwarding (allowing
     #                    nodes to route pod traffic) and ensures bridged network
     #                    traffic is processed by iptables/ip6tables for filtering.
+    #                    Also increases fs.inotify.max_user_instances from the
+    #                    default of 128 to 512. The default is easily exhausted
+    #                    when many pods run on a single node, as each container
+    #                    runtime and .NET application (e.g. Jellyfin) consumes
+    #                    inotify instances for config file watching.
     #   - swap:          Disabled at runtime and permanently in /etc/fstab, as
     #                    kubelet requires swap to be off for accurate memory
     #                    limit enforcement.
@@ -187,6 +192,7 @@
         - {key: 'net.bridge.bridge-nf-call-ip6tables', value: '1'}
         - {key: 'net.ipv4.ip_forward', value: '1'}
         - {key: 'net.ipv6.conf.all.forwarding', value: '1'}
+        - {key: 'fs.inotify.max_user_instances', value: '512'}
 
     - name: Disable swap at runtime
       ansible.builtin.command:
