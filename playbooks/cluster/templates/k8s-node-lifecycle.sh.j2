@@ -1,0 +1,84 @@
+#!/bin/bash
+# ==============================================================================
+# k8s-node-lifecycle.sh
+# ==============================================================================
+# Manages Kubernetes node lifecycle during system shutdown and startup.
+# Called by k8s-graceful-shutdown.service via ExecStop (shutdown) and
+# ExecStart (startup).
+#
+# On shutdown: cordons and drains the node so Longhorn volumes detach cleanly
+# and pods are rescheduled before the node goes down. Always exits 0 so the
+# shutdown is never blocked by a failed or timed-out drain.
+#
+# On startup: retries uncordoning the node every 5 seconds until the API server
+# is reachable or the timeout is reached, so pod scheduling resumes after boot.
+# ==============================================================================
+
+set -o pipefail
+
+KUBECONFIG="{{ kubectl_config_path }}"
+NODE="$(hostname)"
+LOG_TAG="k8s-node-lifecycle"
+ACTION="${1:-stop}"
+
+log() {
+    echo "$1" | systemd-cat -t "$LOG_TAG" -p info
+}
+
+log_err() {
+    echo "$1" | systemd-cat -t "$LOG_TAG" -p err
+}
+
+# ------------------------------------------------------------------------------
+# Startup: uncordon (with retry)
+# Retries every 5 seconds for up to {{ k8s_uncordon_timeout }}s to handle the case
+# where the API server is not yet ready when this service starts on boot.
+# ------------------------------------------------------------------------------
+if [[ "$ACTION" == "start" ]]; then
+    log "Startup detected — attempting to uncordon node $NODE"
+
+    DEADLINE=$(( $(date +%s) + {{ k8s_uncordon_timeout }} ))
+    while true; do
+        if kubectl --kubeconfig="$KUBECONFIG" uncordon "$NODE" &>/dev/null; then
+            log "Node $NODE uncordoned successfully"
+            exit 0
+        fi
+
+        log "API server not ready or uncordon failed — retrying in 5s"
+
+        if (( $(date +%s) >= DEADLINE )); then
+            log_err "Timed out waiting to uncordon $NODE — node may still be cordoned"
+            exit 0
+        fi
+
+        sleep 5
+    done
+fi
+
+# ------------------------------------------------------------------------------
+# Shutdown: drain
+# ------------------------------------------------------------------------------
+log "Shutdown detected — attempting graceful drain of node $NODE"
+
+if ! kubectl --kubeconfig="$KUBECONFIG" get node "$NODE" &>/dev/null; then
+    log_err "API server unreachable or node $NODE not found — skipping drain"
+    exit 0
+fi
+
+log "Cordoning node $NODE"
+if ! kubectl --kubeconfig="$KUBECONFIG" cordon "$NODE"; then
+    log_err "Failed to cordon $NODE — skipping drain"
+    exit 0
+fi
+
+log "Draining node $NODE (timeout: {{ k8s_drain_timeout }}s)"
+if ! kubectl --kubeconfig="$KUBECONFIG" drain "$NODE" \
+    --ignore-daemonsets \
+    --delete-emptydir-data \
+    --timeout="{{ k8s_drain_timeout }}s"; then
+    log_err "Drain of $NODE failed or timed out — proceeding with shutdown anyway"
+    exit 0
+fi
+
+log "Node $NODE drained successfully"
+exit 0

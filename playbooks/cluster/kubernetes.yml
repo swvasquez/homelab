@@ -17,6 +17,8 @@
 #   - Starts and enables the kubelet service.
 #   - Installs Helm via the official APT repository.
 #   - Installs k9s, a terminal UI for managing Kubernetes clusters.
+#   - Installs a systemd shutdown hook that cordons and drains the node before
+#     any shutdown or reboot, allowing Longhorn volumes to detach cleanly.
 #
 # Variables:
 #   kube_version:        Kubernetes version to install (default: v1.28).
@@ -31,6 +33,16 @@
 #                        (default: /etc/apt/keyrings/helm.gpg).
 #   helm_packages:       List of Helm packages to install (default: [helm]).
 #   k9s_version:         Version of k9s to install (default: 0.50.18).
+#   kubectl_config_path: Full path to the kubectl config file used by the drain
+#                        script (default: /home/<ansible_user>/.kube/config).
+#   k8s_drain_script_path: Path where the node lifecycle script is installed on each node
+#                        (default: /usr/local/bin/k8s-node-lifecycle.sh).
+#   k8s_drain_timeout:   Seconds to wait for drain to complete before giving up
+#                        and proceeding with shutdown anyway (default: 300).
+#                        The systemd TimeoutStopSec is set to this value + 30s.
+#   k8s_uncordon_timeout: Seconds to retry uncordoning the node on startup before
+#                        giving up (default: 900). Runs in the background and does
+#                        not block boot.
 
 - name: Install and configure Kubernetes
   hosts: homelab
@@ -49,6 +61,10 @@
     helm_packages:
       - helm
     k9s_version: 0.50.18
+    kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
+    k8s_drain_script_path: /usr/local/bin/k8s-node-lifecycle.sh
+    k8s_drain_timeout: 300
+    k8s_uncordon_timeout: 900
 
   tasks:
     # -------------------------------------------------------------------------
@@ -359,3 +375,46 @@
       ansible.builtin.file:
         path: /tmp/k9s.deb
         state: absent
+
+    # -------------------------------------------------------------------------
+    # Graceful Shutdown Hook
+    # Installs a systemd service that manages the node lifecycle around shutdowns
+    # and startups. On shutdown (ExecStop), the node is cordoned and drained before
+    # the system goes down, allowing Longhorn volumes to detach cleanly. On startup
+    # (ExecStart), the node is uncordoned so pod scheduling resumes.
+    #
+    # If the API server is unreachable or the drain times out, the script logs
+    # the failure and exits 0 so the shutdown is never blocked. TimeoutStopSec
+    # is set to k8s_drain_timeout + 30 seconds to give the drain time to
+    # complete before systemd kills the service.
+    #
+    # To bypass the hook for an immediate shutdown (e.g. in an emergency):
+    #   systemctl mask k8s-graceful-shutdown.service && shutdown -h now
+    # After the node comes back up, restore the hook with:
+    #   systemctl unmask k8s-graceful-shutdown.service
+    # -------------------------------------------------------------------------
+    - name: Install Kubernetes node lifecycle script
+      ansible.builtin.template:
+        src: k8s-node-lifecycle.sh.j2
+        dest: '{{ k8s_drain_script_path }}'
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Install Kubernetes graceful shutdown service
+      ansible.builtin.template:
+        src: k8s-graceful-shutdown.service.j2
+        dest: /etc/systemd/system/k8s-graceful-shutdown.service
+        mode: '0644'
+        owner: root
+        group: root
+
+    - name: Reload systemd daemon to register graceful shutdown service
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable Kubernetes graceful shutdown service
+      ansible.builtin.systemd:
+        name: k8s-graceful-shutdown.service
+        enabled: true
+
