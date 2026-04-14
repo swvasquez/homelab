@@ -158,7 +158,7 @@
     nfs_lvm_vg_name: ubuntu-vg
     nfs_lvm_lv_name: nfs_lv
     nfs_create_lvm: false
-    nfs_lvm_lv_size: 50g
+    nfs_lvm_lv_size: 100g
   tasks:
     - name: Install nfs-kernel-server
       ansible.builtin.apt:
@@ -205,6 +205,7 @@
         vg: '{{ nfs_lvm_vg_name }}'
         lv: '{{ nfs_lvm_lv_name }}'
         size: '{{ nfs_lvm_lv_size }}'
+        resizefs: true
         state: present
       when:
         - nfs_server | default(false)
