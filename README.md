@@ -86,6 +86,10 @@ Ansible Playbooks to configure Ubuntu x86_64 machines and manage a Kubernetes ho
         port: <PORT>
         protocol: tcp
         node_only: true
+      hubble_peer:
+        port: <PORT>
+        protocol: tcp
+        node_only: true
       traefik_http:
         port: <PORT>
         protocol: tcp
@@ -188,7 +192,7 @@ just lint playbooks/cluster/bootstrap.yml
 
 ## Notes
 
-- **Fixed-port services**: The following `ufw_allowed_ports` entries have standard ports that are not consumed by any playbook configuration — the port values defined here are used only by the UFW firewall rules and must match what the service actually listens on: `ssh`, `kubelet`, `etcd_client`, `etcd_peer`, `cilium_vxlan`, `cilium_health`, and `nfs`.
+- **Fixed-port services**: The following `ufw_allowed_ports` entries have standard ports that are not consumed by any playbook configuration — the port values defined here are used only by the UFW firewall rules and must match what the service actually listens on: `ssh`, `kubelet`, `etcd_client`, `etcd_peer`, `cilium_vxlan`, `cilium_health`, `hubble_peer`, and `nfs`.
 - **SSH port**: `ufw_allowed_ports.ssh.port` in `group_vars/homelab.yml` must match `ansible_port` in `inventory.yml`.
 - **`become_exe` configuration**: `become_exe` must be set to `sudo.ws` to resolve an issue
   with Ansible. See [Ansible Issue #85837](https://github.com/ansible/ansible/issues/85837)
