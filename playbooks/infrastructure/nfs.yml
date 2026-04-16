@@ -32,13 +32,15 @@
 #     - Creates the mount point directory.
 #     - Mounts the NFS share and adds it to /etc/fstab for persistence.
 #     - The server address is resolved dynamically from hostvars.
-#     - On client nodes: mounts the NFS share via fstab with x-systemd.automount and
-#       writes a drop-in ordering the automount after network-online.target.
-#     - On the server node: deploys explicit .mount and .automount unit files instead
-#       of fstab. fstab-generator incorrectly places automount units in local-fs.target
-#       even when _netdev is set (systemd bugs #17657, #34164), creating a boot-time
-#       dependency cycle that prevents nfs-server from starting. Explicit unit files
-#       with DefaultDependencies=no and WantedBy=remote-fs.target bypass this entirely.
+#     - On all nodes: deploys explicit .mount and .automount unit files instead of
+#       fstab. fstab-generator incorrectly places automount units in local-fs.target
+#       even when _netdev is set (systemd bugs #17657, #34164). On the server node
+#       this creates a cycle that prevents nfs-server from starting. On client nodes
+#       a drop-in adding After=network-online.target conflicts with the implicit
+#       Before=local-fs.target from DefaultDependencies=yes, causing systemd to drop
+#       iscsid.socket and preventing Longhorn volumes from attaching. Explicit unit
+#       files with DefaultDependencies=no and WantedBy=remote-fs.target bypass both
+#       cycles entirely.
 #     - Writes a systemd drop-in on all nodes to order kubelet.service after the NFS
 #       mount unit. kubelet restores previously active NFS PersistentVolumes at startup
 #       by mounting them directly; if the server is unreachable, kubelet hangs in
@@ -50,9 +52,6 @@
 #       session. With automount, no session exists at boot so nfs-blkmap hangs
 #       indefinitely. pNFS block layouts are not used in this environment, so it is
 #       masked consistently across all nodes.
-#     - Writes a systemd drop-in on all nodes to ensure the automount unit starts
-#       after network-online.target, preventing premature mount attempts before
-#       the network is reachable.
 #     - Writes a systemd drop-in on the server node to order rpc-statd-notify
 #       after nfs-kernel-server.service, preventing it from notifying peers
 #       before exports are ready.
@@ -69,55 +68,6 @@
 #   nfs_export_path:  Directory to export from the server (e.g. /srv/nfs/data).
 #   nfs_export_opts:  Export options (default: "*(rw,sync,no_subtree_check)").
 #   nfs_mount_point:  Local directory to mount the NFS share on clients (e.g. /mnt/nfs).
-#   nfs_mount_opts:   Mount options for clients. Defaults to a resilient set of options that
-#                     prevent the client node from hanging at boot when the NFS server is unreachable
-#                     and allow automatic reconnection once the server comes back up:
-#
-#                       _netdev
-#                         Marks this as a network-dependent mount. systemd will defer the mount
-#                         until after the network is online, preventing early-boot failures.
-#
-#                       nofail
-#                         Allows boot to complete even if the mount cannot be established. Without
-#                         this, a missing NFS server causes the boot sequence to stall indefinitely
-#                         waiting for the mount to succeed.
-#
-#                       soft
-#                         Instructs the kernel to return EIO to the calling process after the
-#                         timeout expires, rather than retrying indefinitely. Prevents processes
-#                         from hanging in uninterruptible D state if the NFS server is unreachable,
-#                         allowing the node to boot in any order and recover automatically once
-#                         the server comes up. Only unacknowledged in-flight writes at the moment
-#                         of server failure are at risk — typically kilobytes representing a
-#                         fraction of a second of writes.
-#
-#                       timeo=600
-#                         Initial RPC timeout in tenths of a second (60 seconds) before returning
-#                         EIO to the calling process under soft mount semantics.
-#
-#                       nfsvers=4
-#                         Pins the mount to NFSv4, skipping version negotiation. The server
-#                         is already configured to serve NFSv4 and all clients are Linux, so
-#                         negotiation adds overhead without benefit.
-#
-#                       x-systemd.automount
-#                         Creates a systemd automount unit instead of a plain mount unit. The share
-#                         is not mounted at boot; instead it is mounted on first access. If the
-#                         server was down at boot, the next access after the server recovers will
-#                         trigger a fresh mount attempt automatically.
-#
-#                       x-systemd.mount-timeout=15
-#                         Limits how long systemd waits for the mount process to complete before
-#                         giving up and marking the unit as failed. Without this, systemd uses a
-#                         90-second default. This applies both to the boot-time mount (which kubelet
-#                         depends on) and to automount-triggered attempts at runtime.
-#
-#                         Note: Ubuntu 25.10 introduced a bug (LP: #2130843) where MOTD scripts
-#                         (91-release-upgrade, 98-fsck-at-reboot) trigger automounts during SSH
-#                         login via the rust-coreutils stat implementation. This timeout ensures
-#                         any such accidental trigger fails fast rather than blocking login for
-#                         the full 90-second default.
-#
 #   nfs_lvm_vg_name:  The name of the LVM Volume Group to use (required).
 #   nfs_lvm_lv_name:  The name of the LVM Logical Volume to mount for the export (required).
 #   nfs_create_lvm:   Boolean, whether to create and format a new LV (default: false).
@@ -304,7 +254,6 @@
   vars:
     nfs_export_path: /srv/nfs/data
     nfs_mount_point: /mnt/nfs
-    nfs_mount_opts: '_netdev,nofail,soft,timeo=600,nfsvers=4,x-systemd.automount,x-systemd.mount-timeout=15'
     _nfs_server_host: >-
       {{ hostvars | dict2items
          | selectattr('value.nfs_server', 'defined')
@@ -326,101 +275,48 @@
         # EPERM, and mount point permissions are superseded by the server anyway.
 
     # -------------------------------------------------------------------------
-    # Boot Ordering — Server Node
-    # The server node mounts its own NFS export at {{ nfs_mount_point }}, which
-    # creates a dependency cycle when using fstab + x-systemd.automount:
-    #
-    #   nfs-server → nfs-mountd → local-fs.target → mnt-nfs.automount → nfs-server
-    #
-    # The root cause is a known systemd bug (#17657, #34164): fstab-generator
-    # places automount units in local-fs.target even when _netdev is set, which
-    # should move them to remote-fs.target. The bug is unfixed upstream.
-    #
-    # The fix is to bypass fstab-generator entirely on the server node by
-    # deploying explicit .mount and .automount unit files with
-    # DefaultDependencies=no and WantedBy=remote-fs.target. This prevents the
-    # automount from being pulled into local-fs.target, breaking the cycle.
-    # With the cycle gone, After=nfs-kernel-server.service can be added to the
-    # mount unit so the server is guaranteed to be running before the mount fires.
+    # Boot Ordering — All Nodes
+    # Fstab-based mounts with x-systemd.automount create ordering cycles on both
+    # server and client nodes. See playbook header for a full explanation.
+    # Explicit unit files with DefaultDependencies=no bypass both cycles.
     #
     # Any existing fstab entry and automount drop-in from previous runs are
     # removed to prevent conflicts with the explicit unit files.
     # -------------------------------------------------------------------------
-    - name: Unmount NFS share on server node
+    - name: Unmount NFS share
       ansible.posix.mount:
         path: '{{ nfs_mount_point }}'
         state: unmounted
-      when: nfs_server | default(false)
 
-    - name: Remove NFS fstab entry on server node
+    - name: Remove NFS fstab entry
       ansible.posix.mount:
         path: '{{ nfs_mount_point }}'
         state: absent_from_fstab
-      when: nfs_server | default(false)
       notify: Reload systemd daemon
 
-    - name: Remove NFS automount drop-in directory on server node
+    - name: Remove NFS automount drop-in directory
       ansible.builtin.file:
         path: '/etc/systemd/system/{{ nfs_mount_point | regex_replace("^/", "") | replace("/", "-") }}.automount.d'
         state: absent
-      when: nfs_server | default(false)
       notify: Reload systemd daemon
 
-    - name: Deploy explicit NFS mount unit on server node
+    - name: Deploy explicit NFS mount unit
       ansible.builtin.template:
         src: mnt-nfs.mount.j2
         dest: '/etc/systemd/system/{{ nfs_mount_point | regex_replace("^/", "") | replace("/", "-") }}.mount'
         mode: '0644'
         owner: root
         group: root
-      when: nfs_server | default(false)
       notify: Reload systemd daemon
 
-    - name: Deploy explicit NFS automount unit on server node
+    - name: Deploy explicit NFS automount unit
       ansible.builtin.template:
         src: mnt-nfs.automount.j2
         dest: '/etc/systemd/system/{{ nfs_mount_point | regex_replace("^/", "") | replace("/", "-") }}.automount'
         mode: '0644'
         owner: root
         group: root
-      when: nfs_server | default(false)
-      notify: Enable and start NFS automount on server node
-
-    # -------------------------------------------------------------------------
-    # Boot Ordering — Client Nodes
-    # Client nodes use fstab + x-systemd.automount as normal. The dependency
-    # cycle only exists on the server node (because only the server runs
-    # nfs-mountd), so the fstab approach is safe on pure client nodes.
-    #
-    # A drop-in orders the automount after network-online.target to prevent
-    # premature mount attempts before the network is reachable.
-    # -------------------------------------------------------------------------
-    - name: Mount NFS share and add to fstab
-      ansible.posix.mount:
-        path: '{{ nfs_mount_point }}'
-        src: '{{ _nfs_server_host }}:{{ nfs_export_path }}'
-        fstype: nfs
-        opts: '{{ nfs_mount_opts }}'
-        state: present
-      when: not (nfs_server | default(false))
-      notify: Reload systemd daemon
-
-    - name: Create systemd drop-in directory for NFS automount ordering
-      ansible.builtin.file:
-        path: '/etc/systemd/system/{{ nfs_mount_point | regex_replace("^/", "") | replace("/", "-") }}.automount.d'
-        state: directory
-        mode: '0755'
-      when: not (nfs_server | default(false))
-
-    - name: Write systemd drop-in to order automount after network
-      ansible.builtin.copy:
-        dest: '/etc/systemd/system/{{ nfs_mount_point | regex_replace("^/", "") | replace("/", "-") }}.automount.d/ordering.conf'
-        mode: '0644'
-        content: |
-          [Unit]
-          After=network-online.target
-      when: not (nfs_server | default(false))
-      notify: Reload systemd daemon
+      notify: Enable and start NFS automount
 
     - name: Create systemd drop-in directory for rpc-statd-notify ordering
       ansible.builtin.file:
@@ -486,7 +382,7 @@
       ansible.builtin.systemd:
         daemon_reload: true
 
-    - name: Enable and start NFS automount on server node
+    - name: Enable and start NFS automount
       ansible.builtin.systemd:
         name: '{{ nfs_mount_point | regex_replace("^/", "") | replace("/", "-") }}.automount'
         enabled: true

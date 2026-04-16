@@ -1,9 +1,10 @@
 {#
-  systemd automount unit for the NFS self-mount on the NFS server node.
+  systemd automount unit for the NFS mount. Used on both the server node
+  (self-mount) and client nodes.
 
   Explicit unit with DefaultDependencies=no and WantedBy=remote-fs.target to
   prevent the fstab-generator from placing it in local-fs.target, which causes
-  a dependency cycle with nfs-kernel-server via nfs-mountd at boot.
+  ordering cycles at boot. See mnt-nfs.mount.j2 for full details.
   (systemd upstream bugs #17657 and #34164 — unfixed as of 2026.)
 #}
 [Unit]
