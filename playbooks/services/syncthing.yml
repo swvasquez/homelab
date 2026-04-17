@@ -5,10 +5,12 @@
 # This playbook configures and deploys Syncthing to the Kubernetes cluster
 # via ArgoCD GitOps using native Kubernetes manifests (StatefulSet, Service).
 #
-# A PersistentVolumeClaim (PVC) is used via a StatefulSet volumeClaimTemplate
-# to provide stable, persistent storage for Syncthing's configuration and data,
-# preventing identity loss or ReadWriteOnce (RWO) locking issues during pod
-# restarts or updates.
+# Storage is split across two volumes. Syncthing's configuration and index DB
+# are stored on a Longhorn PVC provisioned via the StatefulSet volumeClaimTemplate,
+# providing stable identity and preventing ReadWriteOnce (RWO) locking issues
+# during pod restarts. Synced folder data is stored on a pre-created NFS
+# PersistentVolume mounted at /var/syncthing/data, shared with the rest of the
+# homelab NFS export.
 #
 # Note on Configuration: Syncthing dynamically rewrites its config.xml file
 # when changes are made in the UI. Because of this, we cannot mount a read-only
@@ -29,11 +31,12 @@
 # LoadBalancer IP is configured in your local resolver (e.g., /etc/resolver).
 #
 # Run order:
-#   1. cluster/authentication.yml
-#   2. services/gitea.yml
-#   3. services/argocd.yml
-#   4. services/syncthing.yml (this playbook)
-#   5. cluster/authentication.yml (to apply HTTPRoutes and ForwardAuth)
+#   1. infrastructure/nfs.yml (NFS server and Kubernetes NFS path)
+#   2. cluster/authentication.yml
+#   3. services/gitea.yml
+#   4. services/argocd.yml
+#   5. services/syncthing.yml (this playbook)
+#   6. cluster/authentication.yml (to apply HTTPRoutes and ForwardAuth)
 #
 # Input Variables:
 #   bootstrap_node:             Boolean indicating if the host is the control
@@ -46,10 +49,22 @@
 #                               (default: syncthing/syncthing).
 #   syncthing_image_tag:        Docker image tag for the Syncthing server
 #                               (default: 2.0.16).
-#   syncthing_storage_size:     Storage size for the Syncthing StatefulSet PVC
-#                               (default: 10Gi).
+#   syncthing_storage_size:     Storage size for the Syncthing config StatefulSet PVC
+#                               on Longhorn (default: 1Gi).
 #   syncthing_storage_class:    Kubernetes StorageClass used to provision the
-#                               PVC (default: longhorn).
+#                               config PVC (default: longhorn).
+#   syncthing_nfs_data_path:    Absolute path on the NFS server for Syncthing's
+#                               synced data, derived from nfs_k8s_path
+#                               (default: <nfs_k8s_path>/syncthing).
+#   syncthing_nfs_data_size:    Nominal size annotation for the NFS PV and PVC.
+#                               NFS does not enforce quotas via PVC size
+#                               (default: 10Gi).
+#   nfs_k8s_path:               Base NFS path for Kubernetes workloads.
+#                               Read from group_vars.
+#   nfs_group:                  Name of the NFS users group. Read from group_vars.
+#   nfs_group_gid:              GID of the NFS users group. Read from group_vars.
+#   nfs_server_ip:              IP address of the NFS server, derived from
+#                               inventory hostvars at runtime.
 #   syncthing_gitops_path:      Path within the gitops repository where the
 #                               Syncthing manifests are stored
 #                               (default: apps/syncthing).
@@ -58,9 +73,9 @@
 #                               if using an external proxy like Authentik.
 #                               (default: true).
 #   syncthing_default_folder_path: The default absolute path where Syncthing will
-#                               suggest saving new synced folders. This should
-#                               be a directory within the persistent volume
-#                               (default: /var/syncthing/Sync).
+#                               suggest saving new synced folders. Points to the
+#                               NFS data volume mount inside the container
+#                               (default: /var/syncthing/data/sync).
 #   syncthing_sync_hostname:    FQDN for the Syncthing sync LoadBalancer service,
 #                               used by ExternalDNS (default: syncthing-sync.<dns_zone>).
 #   syncthing_gui_port:         Port for the Syncthing Web GUI (default: 8384).
@@ -86,11 +101,19 @@
     syncthing_namespace: syncthing
     syncthing_image: syncthing/syncthing
     syncthing_image_tag: '2.0.16'
-    syncthing_storage_size: 10Gi
+    syncthing_storage_size: 1Gi
     syncthing_storage_class: longhorn
+    syncthing_nfs_data_path: '{{ nfs_k8s_path }}/syncthing'
+    syncthing_nfs_data_size: 10Gi
+    nfs_server_ip: >-
+      {{ hostvars | dict2items
+         | selectattr('value.nfs_server', 'defined')
+         | selectattr('value.nfs_server', 'equalto', true)
+         | map(attribute='value.private_ip')
+         | first }}
     syncthing_gitops_path: apps/syncthing
     syncthing_allow_insecure_admin_access: true
-    syncthing_default_folder_path: /var/syncthing/Sync
+    syncthing_default_folder_path: /var/syncthing/data/sync
     syncthing_sync_hostname: 'syncthing-sync.{{ dns_zone }}'
     syncthing_gui_port: 8384
     syncthing_sync_port: '{{ ufw_allowed_ports.syncthing_sync_tcp.port }}'
@@ -119,6 +142,56 @@
       failed_when:
         - syncthing_ns_result.rc != 0
         - "'already exists' not in syncthing_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # NFS Data Directory
+    # -------------------------------------------------------------------------
+    # Creates the Syncthing synced data directory on the NFS server node.
+    # Runs on the NFS server to operate directly on the server filesystem,
+    # bypassing NFS root_squash restrictions. infrastructure/nfs.yml must have
+    # been run first to create nfs_k8s_path.
+    # -------------------------------------------------------------------------
+    - name: Create Syncthing synced data directory on NFS server
+      ansible.builtin.file:
+        path: '{{ syncthing_nfs_data_path }}'
+        state: directory
+        owner: root
+        group: '{{ nfs_group }}'
+        mode: '2775'
+      when: nfs_server | default(false)
+
+    # -------------------------------------------------------------------------
+    # NFS Data PersistentVolume
+    # -------------------------------------------------------------------------
+    # Applies a static PersistentVolume and PersistentVolumeClaim for Syncthing's
+    # synced data backed by the NFS share. These are applied before ArgoCD syncs
+    # the manifests so the PVC exists when the StatefulSet references it as a
+    # regular volume. The PV uses Retain reclaim policy so synced data is not
+    # deleted if the PVC is removed.
+    # -------------------------------------------------------------------------
+    - name: Write Syncthing NFS data PV manifest
+      ansible.builtin.template:
+        src: templates/syncthing-nfs-data-pv.yml.j2
+        dest: /tmp/syncthing-nfs-data-pv.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Apply Syncthing NFS data PV and PVC
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/syncthing-nfs-data-pv.yml
+      register: syncthing_pv_result
+      changed_when: >-
+        'configured' in syncthing_pv_result.stdout or
+        'created' in syncthing_pv_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Remove Syncthing NFS data PV manifest temporary file
+      ansible.builtin.file:
+        path: /tmp/syncthing-nfs-data-pv.yml
+        state: absent
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------

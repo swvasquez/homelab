@@ -3,16 +3,27 @@
   Contains the Services to expose the GUI and sync ports, and the StatefulSet
   that manages the Syncthing pod and its persistent storage.
 
+  Storage is split across two volumes:
+    - syncthing-data (Longhorn, RWO): Syncthing config and index DB, mounted at
+      /var/syncthing. Managed by the StatefulSet volumeClaimTemplate.
+    - syncthing-nfs-data (NFS, RWX): Synced folder data, mounted at
+      /var/syncthing/data. Pre-created by syncthing.yml before ArgoCD sync.
+
   Variables:
-    syncthing_namespace:      Kubernetes namespace where Syncthing is deployed.
-    syncthing_image:          Docker image for Syncthing.
-    syncthing_image_tag:      Docker image tag for Syncthing.
-    syncthing_storage_class:  StorageClass to use for the PersistentVolumeClaim.
-    syncthing_storage_size:   Size of the PersistentVolumeClaim.
-    syncthing_gui_port:       Port for the Web GUI.
-    syncthing_sync_port:      Port for the sync protocol.
-    syncthing_discovery_port: Port for local discovery.
-    syncthing_sync_hostname:  DNS hostname for the sync service.
+    syncthing_namespace:        Kubernetes namespace where Syncthing is deployed.
+    syncthing_image:            Docker image for Syncthing.
+    syncthing_image_tag:        Docker image tag for Syncthing.
+    syncthing_storage_class:    StorageClass to use for the config PersistentVolumeClaim.
+    syncthing_storage_size:     Size of the config PersistentVolumeClaim.
+    syncthing_gui_port:         Port for the Web GUI.
+    syncthing_sync_port:        Port for the sync protocol.
+    syncthing_discovery_port:   Port for local discovery.
+    syncthing_sync_hostname:    DNS hostname for the sync service.
+    syncthing_default_folder_path: Default path suggested when adding a new folder
+                                in the Syncthing UI.
+    nfs_group_gid:              GID of the NFS users group. Set as PGID so the
+                                Syncthing process runs with this group and can
+                                write to the NFS export.
 #}
 ---
 apiVersion: v1
@@ -78,7 +89,7 @@ spec:
         app.kubernetes.io/name: syncthing
     spec:
       securityContext:
-        fsGroup: 1000
+        fsGroup: {{ nfs_group_gid }}
       initContainers:
         - name: configure-syncthing
           image: '{{ syncthing_image }}:{{ syncthing_image_tag }}'
@@ -106,15 +117,25 @@ spec:
                   sed -i "/<options>/a \        <defaultFolderPath>${DEFAULT_PATH}</defaultFolderPath>" "$CONFIG_FILE"
               fi
 
-              # Ensure the default sync directory exists
+              # Ensure the default sync directory exists and is group-writable
+              # (NFS root_squash maps uid 0 to nobody; Syncthing runs as uid 1000
+              # which relies on group write access via supplementalGroups)
               mkdir -p "$DEFAULT_PATH"
+              chmod 2775 "$DEFAULT_PATH"
           volumeMounts:
             - name: syncthing-data
               mountPath: /var/syncthing
+            - name: syncthing-nfs-data
+              mountPath: /var/syncthing/data
       containers:
         - name: syncthing
           image: '{{ syncthing_image }}:{{ syncthing_image_tag }}'
           imagePullPolicy: IfNotPresent
+          env:
+            - name: PUID
+              value: '1000'
+            - name: PGID
+              value: '{{ nfs_group_gid }}'
           ports:
             - name: http
               containerPort: {{ syncthing_gui_port }}
@@ -131,6 +152,8 @@ spec:
           volumeMounts:
             - name: syncthing-data
               mountPath: /var/syncthing
+            - name: syncthing-nfs-data
+              mountPath: /var/syncthing/data
           readinessProbe:
             tcpSocket:
               port: {{ syncthing_gui_port }}
@@ -141,6 +164,10 @@ spec:
               port: {{ syncthing_gui_port }}
             initialDelaySeconds: 15
             periodSeconds: 20
+      volumes:
+        - name: syncthing-nfs-data
+          persistentVolumeClaim:
+            claimName: syncthing-nfs-data
   volumeClaimTemplates:
     - metadata:
         name: syncthing-data

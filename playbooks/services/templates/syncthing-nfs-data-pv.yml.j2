@@ -1,0 +1,64 @@
+{#
+  Static PersistentVolume and PersistentVolumeClaim for Syncthing synced data,
+  backed by the homelab NFS share. Applied directly by syncthing.yml before ArgoCD
+  syncs the manifests. The PVC is pre-created so the StatefulSet can reference it
+  as a regular volume without managing its lifecycle.
+
+  The storageClassName is set to '' and volumeName is set explicitly to force
+  binding to this specific PV and prevent the default StorageClass from
+  interfering.
+
+  NFS supports ReadWriteMany, allowing multiple pods to mount the volume
+  simultaneously if needed.
+
+  Variables:
+    syncthing_namespace:      Kubernetes namespace where Syncthing is deployed.
+    syncthing_nfs_data_size:  Nominal size annotation for the PV and PVC.
+                              NFS does not enforce quotas via PVC size.
+    nfs_server_ip:            IP address of the NFS server.
+    syncthing_nfs_data_path:  Absolute path on the NFS server for Syncthing's
+                              synced data (e.g. /srv/nfs/data/kubernetes/syncthing).
+
+  Mount options:
+    soft       Instructs the kernel to return EIO after the timeout rather than
+               retrying indefinitely. Allows Kubernetes to restart the pod and
+               recover automatically once the NFS server is reachable, rather
+               than hanging in uninterruptible D state.
+    timeo=600  Initial RPC timeout in tenths of a second (60 seconds) before
+               returning EIO to the calling process under soft mount semantics.
+#}
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: syncthing-nfs-data
+  labels:
+    app.kubernetes.io/name: syncthing
+spec:
+  capacity:
+    storage: '{{ syncthing_nfs_data_size }}'
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ''
+  mountOptions:
+    - soft
+    - timeo=600
+  nfs:
+    server: '{{ nfs_server_ip }}'
+    path: '{{ syncthing_nfs_data_path }}'
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: syncthing-nfs-data
+  namespace: '{{ syncthing_namespace }}'
+  labels:
+    app.kubernetes.io/name: syncthing
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ''
+  volumeName: syncthing-nfs-data
+  resources:
+    requests:
+      storage: '{{ syncthing_nfs_data_size }}'
