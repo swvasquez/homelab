@@ -11,11 +11,45 @@ lint target="playbooks":
     set -euxo pipefail
     uv run ansible-lint {{ target }}
 
+# Run a specific Ansible playbook on a subset of machines
+install category playbook subset="homelab":
+    #!/usr/bin/env sh
+    set -euxo pipefail
+    uv run ansible-playbook \
+        --ask-become-pass \
+        --limit {{ subset }} \
+        -i inventory.yml \
+        "playbooks/{{ category }}/{{ playbook }}.yml"
+
 # Verify that a subset of machines are reachable via Ansible
 ping subset="homelab":
     #!/usr/bin/env sh
     set -euxo pipefail
     uv run ansible {{ subset }} -m ping -i inventory.yml
+
+# Reboot all nodes in the inventory (non-blocking)
+reboot subset="homelab":
+    #!/usr/bin/env sh
+    set -euxo pipefail
+    uv run ansible {{ subset }} \
+        --ask-become-pass \
+        -i inventory.yml \
+        -m ansible.builtin.command \
+        -a 'reboot' \
+        --become \
+        -e ansible_become_exe=sudo.ws
+
+# Shutdown all nodes in the inventory (non-blocking)
+shutdown subset="homelab":
+    #!/usr/bin/env sh
+    set -euxo pipefail
+    uv run ansible {{ subset }} \
+        --ask-become-pass \
+        -i inventory.yml \
+        -m ansible.builtin.command \
+        -a 'shutdown now' \
+        --become \
+        -e ansible_become_exe=sudo.ws
 
 # Flush the local DNS cache
 flush-dns:
@@ -27,13 +61,3 @@ flush-dns:
     else
         sudo resolvectl flush-caches
     fi
-
-# Run a specific Ansible playbook on a subset of machines
-install category playbook subset="homelab":
-    #!/usr/bin/env sh
-    set -euxo pipefail
-    uv run ansible-playbook \
-        --ask-become-pass \
-        --limit {{ subset }} \
-        -i inventory.yml \
-        "playbooks/{{ category }}/{{ playbook }}.yml"
