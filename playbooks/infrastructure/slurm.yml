@@ -442,6 +442,50 @@
       notify: Restart slurmd
 
     # -------------------------------------------------------------------------
+    # NFS Boot Ordering
+    # Slurm job working directories live on the NFS mount. Drop-ins order
+    # slurmctld and slurmd after the NFS mount unit so daemons do not start
+    # before the share is available. Uses Wants= (not Requires=) so daemons
+    # still start after the 15 s mount timeout if NFS is unavailable, and
+    # recover via the automount unit once the server comes online.
+    # -------------------------------------------------------------------------
+    - name: Create systemd drop-in directory for slurmctld NFS ordering
+      ansible.builtin.file:
+        path: /etc/systemd/system/slurmctld.service.d
+        state: directory
+        mode: '0755'
+      when: slurm_controller | default(false) | bool
+
+    - name: Write systemd drop-in to order slurmctld after NFS mount
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/slurmctld.service.d/after-nfs-mount.conf
+        mode: '0644'
+        content: |
+          [Unit]
+          After={{ nfs_mount_point | regex_replace("^/", "") | replace("/", "-") }}.mount
+          Wants={{ nfs_mount_point | regex_replace("^/", "") | replace("/", "-") }}.mount
+      notify: Reload systemd daemon
+      when: slurm_controller | default(false) | bool
+
+    - name: Create systemd drop-in directory for slurmd NFS ordering
+      ansible.builtin.file:
+        path: /etc/systemd/system/slurmd.service.d
+        state: directory
+        mode: '0755'
+      when: slurm_compute_node | default(false) | bool
+
+    - name: Write systemd drop-in to order slurmd after NFS mount
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/slurmd.service.d/after-nfs-mount.conf
+        mode: '0644'
+        content: |
+          [Unit]
+          After={{ nfs_mount_point | regex_replace("^/", "") | replace("/", "-") }}.mount
+          Wants={{ nfs_mount_point | regex_replace("^/", "") | replace("/", "-") }}.mount
+      notify: Reload systemd daemon
+      when: slurm_compute_node | default(false) | bool
+
+    # -------------------------------------------------------------------------
     # Service Startup
     # Starts and enables the three daemons that make up the cluster:
     #   - munge:      must be running on all nodes before any SLURM daemon
@@ -465,19 +509,41 @@
         name: slurmctld
         state: started
         enabled: true
+        masked: false
       when: slurm_controller | default(false) | bool
+
+    - name: Mask slurmctld on non-controller nodes
+      ansible.builtin.systemd:
+        name: slurmctld
+        state: stopped
+        enabled: false
+        masked: true
+      when: not (slurm_controller | default(false) | bool)
 
     - name: Start and enable slurmd
       ansible.builtin.systemd:
         name: slurmd
         state: started
         enabled: true
+        masked: false
       when: slurm_compute_node | default(false) | bool
+
+    - name: Mask slurmd on non-compute nodes
+      ansible.builtin.systemd:
+        name: slurmd
+        state: stopped
+        enabled: false
+        masked: true
+      when: not (slurm_compute_node | default(false) | bool)
 
   handlers:
     # -------------------------------------------------------------------------
     # Handlers
     # -------------------------------------------------------------------------
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+
     - name: Restart munge
       ansible.builtin.systemd:
         name: munge

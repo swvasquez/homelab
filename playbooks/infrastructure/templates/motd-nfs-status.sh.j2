@@ -1,0 +1,11 @@
+#!/bin/bash
+# ==============================================================================
+# motd-nfs-status
+# ==============================================================================
+# Dynamic MOTD fragment that warns when the NFS mount is not active.
+# Runs on every SSH login via /etc/update-motd.d/.
+# ==============================================================================
+
+if ! systemctl is-active --quiet {{ nfs_mount_point | regex_replace("^/", "") | replace("/", "-") }}.mount; then
+    echo "WARNING: NFS mount ({{ nfs_mount_point }}) is not active — NFS server may be offline."
+fi

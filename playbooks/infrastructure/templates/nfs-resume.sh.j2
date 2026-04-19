@@ -1,0 +1,19 @@
+#!/bin/bash
+set -e
+# ==============================================================================
+# nfs-resume.sh
+# ==============================================================================
+# systemd sleep hook deployed on the NFS server node. Called by the systemd
+# sleep infrastructure before and after suspend/hibernate transitions.
+#
+# On resume from S3 suspend, re-exports all NFS shares so that clients can
+# reconnect cleanly. Without this, clients that try to remount before the
+# kernel NFS server has re-announced its exports may encounter stale handles
+# or failed mounts within the soft-mount timeout window.
+# ==============================================================================
+
+case "$1" in
+    post)
+        exportfs -ra
+        ;;
+esac

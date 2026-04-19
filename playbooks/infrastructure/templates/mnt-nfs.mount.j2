@@ -21,6 +21,9 @@
   preventing the fstab-generator from pulling the automount into local-fs.target.
   After=nfs-kernel-server.service is included only on the server node, where it
   is safe because the cycle path no longer exists.
+
+  Note: timeo=600 (60 s NFSv3 retransmit timeout) is superseded by
+  TimeoutSec=15 — systemd kills the mount attempt after 15 s regardless.
 #}
 [Unit]
 Description={{ nfs_mount_point }}

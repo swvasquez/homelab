@@ -47,6 +47,8 @@ Ansible Playbooks to configure Ubuntu x86_64 machines and manage a Kubernetes ho
       - <USER>
       - <ANSIBLE_USER>
     dns_zone: <DNS_ZONE>
+    nfs_export_path: <NFS_EXPORT_PATH>
+    nfs_mount_point: <NFS_MOUNT_POINT>
     nfs_k8s_path: <NFS_K8S_PATH>
     nfs_group: <NFS_GROUP>
     nfs_group_gid: <NFS_GROUP_GID>
