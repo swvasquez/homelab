@@ -728,6 +728,17 @@
     # each incoming request to the Authentik outpost for authentication before
     # allowing it to reach the backend service.
     # -------------------------------------------------------------------------
+    - name: Ensure namespaces exist for ForwardAuth Middleware deployment
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig={{ kubectl_config_path }} create namespace {{ item }}
+      register: ns_result
+      changed_when: ns_result.rc == 0
+      failed_when:
+        - ns_result.rc != 0
+        - "'already exists' not in ns_result.stderr"
+      loop: "{{ protected_httproutes | map(attribute='route_ns') | unique | list }}"
+      when: bootstrap_node | default(false)
+
     - name: Write ForwardAuth Middleware manifests
       ansible.builtin.template:
         src: traefik-forward-auth-middleware.yml.j2

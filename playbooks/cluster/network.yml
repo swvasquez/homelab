@@ -9,8 +9,11 @@
 # fully operational. It performs the following actions:
 #   - Installs the Kubernetes Gateway API CRDs required by Cilium.
 #   - Removes kube-proxy and installs Cilium as the CNI plugin via Helm, with
-#     Cilium's eBPF kube-proxy replacement, Gateway API support, and Hubble
-#     observability enabled.
+#     Cilium's eBPF kube-proxy replacement, Gateway API support, Hubble
+#     observability, and node initialization tainting enabled. The nodeinit
+#     DaemonSet applies a node.cilium.io/agent-not-ready:NoExecute taint on
+#     every Cilium agent start, preventing application pods from scheduling
+#     before the eBPF dataplane is fully programmed.
 #   - Configures a Cilium LoadBalancer IP pool for LAN-accessible services.
 #   - Configures L2 announcement so LoadBalancer IPs are reachable on the LAN.
 #   - Installs Traefik as the L7 Gateway API controller via Helm and creates the

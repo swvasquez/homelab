@@ -1,0 +1,28 @@
+{#
+  Systemd service unit for Kubernetes node suspend/resume lifecycle management.
+  Installed to /etc/systemd/system/k8s-suspend.service and enabled to run
+  before sleep.target, covering both S3 and S0ix (modern standby).
+
+  The script manages its own per-step timeouts, so the service timeouts here
+  are a generous ceiling. Worst-case pre-suspend sums to roughly 300 seconds
+  across all stages (container stop, service stops, device detach waits, iSCSI
+  cleanup, sync); the ceiling leaves headroom.
+
+  Variables:
+    k8s_suspend_script_path: Path to the suspend lifecycle script.
+#}
+[Unit]
+Description=Kubernetes node suspend and resume lifecycle management
+Before=sleep.target
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={{ k8s_suspend_script_path }} pre
+ExecStop={{ k8s_suspend_script_path }} post
+TimeoutStartSec=600
+TimeoutStopSec=300
+
+[Install]
+WantedBy=sleep.target

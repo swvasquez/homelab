@@ -8,12 +8,12 @@
     cluster_name:       Name of the Kubernetes cluster (e.g. homelab-0).
     pod_network_cidr:   CIDR range for pod networking (e.g. 10.244.0.0/16).
 #}
-apiVersion: kubeadm.k8s.io/v1beta3
+apiVersion: kubeadm.k8s.io/v1beta4
 kind: InitConfiguration
 nodeRegistration:
   criSocket: '{{ kubeadm_cri_socket }}'
 ---
-apiVersion: kubeadm.k8s.io/v1beta3
+apiVersion: kubeadm.k8s.io/v1beta4
 kind: ClusterConfiguration
 clusterName: '{{ cluster_name }}'
 networking:

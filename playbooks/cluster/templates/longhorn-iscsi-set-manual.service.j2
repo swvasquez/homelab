@@ -1,0 +1,30 @@
+{#
+  Systemd oneshot that rewrites Longhorn-owned iSCSI node records to
+  node.startup=manual before iscsid.service starts. Scoped to the IQN
+  prefix iqn.2019-10.io.longhorn so records owned by other iSCSI
+  providers (external NAS, backup appliance, etc.) keep their default
+  auto-login behavior.
+
+  Wired with Before=iscsid.service and WantedBy=iscsid.service so
+  systemd pulls this in transparently every time iscsid starts — boot,
+  resume (via the k8s-suspend.service post path that restarts iscsid),
+  and any manual restart. That ensures iscsid always reads a node
+  database in which Longhorn records are marked manual before it acts
+  on them.
+
+  Variables:
+    longhorn_iscsi_set_manual_script_path: Full path to the fixup script.
+#}
+[Unit]
+Description=Set Longhorn iSCSI node records to node.startup=manual
+Documentation=https://longhorn.io/kb/troubleshooting-orphan-iscsi-session-error/
+Before=iscsid.service
+
+[Service]
+Type=oneshot
+ExecStart={{ longhorn_iscsi_set_manual_script_path }}
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=iscsid.service

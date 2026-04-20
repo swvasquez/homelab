@@ -4,12 +4,35 @@
   Variables:
     longhorn_replica_count: Number of volume replicas. Set dynamically to match the
                             cluster node count at deployment time.
+
+  LOAD-BEARING — DO NOT LOWER engineReplicaTimeout OR
+  replicaReplenishmentWaitInterval BACK TO DEFAULTS. These are tuned up
+  from Longhorn defaults (8s and 600s) to prevent the auto-salvage +
+  cross-node-rebuild cascade that happens whenever every node's
+  instance-manager restarts simultaneously — which is the normal case for
+  cluster-wide suspend/resume, coordinated reboot, and dirty power loss.
+  Symptoms of the cascade (observed and fixed):
+    - EXT4-fs "shut down requested (2)" on iSCSI sd* devices in dmesg
+    - JBD2 I/O error when updating journal superblock
+    - tens of GB of cross-node rebuild traffic per cycle
+  The short defaults mark all replicas Failed the moment managers restart,
+  which triggers auto-salvage and a detach-during-rebuild step that aborts
+  ext4 journals on top of the volumes. The longer timeouts give replicas
+  time to reconnect cleanly before anything declares them failed, and the
+  longer replenishment interval means that if a replica IS briefly marked
+  Failed, Longhorn waits 30 minutes before kicking off a new-replica
+  rebuild — well past any expected suspend window. engineReplicaTimeout is
+  set to 300s (5 min) because empirical timing shows instance-manager takes
+  ~95s+ after kubelet start to be fully ready; the 30s default was too
+  short and still triggered rebuilds (observed 2026-04-22).
 #}
 defaultSettings:
   defaultDataPath: /var/lib/longhorn
   storageReservedPercentageForDefaultDisk: 30
   storageMinimalAvailablePercentage: 25
   storageOverProvisioningPercentage: 100
+  engineReplicaTimeout: 300
+  replicaReplenishmentWaitInterval: 1800
 persistence:
   defaultClassReplicaCount: {{ longhorn_replica_count }}
   defaultClass: true

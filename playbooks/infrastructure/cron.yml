@@ -5,27 +5,28 @@
 # Configures system-wide cron jobs for system maintenance and automation.
 #
 # Current tasks:
-#   - Scheduled System Shutdown: Shuts down the system at a configured time
-#     using '/usr/sbin/shutdown -h now'.
+#   - Scheduled System Shutdown: Shuts down or suspends the system at a
+#     configured time. The behavior is controlled by shutdown_mode:
+#       - 'suspend'  triggers S3 suspend-to-RAM via 'systemctl suspend'
+#       - 'shutdown' performs a full power-off via '/usr/sbin/shutdown -h now'
 #
 # Variables:
-#   shutdown_schedule:  Cron schedule string for system shutdown in standard
-#                       5-field notation (e.g., '0 4 * * *'). Set in
-#                       group_vars/homelab.yml.
+#   shutdown_schedule:  Cron schedule string in standard 5-field notation
+#                       (e.g., '0 4 * * *'). Read from group_vars.
+#   shutdown_mode:      'suspend' or 'shutdown'. Read from group_vars.
 
 - name: Configure system cron jobs
   hosts: homelab
   become: true
   become_exe: sudo.ws
-  vars:
-    shutdown_schedule: '0 4 * * *'
 
   tasks:
     # -------------------------------------------------------------------------
     # Scheduled Shutdown
-    # Creates a cron job that shuts down the system at the time defined by the
-    # shutdown_schedule variable. The schedule is sourced from group_vars to
-    # allow per-group customization without modifying this playbook.
+    # Creates a cron job that either suspends or shuts down the system at the
+    # time defined by shutdown_schedule. The command is selected based on
+    # shutdown_mode: 'suspend' uses systemctl suspend for S3 sleep, 'shutdown'
+    # uses /usr/sbin/shutdown -h now for a full power-off.
     # -------------------------------------------------------------------------
     - name: Create scheduled shutdown cron job
       ansible.builtin.cron:
@@ -35,4 +36,4 @@
         day: "{{ shutdown_schedule.split(' ')[2] }}"
         month: "{{ shutdown_schedule.split(' ')[3] }}"
         weekday: "{{ shutdown_schedule.split(' ')[4] }}"
-        job: /usr/sbin/shutdown -h now
+        job: "{{ '/bin/systemctl suspend' if shutdown_mode == 'suspend' else '/usr/sbin/shutdown -h now' }}"

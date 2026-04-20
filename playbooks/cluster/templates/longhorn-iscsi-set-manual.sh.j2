@@ -1,0 +1,64 @@
+#!/bin/bash
+# ==============================================================================
+# longhorn-iscsi-set-manual.sh
+# ==============================================================================
+# Rewrites Longhorn-owned iSCSI node records from node.startup=automatic to
+# node.startup=manual so iscsid does not auto-log-in to them on service start.
+#
+# Why this matters:
+#   Longhorn's CSI plugin issues an explicit `iscsiadm --login` whenever a
+#   volume is attached. If iscsid also auto-reconnects to the same targets on
+#   startup, the two paths race — on boot and especially on resume, iscsid may
+#   reconnect to a target before Longhorn's engine for that volume is back up,
+#   so the kernel sees a dead target for the freshly assigned /dev/sdX and
+#   aborts its ext4 filesystem with "shut down requested (2)" / "device
+#   offline error" messages.
+#
+# Scope:
+#   The rewrite is limited to records whose IQN begins with
+#   iqn.2019-10.io.longhorn, the stable prefix Longhorn uses for every target
+#   it owns. Records owned by any other iSCSI provider (external NAS, backup
+#   appliance, etc.) are left at their existing startup value so their normal
+#   auto-reconnect behavior is preserved.
+#
+# Idempotency:
+#   Only records currently set to automatic are rewritten. A record already
+#   set to manual (or anything non-default) is skipped. The script prints a
+#   single stdout summary line of the form "scanned=N changed=M" so callers
+#   (Ansible, systemd-cat via journald) can tell at a glance what happened.
+#
+# Triggers:
+#   - Ansible deploy: invoked once to normalize any pre-existing records.
+#   - Every iscsid.service start: wired via Before=/WantedBy= so systemd
+#     runs this unit before iscsid reads the node database on boot or resume.
+# ==============================================================================
+
+set -euo pipefail
+
+NODES_DIR='/etc/iscsi/nodes'
+
+# LOAD-BEARING — DO NOT WIDEN this prefix. Scoping the rewrite to Longhorn's
+# fixed IQN prefix (iqn.2019-10.io.longhorn) is intentional. Rewriting
+# records owned by other iSCSI providers (external NAS, backup appliances,
+# etc.) would silently disable their auto-login and break any services
+# depending on those volumes at boot. Every Longhorn-created target uses
+# this prefix; this invariant is stable in the Longhorn source.
+IQN_PREFIX='iqn.2019-10.io.longhorn'
+
+if [[ ! -d "$NODES_DIR" ]]; then
+    echo 'scanned=0 changed=0'
+    exit 0
+fi
+
+scanned=0
+changed=0
+
+while IFS= read -r -d '' record; do
+    scanned=$(( scanned + 1 ))
+    if grep -qE '^node\.startup = automatic$' "$record"; then
+        sed -i 's/^node\.startup = automatic$/node.startup = manual/' "$record"
+        changed=$(( changed + 1 ))
+    fi
+done < <(find "$NODES_DIR" -path "*${IQN_PREFIX}*/default" -print0 2>/dev/null)
+
+echo "scanned=${scanned} changed=${changed}"

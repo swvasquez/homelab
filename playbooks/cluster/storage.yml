@@ -6,6 +6,10 @@
 # block storage across all nodes, and then deploys Longhorn via Helm on the
 # bootstrap node. It provides cluster-persistent storage for Kubernetes.
 #
+# Multipath is configured to blacklist sd* devices on all nodes to prevent
+# multipathd from claiming Longhorn iSCSI volumes, which causes mount failures
+# particularly after S3 suspend/resume.
+#
 # Variables:
 #   bootstrap_node:         Boolean indicating if the host is the control plane
 #                           bootstrap node where Helm commands should execute.
@@ -24,6 +28,11 @@
 #                           (default: longhorn.<dns_zone>).
 #   kubectl_config_path:    Full path to the kubectl config file
 #                           (default: /home/<ansible_user>/.kube/config).
+#   longhorn_iscsi_set_manual_script_path:
+#                           Full path to the helper that rewrites Longhorn-owned
+#                           iSCSI node records from node.startup=automatic to
+#                           manual
+#                           (default: /usr/local/bin/longhorn-iscsi-set-manual.sh).
 
 - name: Install Longhorn storage
   hosts: homelab
@@ -35,6 +44,7 @@
     longhorn_replica_count: 3
     longhorn_hostname: "longhorn.{{ dns_zone }}"
     kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
+    longhorn_iscsi_set_manual_script_path: /usr/local/bin/longhorn-iscsi-set-manual.sh
 
   tasks:
     # -------------------------------------------------------------------------
@@ -43,6 +53,12 @@
     # open-iscsi provides the iSCSI initiator used for block storage transport
     # between Longhorn components. nfs-common enables NFS mounts, which
     # Longhorn uses for ReadWriteMany volume access mode support.
+    #
+    # NOTE: Longhorn manages its own iSCSI sessions via iscsid directly.
+    # On older distros, iscsi.service should be disabled to prevent stale session
+    # reconnection on boot conflicting with Longhorn. On Ubuntu 25.10, iscsi.service
+    # does not exist — only iscsid.service is present, which Longhorn requires.
+    # See: https://longhorn.io/kb/troubleshooting-orphan-iscsi-session-error/
     # -------------------------------------------------------------------------
     - name: Install Longhorn dependencies via package manager
       ansible.builtin.apt:
@@ -51,6 +67,78 @@
           - nfs-common
         state: present
         update_cache: true
+
+    # -------------------------------------------------------------------------
+    # iSCSI Node Record Normalization
+    # Longhorn's CSI plugin issues explicit iscsiadm --login calls whenever a
+    # volume is attached. If iscsid also auto-reconnects to the same targets on
+    # startup (the open-iscsi default of node.startup=automatic), the two paths
+    # race on boot and especially on resume: iscsid can reconnect to a target
+    # before Longhorn's engine for that volume is back up, so the kernel sees a
+    # dead target for the freshly assigned /dev/sdX and aborts its ext4
+    # filesystem with "shut down requested (2)" / "device offline error"
+    # messages.
+    #
+    # The fix rewrites Longhorn-owned node records from automatic to manual
+    # before iscsid reads the node database. Scoped to the IQN prefix
+    # iqn.2019-10.io.longhorn so external iSCSI providers (NAS, backup
+    # appliance, etc.) keep their default auto-login behavior. A systemd
+    # oneshot wired Before=iscsid.service / WantedBy=iscsid.service runs the
+    # script transparently on every iscsid start. A one-off play run normalizes
+    # any records already written by a previously-running iscsid at deploy
+    # time.
+    # -------------------------------------------------------------------------
+    - name: Install Longhorn iSCSI node record fixup script
+      ansible.builtin.template:
+        src: longhorn-iscsi-set-manual.sh.j2
+        dest: '{{ longhorn_iscsi_set_manual_script_path }}'
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Install Longhorn iSCSI node record fixup service
+      ansible.builtin.template:
+        src: longhorn-iscsi-set-manual.service.j2
+        dest: /etc/systemd/system/longhorn-iscsi-set-manual.service
+        mode: '0644'
+        owner: root
+        group: root
+      notify: Reload systemd daemon
+
+    - name: Enable Longhorn iSCSI node record fixup service
+      ansible.builtin.systemd:
+        name: longhorn-iscsi-set-manual.service
+        enabled: true
+        daemon_reload: true
+
+    - name: Normalize existing Longhorn iSCSI node records to manual startup
+      ansible.builtin.command:
+        cmd: '{{ longhorn_iscsi_set_manual_script_path }}'
+      register: longhorn_iscsi_set_manual_result
+      changed_when: "'changed=0' not in longhorn_iscsi_set_manual_result.stdout"
+
+    # -------------------------------------------------------------------------
+    # Multipath Configuration
+    # Blacklists all sd* block devices from multipath management. Longhorn uses
+    # iSCSI to expose volumes, which appear as sd* devices. Without this
+    # blacklist, multipathd claims those devices before Longhorn can map them
+    # correctly, causing mount failures — especially after S3 suspend/resume
+    # when the iSCSI session reconnects and multipathd grabs the raw device
+    # before Longhorn's device management runs.
+    # -------------------------------------------------------------------------
+    - name: Configure multipath to blacklist Longhorn iSCSI devices
+      ansible.builtin.copy:
+        dest: /etc/multipath.conf
+        mode: '0644'
+        content: |
+          blacklist {
+              devnode "^sd[a-z0-9]+"
+          }
+
+    - name: Restart multipathd to apply blacklist
+      ansible.builtin.systemd:
+        name: multipathd
+        state: restarted
 
     # -------------------------------------------------------------------------
     # Longhorn Installation
@@ -146,3 +234,8 @@
         path: /tmp/longhorn-httproute.yml
         state: absent
       when: bootstrap_node | default(false)
+
+  handlers:
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true

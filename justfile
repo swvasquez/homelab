@@ -37,6 +37,27 @@ reboot subset="homelab":
         -m ansible.builtin.command \
         -a 'reboot' \
         --become \
+        -e ansible_become_exe=sudo.ws \
+        -B 1 -P 0
+
+# Wake all nodes in a group via Wake-on-LAN magic packet (MAC addresses read from inventory.yml)
+wake subset="homelab":
+    #!/usr/bin/env sh
+    set -euxo pipefail
+    uv run ansible-inventory -i inventory.yml --list \
+        | jq -r '.{{ subset }}.hosts[] as $h | ._meta.hostvars[$h].mac_address' \
+        | xargs -I{} wakeonlan {}
+
+# Suspend all nodes in the inventory to S3 (non-blocking)
+suspend subset="homelab":
+    #!/usr/bin/env sh
+    set -euxo pipefail
+    uv run ansible {{ subset }} \
+        --ask-become-pass \
+        -i inventory.yml \
+        -m ansible.builtin.command \
+        -a 'systemd-run --on-active=5 systemctl suspend' \
+        --become \
         -e ansible_become_exe=sudo.ws
 
 # Shutdown all nodes in the inventory (non-blocking)
@@ -49,7 +70,26 @@ shutdown subset="homelab":
         -m ansible.builtin.command \
         -a 'shutdown now' \
         --become \
-        -e ansible_become_exe=sudo.ws
+        -e ansible_become_exe=sudo.ws \
+        -B 1 -P 0
+
+# Destroy the Kubernetes cluster on all nodes — IRREVERSIBLE, deletes all data
+destroy-cluster subset="homelab":
+    #!/usr/bin/env sh
+    printf 'WARNING: This will permanently destroy the Kubernetes cluster and all data on "%s".\nType "destroy" to confirm: ' '{{ subset }}'
+    read confirmation
+    if [ "$confirmation" != "destroy" ]; then
+        echo "Aborted."
+        exit 1
+    fi
+    uv run ansible {{ subset }} \
+        --ask-become-pass \
+        -i inventory.yml \
+        -m ansible.builtin.shell \
+        -a 'kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock' \
+        --become \
+        -e ansible_become_exe=sudo.ws \
+        -B 1 -P 0
 
 # Flush the local DNS cache
 flush-dns:

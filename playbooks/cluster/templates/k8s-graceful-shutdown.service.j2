@@ -6,9 +6,9 @@ After=network.target kubelet.service docker.service cri-docker.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-User={{ ansible_user }}
 ExecStart={{ k8s_drain_script_path }} start
 ExecStop={{ k8s_drain_script_path }} stop
+TimeoutStartSec=10
 TimeoutStopSec={{ k8s_drain_timeout + 30 }}
 
 [Install]

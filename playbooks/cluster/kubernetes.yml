@@ -19,6 +19,13 @@
 #   - Installs k9s, a terminal UI for managing Kubernetes clusters.
 #   - Installs a systemd shutdown hook that cordons and drains the node before
 #     any shutdown or reboot, allowing Longhorn volumes to detach cleanly.
+#   - Installs a systemd service bound to sleep.target that locally stops
+#     kubelet, containers, and iSCSI before suspend (S3 or S0ix) and restores
+#     them on resume. No drain or cross-node coordination — Longhorn handles
+#     reconciliation natively on wake.
+#   - Writes a kubelet drop-in (after-cri-docker.conf) that declares a hard
+#     dependency on cri-docker.service, ensuring kubelet never starts before its
+#     CRI socket is available.
 #
 # Variables:
 #   kube_version:        Kubernetes version to install (default: v1.28).
@@ -37,12 +44,22 @@
 #                        script (default: /home/<ansible_user>/.kube/config).
 #   k8s_drain_script_path: Path where the node lifecycle script is installed on each node
 #                        (default: /usr/local/bin/k8s-node-lifecycle.sh).
-#   k8s_drain_timeout:   Seconds to wait for drain to complete before giving up
-#                        and proceeding with shutdown anyway (default: 300).
+#   k8s_drain_timeout:      Seconds to wait for drain to complete before giving up
+#                           and proceeding with shutdown anyway (default: 900).
+#   k8s_drain_grace_period: Seconds each pod gets to terminate gracefully during
+#                           drain. Should be long enough for databases to flush
+#                           writes cleanly (default: 120).
 #                        The systemd TimeoutStopSec is set to this value + 30s.
 #   k8s_uncordon_timeout: Seconds to retry uncordoning the node on startup before
 #                        giving up (default: 900). Runs in the background and does
 #                        not block boot.
+#   k8s_iscsi_disconnect_timeout: Seconds to wait for iSCSI sessions to clear
+#                        during suspend after docker has stopped and sessions
+#                        have been logged out. Prevents the kernel from
+#                        suspending with active iSCSI connections (default: 60).
+#   k8s_suspend_script_path: Path where the suspend lifecycle script is
+#                        installed on each node
+#                        (default: /usr/local/bin/k8s-suspend.sh).
 
 - name: Install and configure Kubernetes
   hosts: homelab
@@ -63,8 +80,11 @@
     k9s_version: 0.50.18
     kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
     k8s_drain_script_path: /usr/local/bin/k8s-node-lifecycle.sh
-    k8s_drain_timeout: 300
+    k8s_suspend_script_path: /usr/local/bin/k8s-suspend.sh
+    k8s_drain_timeout: 900
+    k8s_drain_grace_period: 120
     k8s_uncordon_timeout: 900
+    k8s_iscsi_disconnect_timeout: 60
 
   tasks:
     # -------------------------------------------------------------------------
@@ -87,6 +107,7 @@
           - apt-transport-https
         state: present
         update_cache: true
+        cache_valid_time: 3600
 
     - name: Ensure /etc/apt/keyrings directory exists
       ansible.builtin.file:
@@ -252,6 +273,24 @@
         path: /tmp/cri-dockerd.deb
         state: absent
 
+    - name: Ensure cri-docker drop-in directory exists
+      ansible.builtin.file:
+        path: /etc/systemd/system/cri-docker.service.d
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Write systemd drop-in to order cri-docker after docker
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/cri-docker.service.d/require-docker.conf
+        mode: '0644'
+        owner: root
+        group: root
+        content: |
+          [Unit]
+          Wants=docker.service
+
     - name: Reload systemd daemon after cri-dockerd installation
       ansible.builtin.systemd:
         daemon_reload: true
@@ -292,6 +331,21 @@
         dest: /etc/default/kubelet
         content: 'KUBELET_EXTRA_ARGS=--cgroup-driver=systemd'
         mode: '0644'
+
+    - name: Write systemd drop-in to order kubelet after cri-docker
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/kubelet.service.d/after-cri-docker.conf
+        mode: '0644'
+        owner: root
+        group: root
+        content: |
+          [Unit]
+          After=cri-docker.service
+          Wants=cri-docker.service
+
+    - name: Reload systemd daemon after kubelet drop-in changes
+      ansible.builtin.systemd:
+        daemon_reload: true
 
     - name: Start and enable kubelet service
       ansible.builtin.systemd:
@@ -418,3 +472,68 @@
         name: k8s-graceful-shutdown.service
         enabled: true
 
+    # -------------------------------------------------------------------------
+    # Suspend Lifecycle Service
+    # Systemd service that manages local node state around system suspend.
+    # Using a service with Before=sleep.target gives systemd explicit dependency
+    # tracking — it waits for the service to complete before allowing sleep and
+    # runs ExecStop on resume. This works for both S3 and S0ix (modern standby),
+    # unlike sleep hooks in /lib/systemd/system-sleep/ which are unreliable
+    # under S0ix.
+    #
+    # The hook script runs purely local operations — no kubectl, no drain, no
+    # cross-node coordination. It treats suspend as an unclean event (like a
+    # brief power loss) and relies on Longhorn's native reconciliation to
+    # recover on wake.
+    #
+    # On pre-suspend (ExecStart): stops kubelet, gracefully stops all
+    # containers, stops cri-docker and docker, force-unmounts any lingering
+    # Longhorn mounts, logs out iSCSI sessions, waits for /dev/sd* to detach,
+    # stops iscsid, and syncs.
+    #
+    # On post-resume (ExecStop): starts iscsid, docker, cri-docker, and
+    # kubelet. Longhorn and workload pods reconcile on their own.
+    # -------------------------------------------------------------------------
+    - name: Remove GRUB S3 sleep mode configuration if present
+      ansible.builtin.file:
+        path: /etc/default/grub.d/mem-sleep.cfg
+        state: absent
+      notify: Update GRUB
+
+    - name: Remove legacy suspend sleep hook if present
+      ansible.builtin.file:
+        path: /lib/systemd/system-sleep/k8s-suspend
+        state: absent
+
+    - name: Install Kubernetes suspend lifecycle script
+      ansible.builtin.template:
+        src: k8s-suspend-hook.sh.j2
+        dest: '{{ k8s_suspend_script_path }}'
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Install Kubernetes suspend lifecycle service
+      ansible.builtin.template:
+        src: k8s-suspend.service.j2
+        dest: /etc/systemd/system/k8s-suspend.service
+        mode: '0644'
+        owner: root
+        group: root
+      notify: Reload systemd daemon
+
+    - name: Enable Kubernetes suspend lifecycle service
+      ansible.builtin.systemd:
+        name: k8s-suspend.service
+        enabled: true
+        daemon_reload: true
+
+  handlers:
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Update GRUB
+      ansible.builtin.command:
+        cmd: update-grub
+      changed_when: true
