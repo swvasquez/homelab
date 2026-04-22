@@ -11,8 +11,7 @@
 # group_vars/homelab.yml because s2idle is unreliable on this Ryzen
 # workstation hardware (no S3 exposed by BIOS, s0ix never actually entered).
 # The nightly cron poweroffs each node, and WoL cold-boots them the next
-# morning — both sides go through this script. See boot-lifecycle.md
-# failure mode #4 for why suspend was abandoned.
+# morning — both sides go through this script.
 #
 # On shutdown:
 #   1. Syncs pending writes while volumes are still active.

@@ -6,11 +6,27 @@
   prevent the fstab-generator from placing it in local-fs.target, which causes
   ordering cycles at boot. See mnt-nfs.mount.j2 for full details.
   (systemd upstream bugs #17657 and #34164 — unfixed as of 2026.)
+
+  Intentionally NO After=network-online.target here. The automount is lazy —
+  starting the unit only registers the kernel automount point; it does not
+  mount anything. The first access to the mount path triggers mnt-nfs.mount,
+  which itself is ordered After=network-online.target, so network readiness
+  still gates the actual NFS mount. Adding After=network-online.target here
+  as well closes a structural boot-time ordering cycle: systemd synthesizes
+  Before=lvm2-monitor.service on this automount (because the Where= path
+  sits on the root filesystem and lvm2-monitor is Before=local-fs-pre.target),
+  and lvm2-monitor transitively reaches systemd-networkd via the local-fs
+  -> basic -> sysinit -> network-pre chain. With the redundant
+  After=network-online.target edge in place, the graph is:
+  network-online -> mnt-nfs.automount -> lvm2-monitor -> local-fs-pre ->
+  local-fs -> ... -> systemd-networkd -> systemd-networkd-wait-online ->
+  network-online. systemd tolerates the cycle by deleting jobs (often
+  including systemd-networkd.service/start itself), which forces networkd
+  to come up only via socket activation and produces flaky boots.
 #}
 [Unit]
 Description={{ nfs_mount_point }} automount
 DefaultDependencies=no
-After=network-online.target
 
 [Automount]
 Where={{ nfs_mount_point }}

@@ -12,8 +12,7 @@
 # and s0ix deep sleep is never actually entered (S0ix Entry Time: 0 in
 # amd_pmc stats). Shallow s2idle bounces out within 20–30 seconds from any
 # residual interrupt, so nodes cold-boot via WoL instead. This script stays
-# here for manual `systemctl suspend` testing. See boot-lifecycle.md
-# failure mode #4 for the full diagnosis.
+# here for manual `systemctl suspend` testing.
 #
 # Design: treat suspend as an unclean event (like a brief power loss) rather
 # than orchestrating a graceful cluster-wide drain. Longhorn is designed to
