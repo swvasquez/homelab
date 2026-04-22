@@ -1,0 +1,64 @@
+{#
+  Static PersistentVolume and PersistentVolumeClaim for the Immich photo
+  library, backed by the homelab NFS share. Applied directly by immich.yml
+  before ArgoCD syncs the Helm release. The PVC is pre-created so the Immich
+  Helm chart can reference it via existingClaim without managing its lifecycle.
+
+  The storageClassName is set to '' and volumeName is set explicitly to force
+  binding to this specific PV and prevent the default StorageClass from
+  interfering.
+
+  NFS supports ReadWriteMany, allowing the Immich server and microservices
+  pods to mount the library simultaneously.
+
+  Variables:
+    immich_namespace:         Kubernetes namespace where Immich is deployed.
+    immich_library_nfs_size:  Nominal size annotation for the PV and PVC.
+                              NFS does not enforce quotas via PVC size.
+    nfs_server_ip:            IP address of the NFS server.
+    immich_library_nfs_path:  Absolute path on the NFS server for the Immich
+                              library (e.g. /srv/nfs/data/kubernetes/immich).
+
+  Mount options:
+    soft       Instructs the kernel to return EIO after the timeout rather than
+               retrying indefinitely. Allows Kubernetes to restart the pod and
+               recover automatically once the NFS server is reachable, rather
+               than hanging in uninterruptible D state.
+    timeo=600  Initial RPC timeout in tenths of a second (60 seconds) before
+               returning EIO to the calling process under soft mount semantics.
+#}
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: immich-library
+  labels:
+    app.kubernetes.io/name: immich
+spec:
+  capacity:
+    storage: '{{ immich_library_nfs_size }}'
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ''
+  mountOptions:
+    - soft
+    - timeo=600
+  nfs:
+    server: '{{ nfs_server_ip }}'
+    path: '{{ immich_library_nfs_path }}'
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: immich-library
+  namespace: '{{ immich_namespace }}'
+  labels:
+    app.kubernetes.io/name: immich
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ''
+  volumeName: immich-library
+  resources:
+    requests:
+      storage: '{{ immich_library_nfs_size }}'

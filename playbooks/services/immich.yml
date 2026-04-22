@@ -20,6 +20,12 @@
 # Immich v2.0+ for machine-learning similarity search. A cnpg Cluster resource
 # is provisioned in the immich namespace before ArgoCD syncs the Helm release.
 #
+# The Immich photo library is backed by the homelab NFS share under
+# nfs_k8s_path/immich, exposed through a static PersistentVolume and
+# PersistentVolumeClaim applied before ArgoCD syncs the Helm release. The
+# Immich pod runs with supplementalGroups set to nfs_group_gid so it has write
+# access to the NFS export directory (owned by root:nfs_users, mode 2775).
+#
 # Database credentials and the application secret key are generated on first
 # run and stored in a Kubernetes Secret named immich-credentials in the immich
 # namespace. The Helm values file references this Secret so that those values
@@ -41,11 +47,12 @@
 # the Immich UI over HTTPS.
 #
 # Run order:
-#   1. cluster/authentication.yml (Authentik, Traefik, cert-manager)
-#   2. services/gitea.yml
-#   3. services/argocd.yml
-#   4. services/immich.yml (this playbook)
-#   5. cluster/authentication.yml (re-run to apply HTTPRoutes and ForwardAuth
+#   1. infrastructure/nfs.yml (NFS server and Kubernetes NFS path)
+#   2. cluster/authentication.yml (Authentik, Traefik, cert-manager)
+#   3. services/gitea.yml
+#   4. services/argocd.yml
+#   5. services/immich.yml (this playbook)
+#   6. cluster/authentication.yml (re-run to apply HTTPRoutes and ForwardAuth
 #      middleware for all services including Immich)
 #
 # Variables:
@@ -72,15 +79,25 @@
 #                               (default: ghcr.io/cloudnative-pg/postgresql:17).
 #   immich_db_storage_size:     Storage size for the Immich cnpg database PVC
 #                               (default: 5Gi).
-#   immich_library_pvc_name:    Name of the PersistentVolumeClaim for the
-#                               Immich photo library (default: immich-library).
-#   immich_library_size:        Storage size for the Immich library PVC
-#                               (default: 10Gi).
+#   immich_library_nfs_path:    Absolute path on the NFS server for the Immich
+#                               photo library, derived from nfs_k8s_path
+#                               (default: <nfs_k8s_path>/immich).
+#   immich_library_nfs_size:    Nominal size annotation for the NFS library PV
+#                               and PVC. NFS does not enforce quotas via PVC
+#                               size (default: 10Gi).
 #   immich_storage_class:       Kubernetes StorageClass used to provision the
-#                               database and library PVCs (default: longhorn).
+#                               database and Valkey PVCs (default: longhorn).
 #   immich_gitops_path:         Path within the gitops repository where the
 #                               Immich values file is stored
 #                               (default: apps/immich).
+#   nfs_k8s_path:               Base NFS path for Kubernetes workloads. Read
+#                               from group_vars.
+#   nfs_group:                  Name of the NFS users group. Read from
+#                               group_vars.
+#   nfs_group_gid:              GID of the nfs_users group. Read from
+#                               group_vars.
+#   nfs_server_ip:              IP address of the NFS server, derived from
+#                               inventory hostvars at runtime.
 #   authentik_namespace:        Kubernetes namespace where Authentik is deployed
 #                               (default: authentik).
 #   authentik_hostname:         FQDN for the Authentik UI, derived from
@@ -113,10 +130,16 @@
     immich_db_username: immich
     immich_db_image: ghcr.io/cloudnative-pg/postgresql:17
     immich_db_storage_size: 5Gi
-    immich_library_pvc_name: immich-library
-    immich_library_size: 10Gi
+    immich_library_nfs_path: '{{ nfs_k8s_path }}/immich'
+    immich_library_nfs_size: 10Gi
     immich_storage_class: longhorn
     immich_gitops_path: apps/immich
+    nfs_server_ip: >-
+      {{ hostvars | dict2items
+         | selectattr('value.nfs_server', 'defined')
+         | selectattr('value.nfs_server', 'equalto', true)
+         | map(attribute='value.private_ip')
+         | first }}
     authentik_namespace: authentik
     authentik_hostname: 'authentik.{{ dns_zone }}'
     authentik_signing_key_name: 'authentik Self-signed Certificate'
@@ -146,33 +169,50 @@
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
-    # Persistence
-    # Creates a PersistentVolumeClaim for the Immich photo library. The Immich
-    # Helm chart requires an existing PVC for the library and does not
-    # provision one automatically. The PVC is created before ArgoCD first
-    # syncs the release so that the claim is available immediately.
+    # NFS Library Directory
+    # Creates the Immich photo library subdirectory within the Kubernetes NFS
+    # path. Runs on the NFS server node to operate directly on the server
+    # filesystem, bypassing NFS root_squash restrictions. infrastructure/nfs.yml
+    # must have been run first to create nfs_k8s_path.
     # -------------------------------------------------------------------------
-    - name: Write Immich library PVC manifest
+    - name: Create Immich library directory on NFS server
+      ansible.builtin.file:
+        path: '{{ immich_library_nfs_path }}'
+        state: directory
+        owner: root
+        group: '{{ nfs_group }}'
+        mode: '2775'
+      when: nfs_server | default(false)
+
+    # -------------------------------------------------------------------------
+    # NFS Library PersistentVolume
+    # Applies a static PersistentVolume and PersistentVolumeClaim for the
+    # Immich photo library backed by the NFS share. These are applied before
+    # ArgoCD syncs the Helm release so the PVC exists when the chart references
+    # it via existingClaim. The PV uses Retain reclaim policy so library data
+    # is not deleted if the PVC is removed.
+    # -------------------------------------------------------------------------
+    - name: Write Immich NFS library PV manifest
       ansible.builtin.template:
-        src: templates/immich-library-pvc.yml.j2
-        dest: /tmp/immich-library-pvc.yml
+        src: templates/immich-nfs-library-pv.yml.j2
+        dest: /tmp/immich-nfs-library-pv.yml
         mode: '0600'
       when: bootstrap_node | default(false)
 
-    - name: Apply Immich library PVC
+    - name: Apply Immich NFS library PV and PVC
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
-          apply -f /tmp/immich-library-pvc.yml
-      register: immich_pvc_result
+          apply -f /tmp/immich-nfs-library-pv.yml
+      register: immich_pv_result
       changed_when: >-
-        'created' in immich_pvc_result.stdout or
-        'configured' in immich_pvc_result.stdout
+        'created' in immich_pv_result.stdout or
+        'configured' in immich_pv_result.stdout
       when: bootstrap_node | default(false)
 
-    - name: Remove Immich library PVC manifest temporary file
+    - name: Remove Immich NFS library PV manifest temporary file
       ansible.builtin.file:
-        path: /tmp/immich-library-pvc.yml
+        path: /tmp/immich-nfs-library-pv.yml
         state: absent
       when: bootstrap_node | default(false)
 

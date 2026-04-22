@@ -10,6 +10,12 @@
   namespace via secretKeyRef so that they are never committed to the gitops
   repository.
 
+  The photo library is pre-created by immich.yml as a static NFS-backed
+  PersistentVolume and referenced here via existingClaim so the Helm chart
+  does not manage its lifecycle. The server pod runs with supplementalGroups
+  set to nfs_group_gid so the Immich process has write access to the NFS
+  export directory (owned by root:nfs_users, mode 2775).
+
   Note: The OIDC client ID and client secret are stored in this file which is
   committed to the gitops repository. Ensure the repository is private. For
   production deployments consider using Sealed Secrets or an External Secrets
@@ -23,14 +29,14 @@
     immich_db_name:            PostgreSQL database name.
     immich_db_username:        PostgreSQL username.
     immich_namespace:          Kubernetes namespace where Immich is deployed.
-    immich_library_pvc_name:   Name of the pre-existing PVC for the photo library.
     immich_storage_class:      Kubernetes StorageClass for the Valkey data PVC and
                                the database PVC provisioned in immich.yml.
+    nfs_group_gid:             GID of the nfs_users group on the NFS server.
 #}
 immich:
   persistence:
     library:
-      existingClaim: '{{ immich_library_pvc_name }}'
+      existingClaim: immich-library
 
   configuration:
     oauth:
@@ -44,6 +50,10 @@ immich:
       storageLabelClaim: preferred_username
 
 server:
+  defaultPodOptions:
+    securityContext:
+      supplementalGroups:
+        - {{ nfs_group_gid }}
   controllers:
     main:
       containers:
