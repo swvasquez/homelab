@@ -81,6 +81,11 @@
 #   syncthing_gui_port:         Port for the Syncthing Web GUI (default: 8384).
 #   syncthing_sync_port:        Port for the Syncthing sync protocol (default: 22000).
 #   syncthing_discovery_port:   Port for the Syncthing local discovery (default: 21027).
+#   syncthing_always_local_nets: CIDR networks that Syncthing should always treat
+#                               as LAN. Must be set because the Syncthing pod runs
+#                               on a pod-CIDR interface and cannot auto-detect the
+#                               homelab LAN subnet. Read from group_vars via
+#                               lan_cidr (default: <lan_cidr>).
 #   kubectl_config_path:        Full path to the kubectl config file
 #                               (default: /home/<ansible_user>/.kube/config).
 #   gitea_namespace:            Kubernetes namespace where Gitea is deployed
@@ -112,6 +117,7 @@
          | map(attribute='value.private_ip')
          | first }}
     syncthing_gitops_path: apps/syncthing
+    syncthing_always_local_nets: '{{ lan_cidr }}'
     syncthing_allow_insecure_admin_access: true
     syncthing_default_folder_path: /var/syncthing/data/sync
     syncthing_sync_hostname: 'syncthing-sync.{{ dns_zone }}'

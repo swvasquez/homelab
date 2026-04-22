@@ -54,6 +54,7 @@ metadata:
     app.kubernetes.io/name: syncthing
 spec:
   type: LoadBalancer
+  externalTrafficPolicy: Local
   selector:
     app.kubernetes.io/name: syncthing
   ports:
@@ -115,6 +116,16 @@ spec:
                   sed -i "s|<defaultFolderPath>.*<\/defaultFolderPath>|<defaultFolderPath>${DEFAULT_PATH}<\/defaultFolderPath>|g" "$CONFIG_FILE"
               else
                   sed -i "/<options>/a \        <defaultFolderPath>${DEFAULT_PATH}</defaultFolderPath>" "$CONFIG_FILE"
+              fi
+
+              # Syncthing stores this as repeated singular <alwaysLocalNet>
+              # elements inside <options>, not a plural wrapper.
+              ALWAYS_LOCAL="{{ syncthing_always_local_nets }}"
+              sed -i "/<alwaysLocalNets>.*<\/alwaysLocalNets>/d" "$CONFIG_FILE"
+              if grep -q "<alwaysLocalNet>" "$CONFIG_FILE"; then
+                  sed -i "s|<alwaysLocalNet>.*<\/alwaysLocalNet>|<alwaysLocalNet>${ALWAYS_LOCAL}<\/alwaysLocalNet>|g" "$CONFIG_FILE"
+              else
+                  sed -i "/<options>/a \        <alwaysLocalNet>${ALWAYS_LOCAL}</alwaysLocalNet>" "$CONFIG_FILE"
               fi
 
               # Ensure the default sync directory exists and is group-writable
