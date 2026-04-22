@@ -112,3 +112,36 @@
           - python3-wheel
         state: present
         update_cache: true
+
+    # -------------------------------------------------------------------------
+    # NPU Module Blacklist
+    # The ROCm HSA runtime enumerates all AMD accelerator devices on hsa_init(),
+    # including /dev/accel (the XDNA NPU), which causes EOPNOTSUPP errors at
+    # boot when the amdxdna driver attempts SVA binding. SVA requires IOMMU
+    # PASID support that is not available on this system's IOMMU implementation.
+    # The NPU is not used by ROCm or vLLM, which use the GPU exclusively via
+    # /dev/kfd and /dev/dri.
+    #
+    # This blacklist can be removed once AMD publishes a stable Linux userspace
+    # stack for the NPU (e.g. ONNX Runtime with Vitis AI execution provider) and
+    # the SVA/PASID issues in the amdxdna driver are resolved upstream.
+    # -------------------------------------------------------------------------
+    - name: Blacklist amdxdna module to suppress SVA boot errors
+      ansible.builtin.copy:
+        dest: /etc/modprobe.d/amdxdna-blacklist.conf
+        content: |
+          # amdxdna (AMD NPU) is blacklisted because SVA/PASID is not available
+          # on this system's IOMMU, causing EOPNOTSUPP errors at boot. The NPU
+          # is not used by ROCm or vLLM. Remove this file once AMD provides a
+          # stable Linux NPU userspace stack and SVA issues are resolved upstream.
+          blacklist amdxdna
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Update initramfs
+
+  handlers:
+    - name: Update initramfs
+      ansible.builtin.command:
+        cmd: update-initramfs -u -k all
+      changed_when: true
