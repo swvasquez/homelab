@@ -25,6 +25,7 @@ Ansible Playbooks to configure Ubuntu x86_64 machines and manage a Kubernetes ho
         homelab:
           vars:
             ansible_port: <SSH_PORT>
+            ansible_python_interpreter: <PYTHON_PATH>
           hosts:
             <HOSTNAME>:
               ansible_user: <USER>
