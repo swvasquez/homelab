@@ -1,0 +1,278 @@
+---
+# ==============================================================================
+# Playbook: Enable Pod Security Admission Defaults
+# ==============================================================================
+# Hardens the Kubernetes cluster by configuring the built-in Pod Security
+# Admission controller with cluster-wide defaults, so that every namespace is
+# protected by default without requiring a per-namespace
+# pod-security.kubernetes.io/enforce label. Built-in namespace behavior is
+# permissive (privileged) unless labeled — this playbook inverts that to
+# fail-closed: new namespaces inherit the configured default (baseline) and
+# can only opt down to 'privileged' via explicit exemption in the admission
+# config, or opt up to 'restricted' via a namespace label.
+#
+# This playbook performs the following actions:
+#   - Writes an AdmissionConfiguration file to /etc/kubernetes/admission/ on
+#     the control plane node. The file lists the cluster-wide default PSA
+#     level (baseline) for enforce, warn, and audit, and the exempt
+#     namespaces that legitimately need host access (CNI, CSI, GPU,
+#     node-exporter).
+#   - Idempotently patches the static kube-apiserver.yaml pod manifest to
+#     (a) pass --admission-control-config-file to the apiserver,
+#     (b) mount /etc/kubernetes/admission into the apiserver container, and
+#     (c) declare the corresponding hostPath volume.
+#   - The edits are staged in a single temporary copy of the manifest and
+#     atomically moved into /etc/kubernetes/manifests/ in one step, so the
+#     kubelet never observes a partially-updated manifest.
+#   - Waits for the kube-apiserver to return healthy on /livez before
+#     proceeding, so failures surface immediately.
+#   - Labels the 'default' namespace with the 'restricted' Pod Security
+#     Standard so ad-hoc debug pods dropped there cannot escalate privileges.
+#
+# Run this playbook after bootstrap.yml. It is idempotent — re-running is a
+# no-op when the cluster is already hardened.
+# Playbook order: bootstrap.yml → network.yml → storage.yml → database.yml →
+#                 observability.yml → authentication.yml → security.yml
+#
+# Validation (after the playbook completes, from any machine with kubectl):
+#
+#   kubectl -n immich run pwn --image=alpine --restart=Never \
+#     --overrides='{"spec":{"containers":[{"name":"pwn","image":"alpine",
+#     "securityContext":{"privileged":true}}]}}' -- sleep 60
+#
+# Expected:
+#   Error from server (Forbidden): pods "pwn" is forbidden: violates
+#   PodSecurity "baseline:latest": privileged (container "pwn" must not set
+#   securityContext.privileged=true)
+#
+# Rollback: delete the --admission-control-config-file line, the
+# admission-config volumeMount, and the admission-config volume from
+# /etc/kubernetes/manifests/kube-apiserver.yaml. The kubelet reloads the
+# apiserver automatically.
+#
+# Variables:
+#   admission_config_dir:      Directory on the control plane node where the
+#                              admission configuration file is stored
+#                              (default: /etc/kubernetes/admission).
+#   admission_config_path:     Full path to the admission configuration file
+#                              (default:
+#                              /etc/kubernetes/admission/pod-security.yaml).
+#   apiserver_manifest_path:   Full path to the kube-apiserver static pod
+#                              manifest managed by kubelet
+#                              (default:
+#                              /etc/kubernetes/manifests/kube-apiserver.yaml).
+#   apiserver_manifest_staging_path: Temporary path used to stage edits before
+#                              atomically promoting the file into the manifests
+#                              directory. Must be on the same filesystem as
+#                              apiserver_manifest_path so the final copy is
+#                              atomic and kubelet never observes a partial
+#                              write (default:
+#                              /etc/kubernetes/kube-apiserver.yaml.staging).
+#   apiserver_health_url:      URL polled on the control plane node to confirm
+#                              the apiserver has returned to a healthy state
+#                              after the static pod manifest is updated
+#                              (default: https://127.0.0.1:6443/livez).
+#   apiserver_reload_wait_seconds: Seconds to pause after the manifest is
+#                              updated before polling apiserver health, to
+#                              give the kubelet time to detect the change and
+#                              recreate the pod (default: 30).
+#   apiserver_health_retries:  Number of times to poll apiserver_health_url
+#                              before failing (default: 60).
+#   apiserver_health_delay:    Seconds between apiserver health polls
+#                              (default: 2).
+#   psa_default_level:         Pod Security Standard applied as the
+#                              cluster-wide default for enforce, warn, and
+#                              audit (default: baseline).
+#   psa_exempt_namespaces:     Namespaces exempt from PSA enforcement. These
+#                              host workloads that require host access (CNI,
+#                              CSI, GPU, node-exporter) and cannot run under
+#                              baseline (default: kube-system, kube-public,
+#                              kube-node-lease, longhorn-system, cnpg-system,
+#                              cert-manager, vllm, observability).
+#   psa_restricted_namespaces: Namespaces opted up to the 'restricted' PSA
+#                              profile via an explicit namespace label
+#                              (default: [default]).
+#   kubectl_config_path:       Full path to the kubectl config file used on
+#                              the control plane
+#                              (default: /home/<ansible_user>/.kube/config).
+
+- name: Enable Pod Security Admission defaults
+  hosts: homelab
+  become: true
+  become_exe: sudo.ws
+  vars:
+    admission_config_dir: /etc/kubernetes/admission
+    admission_config_path: /etc/kubernetes/admission/pod-security.yaml
+    apiserver_manifest_path: /etc/kubernetes/manifests/kube-apiserver.yaml
+    apiserver_manifest_staging_path: /etc/kubernetes/kube-apiserver.yaml.staging
+    apiserver_health_url: 'https://127.0.0.1:6443/livez'
+    apiserver_reload_wait_seconds: 30
+    apiserver_health_retries: 60
+    apiserver_health_delay: 2
+    psa_default_level: baseline
+    psa_exempt_namespaces:
+      - kube-system
+      - kube-public
+      - kube-node-lease
+      - longhorn-system
+      - cnpg-system
+      - cert-manager
+      - vllm
+      - observability
+    psa_restricted_namespaces:
+      - default
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Admission Configuration File
+    # -------------------------------------------------------------------------
+    # Writes the AdmissionConfiguration YAML consumed by the apiserver via
+    # --admission-control-config-file. The file declares the cluster-wide PSA
+    # default profile and the namespace exemption list. The directory is
+    # mounted read-only into the apiserver container.
+    # -------------------------------------------------------------------------
+    - name: Create admission configuration directory on control plane
+      ansible.builtin.file:
+        path: '{{ admission_config_dir }}'
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      when: control_plane | default(false)
+
+    - name: Write Pod Security Admission configuration file
+      ansible.builtin.template:
+        src: pod-security-admission.yml.j2
+        dest: '{{ admission_config_path }}'
+        owner: root
+        group: root
+        mode: '0600'
+      when: control_plane | default(false)
+
+    # -------------------------------------------------------------------------
+    # kube-apiserver Static Pod Manifest Patching
+    # -------------------------------------------------------------------------
+    # Idempotently adds three elements to the apiserver static pod manifest:
+    #   - the --admission-control-config-file command flag
+    #   - a volumeMount exposing admission_config_dir inside the container
+    #   - a hostPath volume backing the above mount
+    #
+    # All edits are staged in a temporary copy of the manifest and then
+    # atomically promoted into /etc/kubernetes/manifests/ in a single copy
+    # step. Because the staging path is on the same filesystem as the target,
+    # the final copy performs a rename(2) under the hood and the kubelet
+    # never observes a partially-updated manifest.
+    # -------------------------------------------------------------------------
+    - name: Stage a working copy of the kube-apiserver manifest
+      ansible.builtin.copy:
+        src: '{{ apiserver_manifest_path }}'
+        dest: '{{ apiserver_manifest_staging_path }}'
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0600'
+      when: bootstrap_node | default(false)
+      changed_when: false
+
+    - name: Ensure admission-control-config-file flag is present in staged manifest
+      ansible.builtin.lineinfile:
+        path: '{{ apiserver_manifest_staging_path }}'
+        regexp: '^    - --admission-control-config-file='
+        line: '    - --admission-control-config-file={{ admission_config_path }}'
+        insertafter: '^    - --allow-privileged=true$'
+        state: present
+      when: bootstrap_node | default(false)
+
+    - name: Ensure PSA volumeMount is present in staged manifest
+      ansible.builtin.blockinfile:
+        path: '{{ apiserver_manifest_staging_path }}'
+        marker: '    # {mark} ANSIBLE MANAGED: pod-security admission volumeMount'
+        insertafter: '^    volumeMounts:$'
+        block: |2
+              - mountPath: {{ admission_config_dir }}
+                name: admission-config
+                readOnly: true
+      when: bootstrap_node | default(false)
+
+    - name: Ensure PSA hostPath volume is present in staged manifest
+      ansible.builtin.blockinfile:
+        path: '{{ apiserver_manifest_staging_path }}'
+        marker: '  # {mark} ANSIBLE MANAGED: pod-security admission volume'
+        insertafter: '^  volumes:$'
+        block: |2
+            - hostPath:
+                path: {{ admission_config_dir }}
+                type: DirectoryOrCreate
+              name: admission-config
+      when: bootstrap_node | default(false)
+
+    - name: Promote staged manifest atomically into the kubelet manifests directory
+      ansible.builtin.copy:
+        src: '{{ apiserver_manifest_staging_path }}'
+        dest: '{{ apiserver_manifest_path }}'
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0600'
+      register: apiserver_manifest_promote
+      when: bootstrap_node | default(false)
+
+    - name: Remove staged manifest
+      ansible.builtin.file:
+        path: '{{ apiserver_manifest_staging_path }}'
+        state: absent
+      when: bootstrap_node | default(false)
+      changed_when: false
+
+    # -------------------------------------------------------------------------
+    # Apiserver Health Verification
+    # -------------------------------------------------------------------------
+    # After a real manifest change, kubelet detects the modification on its
+    # next sync (default file-check-frequency is 20 seconds) and recreates
+    # the apiserver static pod. We pause long enough to guarantee the reload
+    # window has elapsed, then poll /livez on the control plane until the new
+    # apiserver reports healthy. A misconfigured admission file would
+    # crashloop the apiserver and surface here rather than silently.
+    # -------------------------------------------------------------------------
+    - name: Pause to allow kubelet to detect the updated kube-apiserver manifest
+      ansible.builtin.pause:
+        seconds: '{{ apiserver_reload_wait_seconds }}'
+      when:
+        - bootstrap_node | default(false)
+        - apiserver_manifest_promote.changed
+
+    - name: Wait for kube-apiserver /livez to report healthy
+      ansible.builtin.uri:
+        url: '{{ apiserver_health_url }}'
+        validate_certs: false
+        status_code: 200
+      register: apiserver_livez
+      until: apiserver_livez.status == 200
+      retries: '{{ apiserver_health_retries }}'
+      delay: '{{ apiserver_health_delay }}'
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Restricted Namespace Labels
+    # -------------------------------------------------------------------------
+    # The cluster-wide default applies the 'baseline' profile to every
+    # namespace that is not exempt. A short list of namespaces is opted up to
+    # 'restricted' via an explicit namespace label, which takes precedence
+    # over the cluster default. The 'default' namespace is the primary target
+    # — it is the common landing zone for ad-hoc 'kubectl run' / 'kubectl
+    # debug' pods, so hardening it blocks the easiest privilege-escalation
+    # path for anyone who happens to have kubeconfig access.
+    # -------------------------------------------------------------------------
+    - name: Label namespaces with the restricted Pod Security profile
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          label --overwrite namespace {{ item }}
+          pod-security.kubernetes.io/enforce=restricted
+          pod-security.kubernetes.io/warn=restricted
+          pod-security.kubernetes.io/audit=restricted
+      register: psa_label_result
+      changed_when: "'labeled' in psa_label_result.stdout"
+      loop: '{{ psa_restricted_namespaces }}'
+      when: bootstrap_node | default(false)

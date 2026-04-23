@@ -1,0 +1,41 @@
+{#
+  Pod Security Admission configuration for the kube-apiserver. Sets the
+  cluster-wide default Pod Security Standard for enforce, warn, and audit
+  modes so that every namespace is protected by default without requiring a
+  pod-security.kubernetes.io/enforce label. Namespaces listed under
+  exemptions.namespaces are skipped entirely (used for workloads that need
+  host access — CNI, CSI, GPU, node-exporter, etc.). Per-namespace labels
+  still override the cluster default, allowing a namespace to opt up to
+  'restricted' or down to 'privileged' when needed.
+
+  Written by playbooks/cluster/security.yml to the path referenced by
+  kube-apiserver's --admission-control-config-file flag.
+
+  Variables:
+    psa_default_level:      Pod Security Standard applied as the cluster-wide
+                            default for enforce, warn, and audit modes
+                            (e.g. baseline).
+    psa_exempt_namespaces:  List of namespace names exempt from PSA
+                            enforcement (e.g. kube-system, longhorn-system).
+#}
+apiVersion: apiserver.config.k8s.io/v1
+kind: AdmissionConfiguration
+plugins:
+  - name: PodSecurity
+    configuration:
+      apiVersion: pod-security.admission.config.k8s.io/v1
+      kind: PodSecurityConfiguration
+      defaults:
+        enforce: '{{ psa_default_level }}'
+        enforce-version: latest
+        warn: '{{ psa_default_level }}'
+        warn-version: latest
+        audit: '{{ psa_default_level }}'
+        audit-version: latest
+      exemptions:
+        usernames: []
+        runtimeClasses: []
+        namespaces:
+{% for ns in psa_exempt_namespaces %}
+          - '{{ ns }}'
+{% endfor %}
