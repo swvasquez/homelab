@@ -1,0 +1,66 @@
+# shellcheck disable=SC2148
+
+# Commands that should be applied only for interactive shells.
+[[ $- == *i* ]] || return
+
+HISTFILESIZE=100000
+HISTSIZE=10000
+
+shopt -s histappend
+shopt -s checkwinsize
+shopt -s extglob
+shopt -s globstar
+shopt -s checkjobs
+
+# shellcheck disable=SC1091
+[[ -f ${HOME}/.bash_aliases ]] && . "${HOME}/.bash_aliases"
+
+# ------------------------------------------------------------------------------
+# Editing mode configuration
+# ------------------------------------------------------------------------------
+
+# Vi editing mode
+set -o vi
+
+# Visually indicate if in insert or normal (command) mode
+bind 'set show-mode-in-prompt on'
+bind 'set vi-ins-mode-string \1\e[6 q\2'
+bind 'set vi-cmd-mode-string \1\e[2 q\2'
+
+# ------------------------------------------------------------------------------
+# Shell integrations
+# ------------------------------------------------------------------------------
+
+# Atuin
+[[ -f {{ bash_preexec_dest }} ]] && source {{ bash_preexec_dest }}
+eval "$(atuin init bash)"
+
+# Zoxide
+eval "$(zoxide init bash)"
+
+# ------------------------------------------------------------------------------
+# User defined functions
+# ------------------------------------------------------------------------------
+
+# Activates the python virtual environment if it exists in the current directory
+activate() {
+	if [[ -f ".venv/bin/activate" ]]; then
+		source .venv/bin/activate
+	else
+		echo "No .venv found in $(pwd)"
+	fi
+}
+
+# Wraps yazi to change to the last visited directory on exit via 'q'
+# https://yazi-rs.github.io/docs/quick-start/#shell-wrapper
+y() {
+	local tempfile
+	tempfile="$(mktemp -t tmp.XXXXXX)" || return
+
+	command yazi "$@" --cwd-file="$tempfile"
+
+	if [[ -s "$tempfile" ]] && [[ "$(cat -- "$tempfile")" != "$PWD" ]]; then
+		cd -- "$(cat "$tempfile")" || return
+	fi
+	command rm -f -- "$tempfile" 2>/dev/null
+}
