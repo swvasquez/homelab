@@ -63,6 +63,8 @@
 #                               Read from group_vars.
 #   nfs_group:                  Name of the NFS users group. Read from group_vars.
 #   nfs_group_gid:              GID of the NFS users group. Read from group_vars.
+#   nonroot_uid:                Non-root UID the Syncthing pod runs as.
+#                               Read from group_vars.
 #   nfs_server_ip:              IP address of the NFS server, derived from
 #                               inventory hostvars at runtime.
 #   syncthing_gitops_path:      Path within the gitops repository where the

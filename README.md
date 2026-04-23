@@ -52,6 +52,7 @@ Ansible Playbooks to configure Ubuntu x86_64 machines and manage a Kubernetes ho
     nfs_k8s_path: <NFS_K8S_PATH>
     nfs_group: <NFS_GROUP>
     nfs_group_gid: <NFS_GROUP_GID>
+    nonroot_uid: <NONROOT_UID>
     lb_ip_pool_cidr: <CIDR>
     lan_cidr: <CIDR>
     router_private_ip: <ROUTER_IP>

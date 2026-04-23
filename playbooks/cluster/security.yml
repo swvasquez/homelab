@@ -121,6 +121,7 @@
       - observability
     psa_restricted_namespaces:
       - default
+      - syncthing
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
 
   tasks:
