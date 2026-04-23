@@ -206,7 +206,7 @@ just lint playbooks/cluster/bootstrap.yml
   just install services <SERVICE>
   just install cluster authentication
   ```
-- **Pod Security Admission**: `cluster/security.yml` configures the kube-apiserver with a cluster-wide default Pod Security Standard (`baseline`) so every namespace is protected by default. Exempt namespaces (e.g. `kube-system`, `longhorn-system`, `vllm`, `observability`) and namespaces opted up to the `restricted` profile (e.g. `default`) are listed in the playbook `vars`. The playbook patches the static `kube-apiserver.yaml` pod manifest; the kubelet reloads the apiserver automatically. Run after `cluster/authentication.yml`:
+- **Pod Security Admission**: `cluster/security.yml` configures the kube-apiserver with a cluster-wide default Pod Security Standard (`baseline`) so every namespace is protected by default. Exempt namespaces (e.g. `kube-system`, `longhorn-system`, `vllm`, `observability`) and namespaces opted up to the `restricted` profile (e.g. `default`, `syncthing`, `gitea`) are listed in the playbook `vars`. The playbook patches the static `kube-apiserver.yaml` pod manifest; the kubelet reloads the apiserver automatically. Run after `cluster/authentication.yml`:
   ```sh
   just install cluster security
   ```

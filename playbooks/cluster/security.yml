@@ -122,6 +122,7 @@
     psa_restricted_namespaces:
       - default
       - syncthing
+      - gitea
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
 
   tasks:

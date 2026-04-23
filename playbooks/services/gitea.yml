@@ -67,6 +67,14 @@
 #                              holds the cluster CA certificate. Used to build
 #                              a combined CA bundle for Gitea
 #                              (default: wildcard-tls).
+#   nonroot_uid:               Non-root UID and GID under which the Gitea
+#                              Deployment, its preExtraInitContainer, and the
+#                              Valkey cluster pods run. Supplied to the Helm
+#                              chart via runAsUser/runAsGroup/fsGroup in the
+#                              Helm values. The CloudNativePG postgres image
+#                              ships with its own baked-in UID/GID (26), so the
+#                              CNPG Cluster is not remapped. Read from
+#                              group_vars.
 
 - name: Install Gitea
   hosts: homelab
