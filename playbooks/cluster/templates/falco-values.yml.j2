@@ -1,0 +1,139 @@
+# ==============================================================================
+# Falco Helm Values
+# ==============================================================================
+# Configures the falcosecurity/falco Helm chart for homelab deployment.
+#
+# Driver: modern_ebpf — uses CO-RE (Compile Once, Run Everywhere) so no kernel
+# module or separate eBPF probe download is required. Requires kernel 5.8+ with
+# BTF support. Requires chart >= 8.x for kernel 6.17+ compatibility.
+#
+# Falcosidekick is deployed as a subchart and forwards alerts to Alertmanager.
+# The chart automatically configures Falco's http_output and json_output when
+# falcosidekick.enabled is true.
+#
+# Custom rules (homelab_rules.yaml) extend the default ruleset with detections
+# relevant to the homelab threat model:
+#   - Shell in a homelab service container (kubectl exec sessions)
+#   - Kubeconfig file read from inside a container (credential theft)
+#   - Unexpected process in a CNPG database pod (database compromise)
+#   - Crypto mining heuristics (stratum protocol port 3333/14444)
+
+driver:
+  kind: modern_ebpf
+
+falco:
+  log_level: info
+
+falcosidekick:
+  enabled: true
+  webui:
+    enabled: true
+    disableauth: true
+  config:
+    alertmanager:
+      hostport: '{{ falco_alertmanager_hostport }}'
+      endpoint: /api/v2/alerts
+      minimumpriority: warning
+
+customRules:
+  homelab_rules.yaml: |-
+    - rule: Read sensitive file untrusted
+      condition: >
+        open_read
+        and sensitive_files
+        and proc_name_exists
+        {% if falco_sensitive_file_container_only %}and container{% endif %}
+        and not proc.name in (user_mgmt_binaries, userexec_binaries, package_mgmt_binaries,
+         cron_binaries, read_sensitive_file_binaries, shell_binaries, hids_binaries,
+         vpn_binaries, mail_config_binaries, nomachine_binaries, sshkit_script_binaries,
+         in.proftpd, mandb, salt-call, salt-minion, postgres_mgmt_binaries,
+         google_oslogin_)
+        and not cmp_cp_by_passwd
+        and not ansible_running_python
+        and not run_by_qualys
+        and not run_by_chef
+        and not run_by_google_accounts_daemon
+        and not user_read_sensitive_file_conditions
+        and not mandb_postinst
+        and not perl_running_plesk
+        and not perl_running_updmap
+        and not veritas_driver_script
+        and not perl_running_centrifydc
+        and not runuser_reading_pam
+        and not linux_bench_reading_etc_shadow
+      override:
+        condition: replace
+
+    - rule: Shell spawned in homelab service container
+      desc: >
+        A shell was spawned inside a homelab service container. This typically
+        indicates a kubectl exec session or a compromised workload.
+      condition: >
+        spawned_process and
+        shell_procs and
+        container and
+        k8s.ns.name in (gitea, syncthing, vaultwarden, immich, jellyfin,
+                        plex, openwebui, firefly, argocd) and
+        not container.image.repository contains 'valkey' and
+        not container.image.repository contains 'redis'
+      output: >
+        Shell spawned in homelab service container
+        (user=%user.name cmd=%proc.cmdline pid=%proc.pid
+        container=%container.name image=%container.image.repository
+        ns=%k8s.ns.name pod=%k8s.pod.name)
+      priority: WARNING
+      tags: [homelab, shell, container]
+
+    - rule: Kubeconfig file read in container
+      desc: >
+        A process inside a container read a kubeconfig file. This may indicate
+        an attempt to steal cluster credentials and pivot to the control plane.
+      condition: >
+        open_read and
+        container and
+        (fd.name glob '/root/.kube/*' or
+         fd.name glob '/home/*/.kube/*' or
+         fd.name = '/etc/kubernetes/admin.conf')
+      output: >
+        Kubeconfig file read inside container
+        (user=%user.name cmd=%proc.cmdline file=%fd.name
+        container=%container.name image=%container.image.repository
+        ns=%k8s.ns.name pod=%k8s.pod.name)
+      priority: WARNING
+      tags: [homelab, credentials, kubernetes]
+
+    - rule: Unexpected process in database pod
+      desc: >
+        A process other than the expected postgres executables was spawned inside
+        a CNPG database pod, which may indicate a compromise or injection attack.
+      condition: >
+        spawned_process and
+        container and
+        k8s.ns.name = cnpg-system and
+        not proc.name in (postgres, pg_ctl, pg_dump, pg_restore,
+                          pg_basebackup, psql, sh, bash, manager,
+                          bootstrap, initdb)
+      output: >
+        Unexpected process in database pod
+        (user=%user.name cmd=%proc.cmdline pid=%proc.pid
+        container=%container.name image=%container.image.repository
+        pod=%k8s.pod.name)
+      priority: ERROR
+      tags: [homelab, database, anomaly]
+
+    - rule: Crypto mining network activity
+      desc: >
+        A container attempted a network connection on a port commonly used by
+        crypto mining pools (stratum protocol). This is a strong indicator of
+        a compromised workload being used for resource abuse.
+      condition: >
+        outbound and
+        container and
+        fd.rport in (3333, 4444, 5555, 7777, 14444, 45700)
+      output: >
+        Possible crypto mining outbound connection
+        (user=%user.name cmd=%proc.cmdline connection=%fd.name
+        container=%container.name image=%container.image.repository
+        ns=%k8s.ns.name pod=%k8s.pod.name)
+      priority: CRITICAL
+      tags: [homelab, cryptomining, network]

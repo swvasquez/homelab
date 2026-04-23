@@ -86,6 +86,10 @@
 #                                (default: jellyfin).
 #   jellyfin_hostname:           FQDN for the Jellyfin UI, derived from
 #                                dns_zone (default: jellyfin.<dns_zone>).
+#   falco_namespace:             Kubernetes namespace for Falco and
+#                                Falcosidekick (default: falco).
+#   falco_ui_hostname:           FQDN for the Falcosidekick web UI, derived
+#                                from dns_zone (default: falco.<dns_zone>).
 #   kubectl_config_path:         Full path to the kubectl config file
 #                                (default: /home/<ansible_user>/.kube/config).
 #   authentik_bootstrap_token:   API token auto-generated on first run and
@@ -145,6 +149,8 @@
     vaultwarden_hostname: 'vault.{{ dns_zone }}'
     jellyfin_namespace: jellyfin
     jellyfin_hostname: 'jellyfin.{{ dns_zone }}'
+    falco_namespace: falco
+    falco_ui_hostname: 'falco.{{ dns_zone }}'
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
     protected_httproutes:
       - name: hubble-ui
@@ -231,6 +237,12 @@
         backend_name: jellyfin
         backend_ns: '{{ jellyfin_namespace }}'
         backend_port: 8096
+      - name: falco-ui
+        route_ns: '{{ falco_namespace }}'
+        hostname: '{{ falco_ui_hostname }}'
+        backend_name: falco-falcosidekick-ui
+        backend_ns: '{{ falco_namespace }}'
+        backend_port: 2802
 
   tasks:
     # -------------------------------------------------------------------------
