@@ -111,7 +111,7 @@
 #                              (default: 2).
 #   psa_default_level:         Pod Security Standard applied as the
 #                              cluster-wide default for enforce, warn, and
-#                              audit (default: baseline).
+#                              audit (default: restricted).
 #   psa_exempt_namespaces:     Namespaces exempt from PSA enforcement. These
 #                              host workloads that require host access (CNI,
 #                              CSI, GPU, node-exporter, Falco eBPF) and cannot
@@ -161,7 +161,7 @@
     apiserver_reload_wait_seconds: 30
     apiserver_health_retries: 60
     apiserver_health_delay: 2
-    psa_default_level: baseline
+    psa_default_level: restricted
     psa_exempt_namespaces:
       - kube-system
       - kube-public
@@ -216,10 +216,18 @@
     # -------------------------------------------------------------------------
     # kube-apiserver Static Pod Manifest Patching
     # -------------------------------------------------------------------------
-    # Idempotently adds three elements to the apiserver static pod manifest:
+    # Idempotently adds four elements to the apiserver static pod manifest:
     #   - the --admission-control-config-file command flag
     #   - a volumeMount exposing admission_config_dir inside the container
     #   - a hostPath volume backing the above mount
+    #   - an annotation stamping the admission config file's SHA-256 so the
+    #     manifest's pod hash changes whenever the admission config contents
+    #     change. Kubelet compares pod hashes and only recreates the apiserver
+    #     when the hash differs, so without this stamp a pure content change
+    #     in the admission config (e.g. flipping psa_default_level from
+    #     baseline to restricted) leaves the running apiserver on its stale
+    #     in-memory config until an unrelated manifest edit eventually
+    #     triggers a restart.
     #
     # All edits are staged in a temporary copy of the manifest and then
     # atomically promoted into /etc/kubernetes/manifests/ in a single copy
@@ -227,6 +235,13 @@
     # the final copy performs a rename(2) under the hood and the kubelet
     # never observes a partially-updated manifest.
     # -------------------------------------------------------------------------
+    - name: Read admission config file checksum for manifest annotation
+      ansible.builtin.stat:
+        path: '{{ admission_config_path }}'
+        checksum_algorithm: sha256
+      register: admission_config_stat
+      when: bootstrap_node | default(false)
+
     - name: Stage a working copy of the kube-apiserver manifest
       ansible.builtin.copy:
         src: '{{ apiserver_manifest_path }}'
@@ -268,6 +283,15 @@
                 path: {{ admission_config_dir }}
                 type: DirectoryOrCreate
               name: admission-config
+      when: bootstrap_node | default(false)
+
+    - name: Stamp admission config SHA-256 annotation into staged manifest
+      ansible.builtin.lineinfile:
+        path: '{{ apiserver_manifest_staging_path }}'
+        regexp: '^    homelab\.internal/psa-admission-config-sha256: '
+        line: '    homelab.internal/psa-admission-config-sha256: "{{ admission_config_stat.stat.checksum }}"'
+        insertafter: '^  annotations:$'
+        state: present
       when: bootstrap_node | default(false)
 
     - name: Promote staged manifest atomically into the kubelet manifests directory
