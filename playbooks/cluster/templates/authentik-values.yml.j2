@@ -14,6 +14,21 @@
   AUTHENTIK_BOOTSTRAP_EMAIL. On subsequent runs this value is ignored by
   Authentik if the account already exists.
 
+  The namespace runs under Pod Security Admission 'restricted'. The server and
+  worker pods each carry a full restricted securityContext via the chart's
+  per-component `securityContext` (pod level) and `containerSecurityContext`
+  (container level) keys, and run as nonroot_uid (65532). The authentik image
+  declares `USER authentik` (UID 1000) in its Dockerfile, but Kubernetes cannot
+  verify `runAsNonRoot` against a USER name alone — a numeric runAsUser is
+  required, so it is set explicitly here. If a future image change makes UID
+  65532 incompatible (e.g. hardcoded writes to /authentik paths owned by
+  UID 1000), fall back to runAsUser/runAsGroup/fsGroup = 1000 to match the
+  image's baked-in user; PSA restricted accepts either UID because it checks
+  runAsNonRoot, not a specific value.
+
+  The CloudNativePG authentik-db pod is not configured here — it lives on the
+  operator's own defaults (UID 26) and is already restricted-compliant.
+
   Variables:
     authentik_secret_key:        Django secret key for Authentik. Read from the
                                  authentik-credentials Kubernetes Secret.
@@ -25,6 +40,8 @@
                                  Read from group_vars.
     bootstrap_admin_password:    Initial password for the default admin account.
                                  Read from group_vars.
+    nonroot_uid:                 Shared non-root UID for the authentik server
+                                 and worker pods. Read from group_vars.
 #}
 authentik:
   secret_key: '{{ authentik_secret_key }}'
@@ -37,6 +54,34 @@ authentik:
   bootstrap_token: '{{ authentik_bootstrap_token }}'
   bootstrap_email: '{{ admin_email }}'
   bootstrap_password: '{{ bootstrap_admin_password }}'
+
+server:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: {{ nonroot_uid }}
+    runAsGroup: {{ nonroot_uid }}
+    fsGroup: {{ nonroot_uid }}
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+
+worker:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: {{ nonroot_uid }}
+    runAsGroup: {{ nonroot_uid }}
+    fsGroup: {{ nonroot_uid }}
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
 
 postgresql:
   enabled: false

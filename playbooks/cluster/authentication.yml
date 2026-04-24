@@ -111,6 +111,8 @@
 #                                PVC (default: 8Gi).
 #   authentik_storage_class:     Kubernetes StorageClass for the database PVC
 #                                (default: longhorn).
+#   nonroot_uid:                 Shared non-root UID for the authentik server
+#                                and worker pods. Read from group_vars.
 
 - name: Install Authentik authentication
   hosts: homelab
