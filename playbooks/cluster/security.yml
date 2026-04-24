@@ -182,6 +182,7 @@
       - jellyfin
       - immich
       - authentik
+      - argocd
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
 
   tasks:

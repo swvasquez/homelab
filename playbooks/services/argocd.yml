@@ -82,6 +82,10 @@
 #                              use as its GitOps source (default: gitops).
 #                              A webhook is also created on this repository
 #                              to trigger immediate ArgoCD syncs on push.
+#   nonroot_uid:               Shared non-root UID applied to every ArgoCD
+#                              pod via the chart's global.securityContext
+#                              (and separately via redis.securityContext).
+#                              Read from group_vars.
 
 - name: Install ArgoCD
   hosts: homelab
