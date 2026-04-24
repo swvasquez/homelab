@@ -12,7 +12,12 @@
 #   - Disables swap (runtime and permanently via /etc/fstab), a requirement for kubelet.
 #   - Installs and enables the cri-dockerd bridge for Docker CRI compatibility.
 #   - Installs kubelet, kubeadm, and kubectl.
-#   - Configures the kubelet cgroup driver to match Docker (systemd).
+#   - Configures the kubelet cgroup driver to match Docker (systemd) and
+#     enables the seccomp default so every container without an explicit
+#     seccompProfile runs under the container runtime's RuntimeDefault
+#     profile instead of Unconfined. Existing containers keep their current
+#     profile until recreated; Pod Security Admission restricted namespaces
+#     are unaffected because their pods already declare RuntimeDefault.
 #   - Places a hold on installed packages to prevent accidental upgrades.
 #   - Starts and enables the kubelet service.
 #   - Installs Helm via the official APT repository.
@@ -326,11 +331,12 @@
         selection: hold
       loop: '{{ kube_packages }}'
 
-    - name: Configure kubelet cgroup driver to use systemd
+    - name: Configure kubelet extra args (cgroup driver and seccomp default)
       ansible.builtin.copy:
         dest: /etc/default/kubelet
-        content: 'KUBELET_EXTRA_ARGS=--cgroup-driver=systemd'
+        content: 'KUBELET_EXTRA_ARGS=--cgroup-driver=systemd --seccomp-default=true'
         mode: '0644'
+      notify: restart kubelet
 
     - name: Write systemd drop-in to order kubelet after cri-docker
       ansible.builtin.copy:
@@ -537,3 +543,32 @@
       ansible.builtin.command:
         cmd: update-grub
       changed_when: true
+
+    # Restarts kubelet on a single node at a time (throttle: 1) and waits
+    # for the kubelet secure port (10250) to accept connections before
+    # moving on to the next node. Running pods are not terminated by a
+    # kubelet restart, and the kernel-level seccomp filter on any
+    # already-created container does not change — the new default only
+    # applies to containers created after kubelet returns. Pod Security
+    # Admission restricted namespaces are unaffected because their pods
+    # already declare RuntimeDefault explicitly.
+    #
+    # Both handlers listen on the 'restart kubelet' topic so that the
+    # wait_for verification always runs in the same throttled pass as the
+    # restart itself, keeping the rolling-restart invariant intact.
+    - name: Restart kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+        daemon_reload: true
+      throttle: 1
+      listen: restart kubelet
+
+    - name: Wait for kubelet port to accept connections after restart
+      ansible.builtin.wait_for:
+        port: 10250
+        host: '{{ ansible_default_ipv4.address }}'
+        delay: 5
+        timeout: 120
+      throttle: 1
+      listen: restart kubelet
