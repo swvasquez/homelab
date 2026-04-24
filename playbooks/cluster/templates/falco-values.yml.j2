@@ -124,12 +124,16 @@ customRules:
     - rule: Crypto mining network activity
       desc: >
         A container attempted a network connection on a port commonly used by
-        crypto mining pools (stratum protocol). This is a strong indicator of
-        a compromised workload being used for resource abuse.
+        crypto mining pools. Ports 3333, 4444, 5555, 7777, and 14444 are
+        standard Stratum protocol ports used by pools for Monero, Ethereum,
+        and similar coins. Port 45700 is associated with XMRig and similar
+        mining software. Loopback destinations are excluded to avoid false
+        positives from legitimate health checks (e.g. Longhorn, Traefik).
       condition: >
         outbound and
         container and
-        fd.rport in (3333, 4444, 5555, 7777, 14444, 45700)
+        fd.rport in (3333, 4444, 5555, 7777, 14444, 45700) and
+        not fd.rip in ("127.0.0.1", "::1")
       output: >
         Possible crypto mining outbound connection
         (user=%user.name cmd=%proc.cmdline connection=%fd.name
