@@ -10,10 +10,18 @@
   control is handled entirely by Traefik ForwardAuth backed by Authentik, which
   gates all requests before they reach the Open WebUI pod.
 
+  The pod runs as nonroot_uid (65532) under PSA restricted. The backend binds
+  to port 8080 by default (PORT env var), so no NET_BIND_SERVICE is required.
+  The podSecurityContext applies to both the copy-app-data init container and
+  the main container — the init container copies image data to a fresh PVC as
+  UID 65532, so all written files are owned correctly on first boot.
+
   Variables:
     openwebui_storage_class:        Kubernetes StorageClass for the data PVC.
     openwebui_storage_size:         Size of the data PVC.
     vllm_api_port:                  Port of the vLLM API endpoint.
+    nonroot_uid:                    Shared non-root UID/GID for pod and container
+                                    securityContext. Read from group_vars.
 #}
 ollama:
   enabled: false
@@ -36,6 +44,20 @@ extraEnvVars:
         key: secret-key
   - name: WEBUI_AUTH
     value: 'false'
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: {{ nonroot_uid }}
+  runAsGroup: {{ nonroot_uid }}
+  fsGroup: {{ nonroot_uid }}
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
 
 persistence:
   enabled: true

@@ -58,6 +58,8 @@
 #                                (default: gitops).
 #   argocd_namespace:            Kubernetes namespace where ArgoCD is deployed
 #                                (default: argocd).
+#   nonroot_uid:                 Shared non-root UID/GID for pod and container
+#                                securityContext. Read from group_vars (default: 65532).
 
 - name: Deploy Open WebUI via ArgoCD GitOps
   hosts: homelab

@@ -178,6 +178,8 @@
       - gitea
       - vaultwarden
       - firefly-iii
+      - open-webui
+      - jellyfin
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
 
   tasks:
