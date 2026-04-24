@@ -69,6 +69,8 @@
 #                                (default: gitops).
 #   argocd_namespace:            Kubernetes namespace where ArgoCD is deployed
 #                                (default: argocd).
+#   nonroot_uid:                 Non-root UID for the Jellyfin pod. Read from
+#                                group_vars.
 
 - name: Deploy Jellyfin Media Server via ArgoCD GitOps
   hosts: homelab

@@ -7,8 +7,11 @@
   jellyfin.yml as a static NFS-backed PersistentVolume and referenced here via
   existingClaim so the Helm chart does not manage its lifecycle.
 
-  The pod runs with supplementalGroups set to nfs_group_gid so the Jellyfin process
-  has write access to the NFS export directory (owned by root:nfs_users, mode 2775).
+  The pod runs as nonroot_uid with its primary GID set to nfs_group_gid so the
+  Jellyfin process can write to the NFS export directory (owned by root:nfs_users,
+  mode 2775). The NFSv4 server uses sec=sys and does not honor supplemental groups for
+  permission checks, so nfs_group_gid must be the process's primary GID, not a
+  supplemental group.
 
   Jellyfin's built-in authentication is not used for initial access. All requests are
   gated by Traefik ForwardAuth backed by Authentik before reaching the Jellyfin pod.
@@ -19,10 +22,25 @@
     jellyfin_config_storage_size: Size of the PVC for Jellyfin configuration and metadata.
     jellyfin_storage_class:       Kubernetes StorageClass for the config PVC.
     nfs_group_gid:                GID of the nfs_users group on the NFS server.
+    nonroot_uid:                  Non-root UID the pod runs as.
 #}
 podSecurityContext:
-  supplementalGroups:
-    - {{ nfs_group_gid }}
+  runAsNonRoot: true
+  runAsUser: {{ nonroot_uid }}
+  # Primary GID is the shared NFS users group rather than nonroot_uid because this pod
+  # writes to an NFS-backed PVC (/media). The NFSv4 server does not honor supplemental
+  # groups for permission checks — only the process's primary GID matches the NFS
+  # export's group ownership, so runAsGroup must equal nfs_group_gid.
+  runAsGroup: {{ nfs_group_gid }}
+  fsGroup: {{ nfs_group_gid }}
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
 
 persistence:
   config:
