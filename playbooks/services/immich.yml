@@ -23,8 +23,13 @@
 # The Immich photo library is backed by the homelab NFS share under
 # nfs_k8s_path/immich, exposed through a static PersistentVolume and
 # PersistentVolumeClaim applied before ArgoCD syncs the Helm release. The
-# Immich pod runs with supplementalGroups set to nfs_group_gid so it has write
-# access to the NFS export directory (owned by root:nfs_users, mode 2775).
+# server pod runs as nonroot_uid with its primary GID set to nfs_group_gid so
+# the Immich process has write access to the NFS export directory (owned by
+# root:nfs_users, mode 2775). The NFSv4 server uses sec=sys and does not honor
+# supplemental groups for permission checks, so nfs_group_gid must be the
+# process's primary GID rather than a supplemental group. The machine-learning
+# and valkey pods have no NFS dependency and run as nonroot_uid for both
+# primary UID and GID.
 #
 # Database credentials and the application secret key are generated on first
 # run and stored in a Kubernetes Secret named immich-credentials in the immich
@@ -116,6 +121,9 @@
 #                               (default: gitops).
 #   argocd_namespace:           Kubernetes namespace where ArgoCD is deployed
 #                               (default: argocd).
+#   nonroot_uid:                Shared non-root UID for the machine-learning
+#                               and valkey pods, and the UID for the server
+#                               pod. Read from group_vars.
 
 - name: Deploy Immich via ArgoCD GitOps
   hosts: homelab

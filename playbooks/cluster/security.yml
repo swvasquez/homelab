@@ -180,6 +180,7 @@
       - firefly-iii
       - open-webui
       - jellyfin
+      - immich
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
 
   tasks:

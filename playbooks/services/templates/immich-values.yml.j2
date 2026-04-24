@@ -12,9 +12,32 @@
 
   The photo library is pre-created by immich.yml as a static NFS-backed
   PersistentVolume and referenced here via existingClaim so the Helm chart
-  does not manage its lifecycle. The server pod runs with supplementalGroups
-  set to nfs_group_gid so the Immich process has write access to the NFS
-  export directory (owned by root:nfs_users, mode 2775).
+  does not manage its lifecycle.
+
+  The namespace runs under Pod Security Admission 'restricted'. All three
+  Immich components (server, machine-learning, valkey) are configured with a
+  restricted securityContext using the bjw-s app-template chart's
+  defaultPodOptions.securityContext (pod level) and
+  controllers.main.containers.main.securityContext (container level) keys.
+
+  The server pod uses nfs_group_gid as its primary GID rather than nonroot_uid.
+  The NFSv4 server (sec=sys) does not honor supplemental groups for permission
+  checks — only the process's primary GID matches the NFS export's group
+  ownership, so runAsGroup must equal nfs_group_gid for writes to succeed
+  against the library PVC (owned by root:nfs_users, mode 2775). This is the
+  same pattern used by Syncthing and Jellyfin.
+
+  The machine-learning and valkey pods have no NFS dependency and run with
+  nonroot_uid as both primary UID and GID. If Valkey fails to start because
+  its existing dump.rdb on the PVC is owned by the image's built-in user
+  (UID 999 / GID 1000), fall back to runAsUser 999, runAsGroup 1000, and
+  fsGroup 999 — the existing PVC data is already owned by that UID so no
+  recreation is required. If the machine-learning container crashes on model
+  load or cache write, disable it by setting machine-learning.enabled to
+  false until the issue is investigated.
+
+  The machine-learning cache is an emptyDir (not a PVC) and is re-populated
+  on first pod start (~2 GB of model downloads).
 
   Note: The OIDC client ID and client secret are stored in this file which is
   committed to the gitops repository. Ensure the repository is private. For
@@ -32,6 +55,8 @@
     immich_storage_class:      Kubernetes StorageClass for the Valkey data PVC and
                                the database PVC provisioned in immich.yml.
     nfs_group_gid:             GID of the nfs_users group on the NFS server.
+    nonroot_uid:               Shared non-root UID for machine-learning and
+                               valkey pods. Read from group_vars.
 #}
 immich:
   persistence:
@@ -52,14 +77,27 @@ immich:
 server:
   defaultPodOptions:
     securityContext:
-      supplementalGroups:
-        - {{ nfs_group_gid }}
+      runAsNonRoot: true
+      runAsUser: {{ nonroot_uid }}
+      # Primary GID is the shared NFS users group rather than nonroot_uid because this pod
+      # writes to an NFS-backed PVC mounted at /data. The NFSv4 server does not honor
+      # supplemental groups for permission checks — only the process's primary GID matches
+      # the NFS export's group ownership, so runAsGroup must equal nfs_group_gid.
+      runAsGroup: {{ nfs_group_gid }}
+      fsGroup: {{ nfs_group_gid }}
+      seccompProfile:
+        type: RuntimeDefault
   controllers:
     main:
       containers:
         main:
           image:
             tag: '{{ immich_image_tag }}'
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           env:
             DB_HOSTNAME: 'immich-db-rw.{{ immich_namespace }}.svc'
             DB_DATABASE_NAME: '{{ immich_db_name }}'
@@ -84,12 +122,25 @@ server:
 
 machine-learning:
   enabled: true
+  defaultPodOptions:
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: {{ nonroot_uid }}
+      runAsGroup: {{ nonroot_uid }}
+      fsGroup: {{ nonroot_uid }}
+      seccompProfile:
+        type: RuntimeDefault
   controllers:
     main:
       containers:
         main:
           image:
             tag: '{{ immich_image_tag }}'
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           resources:
             requests:
               cpu: 100m
@@ -99,6 +150,23 @@ machine-learning:
 
 valkey:
   enabled: true
+  defaultPodOptions:
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: {{ nonroot_uid }}
+      runAsGroup: {{ nonroot_uid }}
+      fsGroup: {{ nonroot_uid }}
+      seccompProfile:
+        type: RuntimeDefault
+  controllers:
+    main:
+      containers:
+        main:
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
   persistence:
     data:
       enabled: true
