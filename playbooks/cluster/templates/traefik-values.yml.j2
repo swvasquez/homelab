@@ -10,11 +10,23 @@
   entrypoint redirect. The built-in dashboard ingressRoute is disabled in favor of
   the manually created HTTPRoute. Access logs are enabled for observability.
 
+  The namespace runs under Pod Security Admission 'restricted'. The pod runs
+  as nonroot_uid (65532) on the chart's built-in distroless image, which
+  already has a `nonroot` user at that UID. The container listens on
+  non-privileged 8000/8443 internally and the LoadBalancer Service maps
+  external 80/443 onto them, so no NET_BIND_SERVICE capability is needed.
+  The chart's built-in podSecurityContext and securityContext defaults are
+  close to restricted but omit `seccompProfile` and `fsGroup`, so the
+  overrides below re-declare the full restricted set (Helm replaces these
+  top-level maps wholesale rather than merging, so every required field
+  has to be repeated even when the chart already sets it).
+
   Variables:
     traefik_http_port:  External LoadBalancer port for HTTP (the web entrypoint).
                         Derived from ufw_allowed_ports.traefik_http.port in group_vars.
     traefik_https_port: External LoadBalancer port for HTTPS (the websecure entrypoint).
                         Derived from ufw_allowed_ports.traefik_https.port in group_vars.
+    nonroot_uid:        Shared non-root UID for the Traefik pod. Read from group_vars.
     IMPORTANT: every time a new service is deployed with an ExtensionRef middleware
     filter (e.g. ForwardAuth) in its HTTPRoute, its namespace must be added to the
     kubernetesCRD namespaces allowlist below and cluster/network.yml must be re-run,
@@ -71,3 +83,20 @@ ingressRoute:
 
 accessLog:
   enabled: true
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: {{ nonroot_uid }}
+  runAsGroup: {{ nonroot_uid }}
+  fsGroup: {{ nonroot_uid }}
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  seccompProfile:
+    type: RuntimeDefault

@@ -61,6 +61,9 @@
 #                            from ufw_allowed_ports.traefik_http.port.
 #   traefik_https_port:      External LoadBalancer port for HTTPS traffic. Derived
 #                            from ufw_allowed_ports.traefik_https.port.
+#   nonroot_uid:             Shared non-root UID for the Traefik pod, injected
+#                            into the chart's podSecurityContext. Read from
+#                            group_vars.
 #   cert_manager_chart_version:   Version of the cert-manager Helm chart
 #                            (default: 1.20.0).
 #   cert_manager_namespace:  Kubernetes namespace for cert-manager
