@@ -177,6 +177,7 @@
       - syncthing
       - gitea
       - vaultwarden
+      - firefly-iii
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
 
   tasks:

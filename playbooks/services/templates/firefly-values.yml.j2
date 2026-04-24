@@ -20,6 +20,16 @@
   applied by firefly.yml. The cron job will log an error for the exchange rate task
   but all other scheduled tasks will continue to run normally.
 
+  The pod runs as the image's built-in www-data user (UID/GID 33). Setting
+  runAsUser to nonroot_uid (65532) causes the entrypoint to fail writing to
+  /etc/nginx/nginx.conf (owned by root, writable only by the image user). PSA
+  restricted accepts UID 33 because runAsNonRoot only requires a non-zero UID.
+  runAsUser must be set explicitly as a number because the image declares USER
+  as the string 'www-data' — without a numeric runAsUser, Kubernetes cannot
+  verify runAsNonRoot and rejects the pod with CreateContainerConfigError.
+  fsGroup is set to 33 so www-data can write to the uploads PVC. The cronjob
+  uses curlimages/curl which supports nonroot_uid directly.
+
   Variables:
     dns_zone:                 DNS zone used to derive the APP_URL (e.g. homelab.internal).
     firefly_namespace:        Kubernetes namespace where Firefly III is deployed.
@@ -49,6 +59,20 @@ config:
     TRUSTED_PROXIES: '**'
   existingSecret: firefly-credentials
 
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 33
+  runAsGroup: 33
+  fsGroup: 33
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
 persistence:
   enabled: true
   storageClassName: '{{ firefly_storage_class }}'
@@ -57,6 +81,18 @@ persistence:
 
 cronjob:
   enabled: true
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: {{ nonroot_uid }}
+    runAsGroup: {{ nonroot_uid }}
+    fsGroup: {{ nonroot_uid }}
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
 
 importer:
   enabled: false

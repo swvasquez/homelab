@@ -70,6 +70,11 @@
 #                             (default: gitops).
 #   argocd_namespace:         Kubernetes namespace where ArgoCD is deployed
 #                             (default: argocd).
+#   nonroot_uid:              Shared non-root UID/GID used for the cronjob pod
+#                             securityContext. Read from group_vars (default: 65532).
+#                             The main app pod uses the image's built-in www-data
+#                             user (UID/GID 33) because the entrypoint writes to
+#                             root-owned nginx config files at startup.
 
 - name: Deploy Firefly III via ArgoCD GitOps
   hosts: homelab
