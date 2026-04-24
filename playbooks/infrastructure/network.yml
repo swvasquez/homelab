@@ -15,6 +15,9 @@
 #     nodes derived from inventory private_ip host variables.
 #   - Allows port 4244/tcp (hubble peer) from the pod CIDR 10.0.0.0/8 so that
 #     hubble-relay pods can reach the hubble peer gRPC endpoint on each node.
+#   - Allows port 9100/tcp (node-exporter) from the pod CIDR 10.0.0.0/8 so that
+#     the Prometheus pod can scrape the node-exporter daemonset on the same
+#     node, where the source IP is the pod IP rather than a node IP.
 #   - Enables UFW.
 #
 # Variables:
@@ -104,8 +107,15 @@
     - name: Allow hubble peer port from pod CIDR
       community.general.ufw:
         rule: allow
-        port: '4244'
-        proto: tcp
+        port: '{{ ufw_allowed_ports.hubble_peer.port | string }}'
+        proto: '{{ ufw_allowed_ports.hubble_peer.protocol }}'
+        from_ip: 10.0.0.0/8
+
+    - name: Allow node-exporter port from pod CIDR
+      community.general.ufw:
+        rule: allow
+        port: '{{ ufw_allowed_ports.node_exporter.port | string }}'
+        proto: '{{ ufw_allowed_ports.node_exporter.protocol }}'
         from_ip: 10.0.0.0/8
 
     # -------------------------------------------------------------------------
