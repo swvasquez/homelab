@@ -14,6 +14,10 @@
   so that Vaultwarden's TLS client (reqwest/OpenSSL) trusts the self-signed
   wildcard certificate used by Authentik and other internal services.
 
+  The pod runs as nonroot_uid (65532) under PSA restricted. ROCKET_PORT is set
+  to 8080 so the process does not need NET_BIND_SERVICE to bind a privileged
+  port. The Service keeps its external port at 80 and routes to targetPort 8080.
+
   Variables:
     dns_zone:                   DNS zone used to derive DOMAIN and SSO_AUTHORITY
                                 (e.g. homelab.internal).
@@ -24,6 +28,8 @@
     vaultwarden_storage_class:  Kubernetes StorageClass for the data PVC.
     homelab_ca_cert:            PEM-encoded CA certificate for homelab services.
                                 Read from the wildcard-tls Secret by vaultwarden.yml.
+    nonroot_uid:                Shared non-root UID/GID for pod and container
+                                securityContext. Read from group_vars.
 #}
 ---
 apiVersion: v1
@@ -66,7 +72,7 @@ spec:
   ports:
     - name: http
       port: 80
-      targetPort: 80
+      targetPort: 8080
       protocol: TCP
 ---
 apiVersion: apps/v1
@@ -86,17 +92,29 @@ spec:
       labels:
         app.kubernetes.io/name: vaultwarden
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: {{ nonroot_uid }}
+        runAsGroup: {{ nonroot_uid }}
+        fsGroup: {{ nonroot_uid }}
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: vaultwarden
           image: '{{ vaultwarden_image }}:{{ vaultwarden_image_tag }}'
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           ports:
             - name: http
-              containerPort: 80
+              containerPort: 8080
               protocol: TCP
           env:
             - name: ROCKET_PORT
-              value: '80'
+              value: '8080'
             - name: DOMAIN
               value: 'https://vault.{{ dns_zone }}'
             - name: SIGNUPS_ALLOWED
@@ -137,13 +155,13 @@ spec:
           readinessProbe:
             httpGet:
               path: /alive
-              port: 80
+              port: 8080
             initialDelaySeconds: 10
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /alive
-              port: 80
+              port: 8080
             initialDelaySeconds: 30
             periodSeconds: 20
       volumes:

@@ -95,6 +95,9 @@
 #   dns_zone:                     Internal DNS zone for homelab services.
 #                                 Read from group_vars. Used to construct
 #                                 the Authentik SSO authority URL.
+#   nonroot_uid:                  Shared non-root UID/GID for the Vaultwarden pod
+#                                 and container securityContext. Read from
+#                                 group_vars (default: 65532).
 
 - name: Deploy Vaultwarden via ArgoCD GitOps
   hosts: homelab
