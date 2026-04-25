@@ -420,7 +420,6 @@
   vars:
     falco_namespace: falco
     falco_chart_version: 8.0.2
-    falco_sensitive_file_container_only: false
     falco_alertmanager_hostport: >-
       http://kube-prometheus-stack-alertmanager.observability.svc.cluster.local:9093
     falco_ui_hostname: 'falco.{{ dns_zone }}'
