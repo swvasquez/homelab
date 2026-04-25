@@ -315,9 +315,9 @@
     #   - Installs the primary Kubernetes components (kubelet, kubeadm, kubectl).
     #   - Applies an 'apt-mark hold' to these packages to prevent unintentional
     #     version upgrades during routine system updates.
-    #   - Configures kubelet to use the systemd cgroup driver before the service
-    #     starts, which must match the cgroup driver used by Docker to prevent
-    #     resource management conflicts.
+    #   - Configures kubelet extra args: cgroup driver (systemd, required to
+    #     match Docker) and seccomp default (RuntimeDefault applied to every
+    #     container that does not declare an explicit seccompProfile).
     #   - Starts and enables the kubelet service.
     # -------------------------------------------------------------------------
     - name: Install Kubernetes components

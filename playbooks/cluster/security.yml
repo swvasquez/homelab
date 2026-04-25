@@ -2,10 +2,11 @@
 # ==============================================================================
 # Playbook: Cluster Security Hardening
 # ==============================================================================
-# Hardens the Kubernetes cluster in two stages: Pod Security Admission (PSA)
-# configuration and Falco runtime security deployment.
+# Hardens the Kubernetes cluster in two plays: namespace-level hardening
+# (Pod Security Admission and ServiceAccount token automount) and Falco
+# runtime security deployment.
 #
-# Play 1 — Pod Security Admission Defaults:
+# Play 1 — Pod Security Admission Defaults and Namespace Hardening:
 #   Configures the built-in Pod Security Admission controller with cluster-wide
 #   defaults so that every namespace is protected without requiring per-namespace
 #   labels. Built-in namespace behavior is permissive (privileged) unless
@@ -30,6 +31,13 @@
 #     proceeding, so failures surface immediately.
 #   - Labels the 'default' namespace with the 'restricted' Pod Security
 #     Standard so ad-hoc debug pods dropped there cannot escalate privileges.
+#   - Patches the 'default' ServiceAccount in every app namespace to set
+#     automountServiceAccountToken: false. Kubernetes mounts this token into
+#     every pod that does not name a specific ServiceAccount, giving any
+#     process inside the container a usable API credential even when it has
+#     no need for one. Disabling automount removes the token from the pod
+#     filesystem entirely. Workloads that legitimately need API access already
+#     use named ServiceAccounts and are unaffected.
 #
 # Play 2 — Falco Runtime Security:
 #   Deploys Falco via Helm to every node as a DaemonSet. Falco watches kernel
@@ -61,8 +69,14 @@
 #
 # Expected:
 #   Error from server (Forbidden): pods "pwn" is forbidden: violates
-#   PodSecurity "baseline:latest": privileged (container "pwn" must not set
+#   PodSecurity "restricted:latest": privileged (container "pwn" must not set
 #   securityContext.privileged=true)
+#
+# Validation — SA automount (after the playbook completes):
+#
+#   kubectl get sa default -n gitea -o jsonpath='{.automountServiceAccountToken}'
+#
+# Expected: false
 #
 # Validation — Falco (trigger a detection from any machine with kubectl):
 #
@@ -76,6 +90,10 @@
 # admission-config volumeMount, and the admission-config volume from
 # /etc/kubernetes/manifests/kube-apiserver.yaml. The kubelet reloads the
 # apiserver automatically.
+#
+# Rollback — SA automount: kubectl patch serviceaccount default -n <ns>
+# --type=merge -p '{"automountServiceAccountToken": null}' to restore the
+# Kubernetes default (inherits true from the namespace).
 #
 # Rollback — Falco: helm uninstall falco -n falco
 #
@@ -120,7 +138,9 @@
 #                              cnpg-system, cert-manager, vllm, observability,
 #                              falco).
 #   psa_restricted_namespaces: Namespaces opted up to the 'restricted' PSA
-#                              profile via an explicit namespace label
+#                              profile via an explicit namespace label. Also
+#                              used as the target list for the default
+#                              ServiceAccount automount-disable patch
 #                              (default: [default]).
 #   kubectl_config_path:       Full path to the kubectl config file used on
 #                              the control plane
@@ -148,7 +168,7 @@
 #                              the control plane
 #                              (default: /home/<ansible_user>/.kube/config).
 
-- name: Enable Pod Security Admission defaults
+- name: Harden namespace defaults and Pod Security Admission
   hosts: homelab
   become: true
   become_exe: sudo.ws
@@ -343,13 +363,12 @@
     # -------------------------------------------------------------------------
     # Restricted Namespace Labels
     # -------------------------------------------------------------------------
-    # The cluster-wide default applies the 'baseline' profile to every
-    # namespace that is not exempt. A short list of namespaces is opted up to
-    # 'restricted' via an explicit namespace label, which takes precedence
-    # over the cluster default. The 'default' namespace is the primary target
-    # — it is the common landing zone for ad-hoc 'kubectl run' / 'kubectl
-    # debug' pods, so hardening it blocks the easiest privilege-escalation
-    # path for anyone who happens to have kubeconfig access.
+    # The cluster-wide default already enforces 'restricted' for every
+    # namespace that is not exempt. These explicit per-namespace labels are
+    # now redundant but kept in place as a defense-in-depth measure and as a
+    # grep-able record of which namespaces were individually verified and
+    # migrated. They also ensure correctness if the cluster-wide default is
+    # ever loosened.
     # -------------------------------------------------------------------------
     - name: Label namespaces with the restricted Pod Security profile
       ansible.builtin.command:
@@ -361,6 +380,36 @@
           pod-security.kubernetes.io/audit=restricted
       register: psa_label_result
       changed_when: "'labeled' in psa_label_result.stdout"
+      loop: '{{ psa_restricted_namespaces }}'
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Default ServiceAccount Token Automount
+    # -------------------------------------------------------------------------
+    # Kubernetes automatically mounts a token for the 'default' ServiceAccount
+    # into every pod that does not name a specific ServiceAccount. This token
+    # is a valid API bearer credential — any process in the container can read
+    # it and query the cluster API, enabling reconnaissance even without
+    # explicit RBAC grants. Patching automountServiceAccountToken: false on
+    # the 'default' SA in each app namespace removes the token from the pod
+    # filesystem entirely for pods that do not need it.
+    #
+    # Named ServiceAccounts used by actual workloads (Traefik, ArgoCD,
+    # Authentik, CNPG, cert-manager, Cilium, etc.) are unaffected — this
+    # patch touches only the 'default' SA in each namespace. The change is
+    # lazy: already-running pods keep their existing token mount until
+    # recreated; only new pods created after the patch lose the mount.
+    # -------------------------------------------------------------------------
+    - name: Disable default ServiceAccount token automount in app namespaces
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch serviceaccount default
+          -n {{ item }}
+          --type=merge
+          -p '{"automountServiceAccountToken": false}'
+      register: sa_automount_result
+      changed_when: "'patched' in sa_automount_result.stdout"
       loop: '{{ psa_restricted_namespaces }}'
       when: bootstrap_node | default(false)
 
