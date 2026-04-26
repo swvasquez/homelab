@@ -136,9 +136,6 @@ Ansible Playbooks to configure Ubuntu x86_64 machines and manage a Kubernetes ho
       syncthing_discovery:
         port: <PORT>
         protocol: udp
-      plex:
-        port: <PORT>
-        protocol: tcp
     ```
 
 ## Directory Structure
