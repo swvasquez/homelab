@@ -192,6 +192,33 @@ just lint [TARGET]
 just lint playbooks/cluster/bootstrap.yml
 ```
 
+## Kubernetes
+
+### Deploy a New Cluster
+
+Requires `ssh`, `network`, `docker`, and optionally `nfs` from `playbooks/infrastructure/` to be installed first. Then run the cluster playbooks in this order:
+
+1. `kubernetes`
+2. `bootstrap`
+3. `network`
+4. `storage`
+5. `database`
+6. `observability`
+7. `authentication`
+8. `git`
+9. `gitops`
+10. `security`
+
+Once complete, services in `playbooks/service/` are self-contained and can be installed in any order.
+
+### Destroy the Cluster
+
+Run on each node to tear down Kubernetes and reset cluster state:
+
+```sh
+kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock
+```
+
 ## Notes
 
 - **Fixed-port services**: The following `ufw_allowed_ports` entries have standard ports that are not consumed by any playbook configuration — the port values defined here are used only by the UFW firewall rules and must match what the service actually listens on: `ssh`, `kubelet`, `etcd_client`, `etcd_peer`, `cilium_vxlan`, `cilium_health`, `hubble_peer`, and `nfs`.
