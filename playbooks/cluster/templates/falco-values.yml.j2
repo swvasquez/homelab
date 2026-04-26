@@ -15,7 +15,13 @@
 # relevant to the homelab threat model:
 #   - Kubeconfig file read from inside a container (credential theft)
 #   - Unexpected process in a CNPG database pod (database compromise)
-#   - Crypto mining heuristics (stratum protocol port 3333/14444)
+#   - Crypto mining heuristics — port list derived from upstream Falco's
+#     miner_ports macro (https://falco.org/blog/falco-detect-cryptomining/).
+#     18 well-known Stratum / mining-pool ports kept at CRITICAL; the two
+#     ephemeral-range ports (45560, 45700) split to NOTICE because they
+#     structurally false-positive on routine UDP egress from any pod;
+#     9 upstream ports omitted (overloaded HTTP-alts, SMTP, IRC, Bitcoin
+#     P2P, generic debug ports) — see rule desc for per-port rationale.
 #
 # Default rules disabled via override (chronic false positives in this cluster):
 #   - Run shell untrusted: CNPG postgres invokes 'sh -c manager wal-archive'
@@ -142,18 +148,39 @@ customRules:
       priority: ERROR
       tags: [homelab, database, anomaly]
 
+    # ------------------------------------------------------------------
+    # Crypto mining port lists below are derived from upstream Falco's
+    # miner_ports macro, documented in the official "Cryptomining
+    # Detection Using Falco" blog post:
+    #   https://falco.org/blog/falco-detect-cryptomining/
+    # Upstream's full list (29 ports):
+    #   25, 3333, 3334, 3335, 3336, 3357, 4444, 5555, 5556, 5588, 5730,
+    #   6099, 6666, 7777, 7778, 8000, 8001, 8008, 8080, 8118, 8333, 8888,
+    #   8899, 9332, 9999, 14433, 14444, 45560, 45700
+    # The homelab rules deliberately deviate — see each rule's desc for
+    # which ports are kept at which priority and which are omitted.
+    # ------------------------------------------------------------------
+
     - rule: Crypto mining network activity
       desc: >
-        A container attempted a network connection on a port commonly used by
-        crypto mining pools. Ports 3333, 4444, 5555, 7777, and 14444 are
-        standard Stratum protocol ports used by pools for Monero, Ethereum,
-        and similar coins. Port 45700 is associated with XMRig and similar
-        mining software. Loopback destinations are excluded to avoid false
-        positives from legitimate health checks (e.g. Longhorn, Traefik).
+        A container attempted a network connection on a well-known Stratum
+        protocol port used by mining pools for Monero, Ethereum, Litecoin,
+        and similar coins. All ports in this list sit below the Linux
+        ephemeral source-port range (32768-60999), so a match reflects a
+        real destination port and not a kernel-assigned source port.
+        Loopback destinations are excluded to avoid false positives from
+        legitimate health checks (e.g. Longhorn, Traefik). Ports
+        deliberately omitted from upstream's miner_ports macro: 25 (SMTP
+        — Authentik sends mail), 8000/8001/8008/8080/8888 (overloaded
+        HTTP-alts found in dev servers, sidecars, and dashboards across
+        the cluster), 8333 (Bitcoin P2P, not mining), 6666 (IRC, not
+        mining), 9999 (commonly used for debug/health endpoints).
       condition: >
         outbound and
         container and
-        fd.rport in (3333, 4444, 5555, 7777, 14444, 45700) and
+        fd.rport in (3333, 3334, 3335, 3336, 3357, 4444, 5555, 5556,
+                     5588, 5730, 6099, 7777, 7778, 8118, 8899, 9332,
+                     14433, 14444) and
         not fd.rip in ("127.0.0.1", "::1")
       output: >
         Possible crypto mining outbound connection
@@ -161,4 +188,29 @@ customRules:
         container=%container.name image=%container.image.repository
         ns=%k8s.ns.name pod=%k8s.pod.name)
       priority: CRITICAL
+      tags: [homelab, cryptomining, network]
+
+    - rule: Crypto mining ephemeral port activity
+      desc: >
+        A container's outbound connection matched port 45560 or 45700,
+        both listed in upstream Falco's miner_ports macro as associated
+        with XMRig and similar mining software. Both ports also sit
+        inside the Linux ephemeral source-port range (32768-60999), and
+        Falco's fd.rport semantics on unconnected UDP sockets
+        occasionally surface the local source port — so this rule fires
+        structurally on routine DNS/UDP egress (notably CoreDNS upstream
+        queries). Kept at NOTICE priority for forensic review without
+        triggering Critical alert fatigue. Investigate only if the
+        source pod is not a known DNS, proxy, or service-mesh component.
+      condition: >
+        outbound and
+        container and
+        fd.rport in (45560, 45700) and
+        not fd.rip in ("127.0.0.1", "::1")
+      output: >
+        Possible crypto mining outbound connection on ephemeral-range port
+        (user=%user.name cmd=%proc.cmdline connection=%fd.name
+        container=%container.name image=%container.image.repository
+        ns=%k8s.ns.name pod=%k8s.pod.name)
+      priority: NOTICE
       tags: [homelab, cryptomining, network]
