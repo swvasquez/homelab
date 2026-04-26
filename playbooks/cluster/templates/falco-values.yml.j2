@@ -13,10 +13,27 @@
 #
 # Custom rules (homelab_rules.yaml) extend the default ruleset with detections
 # relevant to the homelab threat model:
-#   - Shell in a homelab service container (kubectl exec sessions)
 #   - Kubeconfig file read from inside a container (credential theft)
 #   - Unexpected process in a CNPG database pod (database compromise)
 #   - Crypto mining heuristics (stratum protocol port 3333/14444)
+#
+# Default rules disabled via override (chronic false positives in this cluster):
+#   - Run shell untrusted: CNPG postgres invokes 'sh -c manager wal-archive'
+#     for every WAL segment archive; firefly's s6-overlay nginx health check
+#     spawns 'sh ./data/check' on a timer. Both are operator-internal and
+#     fire hundreds of times per hour.
+#   - Linux Kernel Module Injection Detected: Longhorn's instance-manager
+#     calls 'iscsiadm -m discovery' which loads kernel modules during volume
+#     attach. Required for storage to work; not suppressible by namespace
+#     scoping because the rule has no namespace exception hook upstream.
+#   - Redirect STDOUT/STDIN to Network Connection in Container: Longhorn's
+#     loopback gRPC self-talk and wait-for-it.sh startup gates trigger this.
+#     Low-signal rule for a Kubernetes workload.
+#
+# Default rule kept with exception:
+#   - Terminal shell in container: only fires on processes with an attached
+#     TTY, so it's a clean kubectl-exec detection. open-webui's entrypoint
+#     runs interactively (bash start.sh) and is the only known false positive.
 
 driver:
   kind: modern_ebpf
@@ -66,25 +83,27 @@ customRules:
       override:
         condition: replace
 
-    - rule: Shell spawned in homelab service container
-      desc: >
-        A shell was spawned inside a homelab service container. This typically
-        indicates a kubectl exec session or a compromised workload.
+    - rule: Run shell untrusted
+      override:
+        enabled: replace
+      enabled: false
+
+    - rule: Linux Kernel Module Injection Detected
+      override:
+        enabled: replace
+      enabled: false
+
+    - rule: Redirect STDOUT/STDIN to Network Connection in Container
+      override:
+        enabled: replace
+      enabled: false
+
+    - rule: Terminal shell in container
+      override:
+        condition: append
       condition: >
-        spawned_process and
-        shell_procs and
-        container and
-        k8s.ns.name in (gitea, syncthing, vaultwarden, immich, jellyfin,
-                        plex, openwebui, firefly, argocd) and
-        not container.image.repository contains 'valkey' and
-        not container.image.repository contains 'redis'
-      output: >
-        Shell spawned in homelab service container
-        (user=%user.name cmd=%proc.cmdline pid=%proc.pid
-        container=%container.name image=%container.image.repository
-        ns=%k8s.ns.name pod=%k8s.pod.name)
-      priority: WARNING
-      tags: [homelab, shell, container]
+        and not (k8s.ns.name = "open-webui" and
+                 proc.cmdline startswith "bash start.sh")
 
     - rule: Kubeconfig file read in container
       desc: >

@@ -48,17 +48,21 @@
 #   Alertmanager so they appear in Grafana alongside existing cluster metrics.
 #
 #   Custom homelab rules detect:
-#   - Shell spawned inside a homelab service container (kubectl exec sessions)
 #   - Kubeconfig file read from inside a container (credential theft)
 #   - Unexpected process spawned in a database pod (CNPG compromise)
 #   - Crypto mining heuristics (stratum protocol, mining pool ports)
+#
+#   Several default rules are disabled via override because they fire
+#   continuously on legitimate cluster components (CNPG WAL archiving,
+#   Longhorn iSCSI, longhorn-instance-manager loopback gRPC). See the
+#   header in falco-values.yml.j2 for the full list and rationale.
 #
 #   Falco requires privileged kernel access to read eBPF events and must be
 #   exempt from the baseline PSA profile. The falco namespace is listed in
 #   psa_exempt_namespaces in Play 1.
 #
 # Play 3 — Kyverno Admission Policy Engine:
-#   Deploys Kyverno via Helm and applies four ClusterPolicies enforcing
+#   Deploys Kyverno via Helm and applies three ClusterPolicies enforcing
 #   workload-level hygiene rules PSA cannot express on its own:
 #
 #   - disallow-latest-tag:            deny ':latest' or untagged images
@@ -67,15 +71,8 @@
 #   - disallow-nodeport-externalname: deny NodePort and ExternalName
 #                                     Services in app namespaces — these
 #                                     bypass Traefik and ForwardAuth
-#   - require-readonly-rootfs:        deny containers without
-#                                     securityContext.readOnlyRootFilesystem
-#                                     = true. firefly-iii is excluded
-#                                     because the upstream image's
-#                                     entrypoint writes config into /etc
-#                                     at startup; see the comment in
-#                                     services/templates/firefly-values.yml.j2.
 #
-#   All four policies use validationFailureAction: Enforce — Kyverno's
+#   All three policies use validationFailureAction: Enforce — Kyverno's
 #   admission webhook blocks non-compliant Pods and Services at create or
 #   update time, and PolicyReports are still emitted for visibility.
 #
@@ -124,7 +121,7 @@
 #   kubectl get policyreport -A
 #   kubectl get clusterpolicyreport
 #
-# Expected: four ClusterPolicies in 'Ready' state and a populated set of
+# Expected: three ClusterPolicies in 'Ready' state and a populated set of
 # PolicyReport / ClusterPolicyReport objects across the app namespaces.
 # Each report lists 'pass' / 'fail' / 'warn' counts per policy. Inspect
 # any 'fail' entries with:
@@ -142,11 +139,11 @@
 #
 # Rollback — Falco: helm uninstall falco -n falco
 #
-# Rollback — Kyverno: kubectl delete -f the four ClusterPolicies (or
+# Rollback — Kyverno: kubectl delete -f the three ClusterPolicies (or
 # kubectl delete clusterpolicy disallow-latest-tag
-#   disallow-sa-token-override disallow-nodeport-externalname
-#   require-readonly-rootfs), then 'helm uninstall kyverno -n kyverno'
-# and 'kubectl delete namespace kyverno'.
+#   disallow-sa-token-override disallow-nodeport-externalname),
+# then 'helm uninstall kyverno -n kyverno' and
+# 'kubectl delete namespace kyverno'.
 #
 # Variables — Play 1 (PSA):
 #   admission_config_dir:      Directory on the control plane node where the
@@ -240,8 +237,7 @@
 #                              templates/kyverno-<name>.yml.j2
 #                              (default: disallow-latest-tag,
 #                              disallow-sa-token-override,
-#                              disallow-nodeport-externalname,
-#                              require-readonly-rootfs).
+#                              disallow-nodeport-externalname).
 #   kubectl_config_path:       Full path to the kubectl config file used on
 #                              the control plane
 #                              (default: /home/<ansible_user>/.kube/config).
@@ -638,7 +634,6 @@
       - disallow-latest-tag
       - disallow-sa-token-override
       - disallow-nodeport-externalname
-      - require-readonly-rootfs
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
 
   tasks:
@@ -724,8 +719,7 @@
     # (Falco eBPF, Longhorn CSI, vLLM ROCm, observability node-exporter,
     # cert-manager, CNPG operator, kube-system, kyverno itself) are excluded
     # because they legitimately need elevated permissions that these
-    # rules would otherwise flag. The require-readonly-rootfs policy
-    # additionally excludes firefly-iii — see its template for the reason.
+    # rules would otherwise flag.
     # -------------------------------------------------------------------------
     - name: Write Kyverno ClusterPolicy manifests
       ansible.builtin.template:

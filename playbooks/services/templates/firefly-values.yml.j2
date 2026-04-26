@@ -79,9 +79,6 @@ podSecurityContext:
 # entrypoint reads from, and the firefly-iii Helm chart does not expose
 # initContainers, so there is no clean way to seed those templates into
 # a writable volume before the main container starts.
-# The firefly-iii namespace is therefore listed in the NotIn exclusion
-# list of the require-readonly-rootfs Kyverno ClusterPolicy
-# (playbooks/cluster/templates/kyverno-policies/require-readonly-rootfs.yml.j2).
 # Revisit when the upstream image supports a true read-only mode or the
 # chart adds initContainer hooks.
 securityContext:
