@@ -15,10 +15,9 @@
 # All access to the Jellyfin web UI is gated by Traefik ForwardAuth backed by
 # Authentik, requiring an active Authentik session before requests reach
 # Jellyfin. Jellyfin's own user management can still be used for per-user
-# library permissions after the ForwardAuth layer grants access.
-#
-# After deploying this playbook, re-run cluster/authentication.yml to apply
-# the HTTPRoute and ForwardAuth middleware to the jellyfin namespace.
+# library permissions after the ForwardAuth layer grants access. The HTTPRoute
+# and ForwardAuth Middleware are applied by this playbook itself in the
+# Jellyfin namespace.
 #
 # Run order:
 #   1. infrastructure/nfs.yml (NFS server and Kubernetes NFS path)
@@ -26,7 +25,6 @@
 #   3. services/gitea.yml
 #   4. services/argocd.yml
 #   5. services/jellyfin.yml (this playbook)
-#   6. cluster/authentication.yml (re-run to apply HTTPRoute and ForwardAuth)
 #
 # Input Variables:
 #   bootstrap_node:              Boolean indicating if the host is the control
@@ -78,6 +76,7 @@
   become_exe: sudo.ws
   vars:
     jellyfin_namespace: jellyfin
+    jellyfin_hostname: 'jellyfin.{{ dns_zone }}'
     jellyfin_chart_version: 3.0.0
     jellyfin_config_storage_size: 3Gi
     jellyfin_media_storage_size: 10Gi
@@ -88,9 +87,9 @@
          | selectattr('value.nfs_server', 'equalto', true)
          | map(attribute='value.private_ip')
          | first }}
-    jellyfin_hostname: 'jellyfin.{{ dns_zone }}'
     jellyfin_gitops_path: apps/jellyfin
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    authentik_namespace: authentik
     gitea_namespace: gitea
     gitea_admin_username: gitea_admin
     gitea_gitops_repo: gitops
@@ -113,6 +112,91 @@
       failed_when:
         - jellyfin_ns_result.rc != 0
         - "'already exists' not in jellyfin_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Default ServiceAccount Hardening
+    # -------------------------------------------------------------------------
+    # Disables the default ServiceAccount token automount in this namespace so
+    # ad-hoc pods that don't name a ServiceAccount cannot read a usable API
+    # bearer credential.
+    # -------------------------------------------------------------------------
+    - name: Disable default ServiceAccount token automount in Jellyfin namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch serviceaccount default
+          -n {{ jellyfin_namespace }}
+          --type=merge
+          -p '{"automountServiceAccountToken": false}'
+      register: jellyfin_sa_automount_result
+      changed_when: "'patched' in jellyfin_sa_automount_result.stdout"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ForwardAuth Middleware and HTTPRoute
+    # -------------------------------------------------------------------------
+    # Deploys the Traefik ForwardAuth Middleware in the Jellyfin namespace and
+    # exposes the Jellyfin web UI over HTTPS via an HTTPRoute attached to the
+    # traefik-gateway. Authentik gates all access. Authentik must already be
+    # installed (cluster/authentication.yml) for the gate to function.
+    # -------------------------------------------------------------------------
+    - name: Write ForwardAuth Middleware manifest for Jellyfin
+      ansible.builtin.template:
+        src: ../cluster/templates/traefik-forward-auth-middleware.yml.j2
+        dest: /tmp/traefik-forward-auth-middleware-jellyfin.yml
+        mode: '0644'
+      vars:
+        middleware_namespace: '{{ jellyfin_namespace }}'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ForwardAuth Middleware in Jellyfin namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/traefik-forward-auth-middleware-jellyfin.yml
+      register: jellyfin_middleware_result
+      changed_when: >-
+        'created' in jellyfin_middleware_result.stdout or
+        'configured' in jellyfin_middleware_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Jellyfin ForwardAuth Middleware manifest
+      ansible.builtin.file:
+        path: /tmp/traefik-forward-auth-middleware-jellyfin.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write Jellyfin HTTPRoute manifest
+      ansible.builtin.template:
+        src: ../cluster/templates/httproute.yml.j2
+        dest: /tmp/jellyfin-httproute.yml
+        mode: '0644'
+      vars:
+        httproute_name: jellyfin
+        httproute_namespace: '{{ jellyfin_namespace }}'
+        httproute_hostname: '{{ jellyfin_hostname }}'
+        httproute_backend_name: jellyfin
+        httproute_backend_namespace: '{{ jellyfin_namespace }}'
+        httproute_backend_port: 8096
+        with_forward_auth: true
+      when: bootstrap_node | default(false)
+
+    - name: Apply Jellyfin HTTPRoute
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/jellyfin-httproute.yml
+      register: jellyfin_httproute_result
+      changed_when: >-
+        'created' in jellyfin_httproute_result.stdout or
+        'configured' in jellyfin_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Jellyfin HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/jellyfin-httproute.yml
+        state: absent
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
@@ -159,7 +243,7 @@
         'created' in jellyfin_pv_result.stdout
       when: bootstrap_node | default(false)
 
-    - name: Remove Jellyfin NFS media PV manifest temporary file
+    - name: Clean up Jellyfin NFS media PV manifest
       ansible.builtin.file:
         path: /tmp/jellyfin-nfs-media-pv.yml
         state: absent
@@ -282,7 +366,7 @@
         - bootstrap_node | default(false)
         - gitops_diff_result.rc != 0
 
-    - name: Remove gitops temporary directory
+    - name: Clean up gitops temporary directory
       ansible.builtin.file:
         path: /tmp/gitops-jellyfin
         state: absent
@@ -313,7 +397,7 @@
         'created' in argocd_app_result.stdout
       when: bootstrap_node | default(false)
 
-    - name: Remove ArgoCD Application manifest temporary file
+    - name: Clean up ArgoCD Application manifest for Jellyfin
       ansible.builtin.file:
         path: /tmp/jellyfin-app.yml
         state: absent

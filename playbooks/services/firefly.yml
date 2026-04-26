@@ -29,15 +29,14 @@
 # Firefly III uses its own built-in authentication (email and password). Access
 # to the service is additionally gated by Traefik ForwardAuth backed by
 # Authentik, requiring users to authenticate with Authentik before reaching the
-# Firefly III login page. Run cluster/authentication.yml after this playbook to
-# apply the HTTPRoute and ForwardAuth middleware.
+# Firefly III login page. The HTTPRoute and ForwardAuth Middleware are applied
+# by this playbook itself in the Firefly III namespace.
 #
 # Run order:
 #   1. cluster/authentication.yml (Authentik, Traefik, cert-manager)
 #   2. services/gitea.yml
 #   3. services/argocd.yml
 #   4. services/firefly.yml (this playbook)
-#   5. cluster/authentication.yml (re-run to apply HTTPRoute and ForwardAuth)
 #
 # Input Variables:
 #   bootstrap_node:           Boolean indicating if the host is the control
@@ -82,15 +81,17 @@
   become_exe: sudo.ws
   vars:
     firefly_namespace: firefly-iii
+    firefly_hostname: 'firefly.{{ dns_zone }}'
     firefly_chart_version: '1.9.12'
     firefly_storage_size: 2Gi
-    firefly_db_storage_size: 5Gi
     firefly_storage_class: longhorn
     firefly_db_name: fireflyiii
     firefly_db_username: fireflyiii
     firefly_db_image: ghcr.io/cloudnative-pg/postgresql:17
+    firefly_db_storage_size: 5Gi
     firefly_gitops_path: apps/firefly-iii
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    authentik_namespace: authentik
     gitea_namespace: gitea
     gitea_admin_username: gitea_admin
     gitea_gitops_repo: gitops
@@ -113,6 +114,92 @@
       failed_when:
         - firefly_ns_result.rc != 0
         - "'already exists' not in firefly_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Default ServiceAccount Hardening
+    # -------------------------------------------------------------------------
+    # Disables the default ServiceAccount token automount in this namespace so
+    # ad-hoc pods that don't name a ServiceAccount cannot read a usable API
+    # bearer credential.
+    # -------------------------------------------------------------------------
+    - name: Disable default ServiceAccount token automount in Firefly III namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch serviceaccount default
+          -n {{ firefly_namespace }}
+          --type=merge
+          -p '{"automountServiceAccountToken": false}'
+      register: firefly_sa_automount_result
+      changed_when: "'patched' in firefly_sa_automount_result.stdout"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ForwardAuth Middleware and HTTPRoute
+    # -------------------------------------------------------------------------
+    # Deploys the Traefik ForwardAuth Middleware in the Firefly III namespace
+    # and exposes the Firefly III UI over HTTPS via an HTTPRoute attached to
+    # the traefik-gateway. Authentik gates browser access on top of Firefly's
+    # own login. Authentik must already be installed
+    # (cluster/authentication.yml) for the gate to function.
+    # -------------------------------------------------------------------------
+    - name: Write ForwardAuth Middleware manifest for Firefly III
+      ansible.builtin.template:
+        src: ../cluster/templates/traefik-forward-auth-middleware.yml.j2
+        dest: /tmp/traefik-forward-auth-middleware-firefly-iii.yml
+        mode: '0644'
+      vars:
+        middleware_namespace: '{{ firefly_namespace }}'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ForwardAuth Middleware in Firefly III namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/traefik-forward-auth-middleware-firefly-iii.yml
+      register: firefly_middleware_result
+      changed_when: >-
+        'created' in firefly_middleware_result.stdout or
+        'configured' in firefly_middleware_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Firefly III ForwardAuth Middleware manifest
+      ansible.builtin.file:
+        path: /tmp/traefik-forward-auth-middleware-firefly-iii.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write Firefly III HTTPRoute manifest
+      ansible.builtin.template:
+        src: ../cluster/templates/httproute.yml.j2
+        dest: /tmp/firefly-iii-httproute.yml
+        mode: '0644'
+      vars:
+        httproute_name: firefly-iii
+        httproute_namespace: '{{ firefly_namespace }}'
+        httproute_hostname: '{{ firefly_hostname }}'
+        httproute_backend_name: firefly-iii
+        httproute_backend_namespace: '{{ firefly_namespace }}'
+        httproute_backend_port: 80
+        with_forward_auth: true
+      when: bootstrap_node | default(false)
+
+    - name: Apply Firefly III HTTPRoute
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/firefly-iii-httproute.yml
+      register: firefly_httproute_result
+      changed_when: >-
+        'created' in firefly_httproute_result.stdout or
+        'configured' in firefly_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Firefly III HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/firefly-iii-httproute.yml
+        state: absent
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
@@ -293,7 +380,7 @@
         'configured' in firefly_db_cluster_result.stdout
       when: bootstrap_node | default(false)
 
-    - name: Remove Firefly III cnpg Cluster manifest temporary file
+    - name: Clean up Firefly III cnpg Cluster manifest
       ansible.builtin.file:
         path: /tmp/firefly-db-cluster.yml
         state: absent
@@ -362,7 +449,7 @@
         'configured' in firefly_netpol_result.stdout
       when: bootstrap_node | default(false)
 
-    - name: Remove Firefly III egress NetworkPolicy manifest temporary file
+    - name: Clean up Firefly III egress NetworkPolicy manifest
       ansible.builtin.file:
         path: /tmp/firefly-netpol.yml
         state: absent
@@ -489,7 +576,7 @@
         - bootstrap_node | default(false)
         - gitops_diff_result.rc != 0
 
-    - name: Remove gitops temporary directory
+    - name: Clean up gitops temporary directory
       ansible.builtin.file:
         path: /tmp/gitops-firefly
         state: absent
@@ -520,13 +607,13 @@
         'created' in argocd_app_result.stdout
       when: bootstrap_node | default(false)
 
-    - name: Remove ArgoCD Application manifest temporary file
+    - name: Clean up ArgoCD Application manifest for Firefly III
       ansible.builtin.file:
         path: /tmp/firefly-app.yml
         state: absent
       when: bootstrap_node | default(false)
 
-    - name: Trigger ArgoCD sync for Firefly III
+    - name: Trigger ArgoCD hard refresh to detect new gitops commit
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}

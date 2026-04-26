@@ -21,16 +21,17 @@
   top-level maps wholesale rather than merging, so every required field
   has to be repeated even when the chart already sets it).
 
+  The kubernetesCRD provider is configured to watch all namespaces (no allowlist).
+  This lets services define their own ForwardAuth Middleware in their own namespace
+  without requiring this file (and a Helm upgrade) to be updated each time a new
+  service is added.
+
   Variables:
     traefik_http_port:  External LoadBalancer port for HTTP (the web entrypoint).
                         Derived from ufw_allowed_ports.traefik_http.port in group_vars.
     traefik_https_port: External LoadBalancer port for HTTPS (the websecure entrypoint).
                         Derived from ufw_allowed_ports.traefik_https.port in group_vars.
     nonroot_uid:        Shared non-root UID for the Traefik pod. Read from group_vars.
-    IMPORTANT: every time a new service is deployed with an ExtensionRef middleware
-    filter (e.g. ForwardAuth) in its HTTPRoute, its namespace must be added to the
-    kubernetesCRD namespaces allowlist below and cluster/network.yml must be re-run,
-    or Traefik will silently drop the filter and return 500.
 #}
 providers:
   kubernetesGateway:
@@ -38,20 +39,6 @@ providers:
   kubernetesCRD:
     enabled: true
     allowCrossNamespace: true
-    namespaces:
-      - traefik
-      - kube-system
-      - longhorn-system
-      - observability
-      - gitea
-      - argocd
-      - immich
-      - syncthing
-      - open-webui
-      - firefly-iii
-      - vaultwarden
-      - jellyfin
-      - falco
   kubernetesIngress:
     enabled: false
 

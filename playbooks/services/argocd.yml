@@ -13,10 +13,8 @@
 # the Helm values, so they remain consistent if the provider already exists.
 #
 # ArgoCD runs in insecure mode (--insecure) since TLS is terminated at the
-# Traefik gateway. The ArgoCD UI HTTPRoute is managed by authentication.yml,
-# which centralizes HTTPRoute management for all cluster services and applies
-# the Authentik ForwardAuth middleware. Run authentication.yml after this
-# playbook to expose the ArgoCD UI over HTTPS.
+# Traefik gateway. The ArgoCD UI HTTPRoute and Authentik ForwardAuth Middleware
+# are applied by this playbook itself in the ArgoCD namespace.
 #
 # The homelab CA certificate is injected into ArgoCD's OIDC configuration so
 # that the server can verify Authentik's self-signed wildcard certificate when
@@ -121,6 +119,93 @@
       failed_when:
         - argocd_ns_result.rc != 0
         - "'already exists' not in argocd_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Default ServiceAccount Hardening
+    # -------------------------------------------------------------------------
+    # Disables the default ServiceAccount token automount in this namespace so
+    # ad-hoc pods that don't name a ServiceAccount cannot read a usable API
+    # bearer credential. The named ArgoCD ServiceAccounts created by the Helm
+    # chart are unaffected.
+    # -------------------------------------------------------------------------
+    - name: Disable default ServiceAccount token automount in ArgoCD namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch serviceaccount default
+          -n {{ argocd_namespace }}
+          --type=merge
+          -p '{"automountServiceAccountToken": false}'
+      register: argocd_sa_automount_result
+      changed_when: "'patched' in argocd_sa_automount_result.stdout"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ForwardAuth Middleware and HTTPRoute
+    # -------------------------------------------------------------------------
+    # Deploys the Traefik ForwardAuth Middleware in the ArgoCD namespace and
+    # exposes the ArgoCD UI over HTTPS via an HTTPRoute attached to the
+    # traefik-gateway. Authentik gates browser access on top of ArgoCD's own
+    # OIDC login. Authentik must already be installed
+    # (cluster/authentication.yml) for the gate to function.
+    # -------------------------------------------------------------------------
+    - name: Write ForwardAuth Middleware manifest for ArgoCD
+      ansible.builtin.template:
+        src: ../cluster/templates/traefik-forward-auth-middleware.yml.j2
+        dest: /tmp/traefik-forward-auth-middleware-argocd.yml
+        mode: '0644'
+      vars:
+        middleware_namespace: '{{ argocd_namespace }}'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ForwardAuth Middleware in ArgoCD namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/traefik-forward-auth-middleware-argocd.yml
+      register: argocd_middleware_result
+      changed_when: >-
+        'created' in argocd_middleware_result.stdout or
+        'configured' in argocd_middleware_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up ArgoCD ForwardAuth Middleware manifest
+      ansible.builtin.file:
+        path: /tmp/traefik-forward-auth-middleware-argocd.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write ArgoCD HTTPRoute manifest
+      ansible.builtin.template:
+        src: ../cluster/templates/httproute.yml.j2
+        dest: /tmp/argocd-httproute.yml
+        mode: '0644'
+      vars:
+        httproute_name: argocd
+        httproute_namespace: '{{ argocd_namespace }}'
+        httproute_hostname: '{{ argocd_hostname }}'
+        httproute_backend_name: argocd-server
+        httproute_backend_namespace: '{{ argocd_namespace }}'
+        httproute_backend_port: 80
+        with_forward_auth: true
+      when: bootstrap_node | default(false)
+
+    - name: Apply ArgoCD HTTPRoute
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/argocd-httproute.yml
+      register: argocd_httproute_result
+      changed_when: >-
+        'created' in argocd_httproute_result.stdout or
+        'configured' in argocd_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up ArgoCD HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/argocd-httproute.yml
+        state: absent
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------

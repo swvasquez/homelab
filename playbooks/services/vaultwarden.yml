@@ -35,16 +35,15 @@
 # reaches Vaultwarden. Note that native Bitwarden clients (desktop, mobile,
 # browser extension) communicate with the Vaultwarden API and do not go through
 # the browser ForwardAuth flow. To support native clients, remove the
-# ForwardAuth filter from the vaultwarden HTTPRoute in
-# cluster/authentication.yml or create a separate API-only HTTPRoute without
-# the filter.
+# with_forward_auth flag from the Vaultwarden HTTPRoute task below or create a
+# separate API-only HTTPRoute without the filter. The HTTPRoute and ForwardAuth
+# Middleware are applied by this playbook itself in the Vaultwarden namespace.
 #
 # Run order:
 #   1. cluster/authentication.yml (Authentik, Traefik, cert-manager)
 #   2. services/gitea.yml
 #   3. services/argocd.yml
 #   4. services/vaultwarden.yml (this playbook)
-#   5. cluster/authentication.yml (re-run to apply HTTPRoute and ForwardAuth)
 #
 # Input Variables:
 #   bootstrap_node:               Boolean indicating if the host is the control
@@ -105,22 +104,23 @@
   become_exe: sudo.ws
   vars:
     vaultwarden_namespace: vaultwarden
+    vaultwarden_hostname: 'vault.{{ dns_zone }}'
     vaultwarden_image: vaultwarden/server
     vaultwarden_image_tag: '1.35.7'
     vaultwarden_storage_size: '5Gi'
     vaultwarden_storage_class: longhorn
-    vaultwarden_db_storage_size: '5Gi'
     vaultwarden_db_name: vaultwarden
     vaultwarden_db_username: vaultwarden
     vaultwarden_db_image: 'ghcr.io/cloudnative-pg/postgresql:17'
+    vaultwarden_db_storage_size: '5Gi'
     vaultwarden_gitops_path: apps/vaultwarden
-    authentik_namespace: authentik
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    authentik_namespace: authentik
+    traefik_namespace: traefik
     gitea_namespace: gitea
     gitea_admin_username: gitea_admin
     gitea_gitops_repo: gitops
     argocd_namespace: argocd
-    traefik_namespace: traefik
 
   tasks:
     # -------------------------------------------------------------------------
@@ -139,6 +139,94 @@
       failed_when:
         - vaultwarden_ns_result.rc != 0
         - "'already exists' not in vaultwarden_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Default ServiceAccount Hardening
+    # -------------------------------------------------------------------------
+    # Disables the default ServiceAccount token automount in this namespace so
+    # ad-hoc pods that don't name a ServiceAccount cannot read a usable API
+    # bearer credential.
+    # -------------------------------------------------------------------------
+    - name: Disable default ServiceAccount token automount in Vaultwarden namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch serviceaccount default
+          -n {{ vaultwarden_namespace }}
+          --type=merge
+          -p '{"automountServiceAccountToken": false}'
+      register: vaultwarden_sa_automount_result
+      changed_when: "'patched' in vaultwarden_sa_automount_result.stdout"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ForwardAuth Middleware and HTTPRoute
+    # -------------------------------------------------------------------------
+    # Deploys the Traefik ForwardAuth Middleware in the Vaultwarden namespace
+    # and exposes the Vaultwarden web vault over HTTPS via an HTTPRoute
+    # attached to the traefik-gateway. Authentik gates browser access on top
+    # of Vaultwarden's own login. Native Bitwarden clients (desktop, mobile,
+    # browser extension) call the API directly and bypass the ForwardAuth
+    # browser flow. Authentik must already be installed
+    # (cluster/authentication.yml) for the gate to function.
+    # -------------------------------------------------------------------------
+    - name: Write ForwardAuth Middleware manifest for Vaultwarden
+      ansible.builtin.template:
+        src: ../cluster/templates/traefik-forward-auth-middleware.yml.j2
+        dest: /tmp/traefik-forward-auth-middleware-vaultwarden.yml
+        mode: '0644'
+      vars:
+        middleware_namespace: '{{ vaultwarden_namespace }}'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ForwardAuth Middleware in Vaultwarden namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/traefik-forward-auth-middleware-vaultwarden.yml
+      register: vaultwarden_middleware_result
+      changed_when: >-
+        'created' in vaultwarden_middleware_result.stdout or
+        'configured' in vaultwarden_middleware_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Vaultwarden ForwardAuth Middleware manifest
+      ansible.builtin.file:
+        path: /tmp/traefik-forward-auth-middleware-vaultwarden.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write Vaultwarden HTTPRoute manifest
+      ansible.builtin.template:
+        src: ../cluster/templates/httproute.yml.j2
+        dest: /tmp/vaultwarden-httproute.yml
+        mode: '0644'
+      vars:
+        httproute_name: vaultwarden
+        httproute_namespace: '{{ vaultwarden_namespace }}'
+        httproute_hostname: '{{ vaultwarden_hostname }}'
+        httproute_backend_name: vaultwarden
+        httproute_backend_namespace: '{{ vaultwarden_namespace }}'
+        httproute_backend_port: 80
+        with_forward_auth: true
+      when: bootstrap_node | default(false)
+
+    - name: Apply Vaultwarden HTTPRoute
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/vaultwarden-httproute.yml
+      register: vaultwarden_httproute_result
+      changed_when: >-
+        'created' in vaultwarden_httproute_result.stdout or
+        'configured' in vaultwarden_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Vaultwarden HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/vaultwarden-httproute.yml
+        state: absent
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
@@ -252,6 +340,67 @@
         - bootstrap_node | default(false)
         - vaultwarden_db_url_check.rc != 0
       no_log: true
+
+    # -------------------------------------------------------------------------
+    # Database
+    # -------------------------------------------------------------------------
+    # Provisions a CloudNativePG Cluster for Vaultwarden's PostgreSQL database.
+    # The Cluster is provisioned before ArgoCD first syncs the manifests so
+    # that the database is available when the Vaultwarden pod starts.
+    # -------------------------------------------------------------------------
+    - name: Write Vaultwarden cnpg Cluster manifest
+      ansible.builtin.copy:
+        dest: /tmp/vaultwarden-db-cluster.yml
+        mode: '0600'
+        content: |
+          apiVersion: postgresql.cnpg.io/v1
+          kind: Cluster
+          metadata:
+            name: vaultwarden-db
+            namespace: '{{ vaultwarden_namespace }}'
+          spec:
+            instances: 1
+            imageName: '{{ vaultwarden_db_image }}'
+            storage:
+              storageClass: '{{ vaultwarden_storage_class }}'
+              size: '{{ vaultwarden_db_storage_size }}'
+            bootstrap:
+              initdb:
+                database: '{{ vaultwarden_db_name }}'
+                owner: '{{ vaultwarden_db_username }}'
+                secret:
+                  name: vaultwarden-db-credentials
+      when: bootstrap_node | default(false)
+
+    - name: Apply Vaultwarden cnpg Cluster manifest
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/vaultwarden-db-cluster.yml
+      register: vaultwarden_db_cluster_result
+      changed_when: >-
+        'created' in vaultwarden_db_cluster_result.stdout or
+        'configured' in vaultwarden_db_cluster_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Vaultwarden cnpg Cluster manifest
+      ansible.builtin.file:
+        path: /tmp/vaultwarden-db-cluster.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Wait for Vaultwarden cnpg Cluster to become healthy
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get cluster vaultwarden-db -n {{ vaultwarden_namespace }}
+          -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: vaultwarden_db_ready
+      until: vaultwarden_db_ready.stdout == 'True'
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
     # Authentik OIDC Configuration
@@ -537,64 +686,29 @@
       no_log: true
 
     # -------------------------------------------------------------------------
-    # Database
+    # Homelab CA Certificate
     # -------------------------------------------------------------------------
-    # Provisions a CloudNativePG Cluster for Vaultwarden's PostgreSQL database.
-    # The Cluster is provisioned before ArgoCD first syncs the manifests so
-    # that the database is available when the Vaultwarden pod starts.
+    # Reads the self-signed wildcard TLS certificate from the wildcard-tls
+    # Secret in kube-system and stores it as a fact. The certificate is rendered
+    # into a ConfigMap via the Jinja2 manifest template and mounted into the
+    # Vaultwarden pod at /etc/ssl/certs/homelab-ca.crt. The SSL_CERT_FILE
+    # environment variable points to this path so that Vaultwarden's TLS client
+    # (reqwest/OpenSSL) trusts the certificate when connecting to Authentik for
+    # OIDC discovery.
     # -------------------------------------------------------------------------
-    - name: Write Vaultwarden cnpg Cluster manifest
-      ansible.builtin.copy:
-        dest: /tmp/vaultwarden-db-cluster.yml
-        mode: '0600'
-        content: |
-          apiVersion: postgresql.cnpg.io/v1
-          kind: Cluster
-          metadata:
-            name: vaultwarden-db
-            namespace: '{{ vaultwarden_namespace }}'
-          spec:
-            instances: 1
-            imageName: '{{ vaultwarden_db_image }}'
-            storage:
-              storageClass: '{{ vaultwarden_storage_class }}'
-              size: '{{ vaultwarden_db_storage_size }}'
-            bootstrap:
-              initdb:
-                database: '{{ vaultwarden_db_name }}'
-                owner: '{{ vaultwarden_db_username }}'
-                secret:
-                  name: vaultwarden-db-credentials
-      when: bootstrap_node | default(false)
-
-    - name: Apply Vaultwarden cnpg Cluster manifest
+    - name: Read homelab CA certificate from wildcard-tls Secret
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
-          apply -f /tmp/vaultwarden-db-cluster.yml
-      register: vaultwarden_db_cluster_result
-      changed_when: >-
-        'created' in vaultwarden_db_cluster_result.stdout or
-        'configured' in vaultwarden_db_cluster_result.stdout
-      when: bootstrap_node | default(false)
-
-    - name: Remove Vaultwarden cnpg Cluster manifest temporary file
-      ansible.builtin.file:
-        path: /tmp/vaultwarden-db-cluster.yml
-        state: absent
-      when: bootstrap_node | default(false)
-
-    - name: Wait for Vaultwarden cnpg Cluster to become healthy
-      ansible.builtin.command:
-        cmd: >-
-          kubectl --kubeconfig={{ kubectl_config_path }}
-          get cluster vaultwarden-db -n {{ vaultwarden_namespace }}
-          -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
-      register: vaultwarden_db_ready
-      until: vaultwarden_db_ready.stdout == 'True'
-      retries: 30
-      delay: 10
+          get secret -n kube-system wildcard-tls
+          -o jsonpath='{.data.tls\.crt}'
+      register: homelab_ca_cert_b64
       changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set homelab CA certificate fact
+      ansible.builtin.set_fact:
+        homelab_ca_cert: '{{ homelab_ca_cert_b64.stdout | b64decode }}'
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
@@ -661,37 +775,12 @@
         'configured' in vaultwarden_netpol_result.stdout
       when: bootstrap_node | default(false)
 
-    - name: Remove Vaultwarden egress NetworkPolicy manifest temporary file
+    - name: Clean up Vaultwarden egress NetworkPolicy manifest
       ansible.builtin.file:
         path: /tmp/vaultwarden-netpol.yml
         state: absent
       when: bootstrap_node | default(false)
 
-    # -------------------------------------------------------------------------
-    # TLS / CA Certificate
-    # -------------------------------------------------------------------------
-    # Reads the self-signed wildcard TLS certificate from the wildcard-tls
-    # Secret in kube-system and stores it as a fact. The certificate is rendered
-    # into a ConfigMap via the Jinja2 manifest template and mounted into the
-    # Vaultwarden pod at /etc/ssl/certs/homelab-ca.crt. The SSL_CERT_FILE
-    # environment variable points to this path so that Vaultwarden's TLS client
-    # (reqwest/OpenSSL) trusts the certificate when connecting to Authentik for
-    # OIDC discovery.
-    # -------------------------------------------------------------------------
-    - name: Read homelab CA certificate from wildcard-tls Secret
-      ansible.builtin.command:
-        cmd: >-
-          kubectl --kubeconfig={{ kubectl_config_path }}
-          get secret -n kube-system wildcard-tls
-          -o jsonpath='{.data.tls\.crt}'
-      register: homelab_ca_cert_b64
-      changed_when: false
-      when: bootstrap_node | default(false)
-
-    - name: Set homelab CA certificate fact
-      ansible.builtin.set_fact:
-        homelab_ca_cert: '{{ homelab_ca_cert_b64.stdout | b64decode }}'
-      when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
     # GitOps - Manifest Management
@@ -819,7 +908,7 @@
         - bootstrap_node | default(false)
         - gitops_diff_result.rc != 0
 
-    - name: Remove gitops temporary directory
+    - name: Clean up gitops temporary directory
       ansible.builtin.file:
         path: /tmp/gitops-vaultwarden
         state: absent
@@ -850,7 +939,7 @@
         'created' in argocd_app_result.stdout
       when: bootstrap_node | default(false)
 
-    - name: Remove ArgoCD Application manifest temporary file
+    - name: Clean up ArgoCD Application manifest for Vaultwarden
       ansible.builtin.file:
         path: /tmp/vaultwarden-app.yml
         state: absent

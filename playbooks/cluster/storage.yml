@@ -45,6 +45,7 @@
     longhorn_hostname: "longhorn.{{ dns_zone }}"
     kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
     longhorn_iscsi_set_manual_script_path: /usr/local/bin/longhorn-iscsi-set-manual.sh
+    authentik_namespace: authentik
 
   tasks:
     # -------------------------------------------------------------------------
@@ -197,12 +198,49 @@
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
+    # ForwardAuth Middleware (longhorn-system)
+    # Deploys the Traefik ForwardAuth Middleware in the longhorn-system
+    # namespace so that the Longhorn UI HTTPRoute can reference it. The
+    # Middleware itself just declares an outbound URL — it can be created
+    # before Authentik is installed; it only becomes functional once
+    # cluster/authentication.yml has run and the Authentik service is
+    # reachable in the cluster.
+    # -------------------------------------------------------------------------
+    - name: Write ForwardAuth Middleware manifest for longhorn-system
+      ansible.builtin.template:
+        src: traefik-forward-auth-middleware.yml.j2
+        dest: /tmp/traefik-forward-auth-middleware-longhorn-system.yml
+        mode: '0644'
+      vars:
+        middleware_namespace: '{{ longhorn_namespace }}'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ForwardAuth Middleware in longhorn-system
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/traefik-forward-auth-middleware-longhorn-system.yml
+      register: longhorn_middleware_result
+      changed_when: >-
+        'created' in longhorn_middleware_result.stdout or
+        'configured' in longhorn_middleware_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up longhorn-system ForwardAuth Middleware manifest
+      ansible.builtin.file:
+        path: /tmp/traefik-forward-auth-middleware-longhorn-system.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
     # UI Exposure
     # Exposes the Longhorn UI over the LAN via an HTTPRoute attached to the
     # traefik-gateway. HTTPS traffic matching the Longhorn hostname is routed
     # to the longhorn-frontend service. HTTP traffic is redirected to HTTPS by
     # the Traefik entrypoint redirect. ExternalDNS will register the Longhorn
-    # hostname in Bind9 once the HTTPRoute is accepted by the Gateway.
+    # hostname in Bind9 once the HTTPRoute is accepted by the Gateway. The
+    # route is gated by ForwardAuth and only becomes accessible once Authentik
+    # is installed by cluster/authentication.yml.
     # -------------------------------------------------------------------------
     - name: Write Longhorn HTTPRoute manifest
       ansible.builtin.template:
@@ -216,6 +254,7 @@
         httproute_backend_name: longhorn-frontend
         httproute_backend_namespace: "{{ longhorn_namespace }}"
         httproute_backend_port: 80
+        with_forward_auth: true
       when: bootstrap_node | default(false)
 
     - name: Apply Longhorn HTTPRoute

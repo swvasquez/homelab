@@ -103,17 +103,17 @@
   become_exe: sudo.ws
   vars:
     vllm_namespace: vllm
+    vllm_hostname: 'vllm.{{ dns_zone }}'
     vllm_image: vllm/vllm-openai-rocm
     vllm_image_tag: v0.18.0
     vllm_model: microsoft/Phi-4-mini-instruct
     vllm_dtype: float16
-    vllm_gpu_memory_util: "0.90"
-    vllm_max_model_len: "2048"
+    vllm_gpu_memory_util: '0.90'
+    vllm_max_model_len: '2048'
     vllm_api_port: '{{ ufw_allowed_ports.vllm_api.port }}'
     vllm_api_key_enabled: true
     vllm_hf_token_enabled: false
-    vllm_hf_token: ""
-    vllm_hostname: 'vllm.{{ dns_zone }}'
+    vllm_hf_token: ''
     vllm_cache_host_path: /var/lib/vllm/cache
     vllm_gitops_path: apps/vllm
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
@@ -124,9 +124,10 @@
 
   tasks:
     # -------------------------------------------------------------------------
-    # Namespace Configuration
+    # Namespace
     # -------------------------------------------------------------------------
-    # Creates the vLLM namespace before any other resources are defined.
+    # Creates the vLLM namespace before any other resources so that Secrets
+    # and the ArgoCD Application can target it on first run.
     # -------------------------------------------------------------------------
     - name: Create vLLM namespace
       ansible.builtin.command:
@@ -138,6 +139,50 @@
       failed_when:
         - vllm_ns_result.rc != 0
         - "'already exists' not in vllm_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Pod Security Admission Opt-Out
+    # -------------------------------------------------------------------------
+    # The cluster default Pod Security Standard is 'restricted', which forbids
+    # hostPath volumes, host devices, and the elevated container privileges
+    # the vLLM DaemonSet needs to access /dev/kfd and /dev/dri for ROCm GPU
+    # access. Label this namespace with 'privileged' to opt out of the
+    # cluster default for this single namespace, without requiring the
+    # cluster-level PSA exemption list in cluster/security.yml to know about
+    # vLLM.
+    # -------------------------------------------------------------------------
+    - name: Label vLLM namespace with privileged Pod Security profile
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          label --overwrite namespace {{ vllm_namespace }}
+          pod-security.kubernetes.io/enforce=privileged
+          pod-security.kubernetes.io/warn=privileged
+          pod-security.kubernetes.io/audit=privileged
+      register: vllm_psa_label_result
+      changed_when: "'labeled' in vllm_psa_label_result.stdout"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Kyverno Opt-Out
+    # -------------------------------------------------------------------------
+    # Labels the vLLM namespace with 'homelab.internal/kyverno-exempt=true'
+    # so the cluster's Kyverno ClusterPolicies skip it. The vLLM image is
+    # consumed by tag without a digest pin and the DaemonSet exposes a
+    # NodePort-equivalent direct LoadBalancer for OpenAI-compatible clients,
+    # both of which the default policy set would otherwise reject. This label
+    # lets vLLM opt itself out without cluster/security.yml having to name
+    # vllm in its policy selector.
+    # -------------------------------------------------------------------------
+    - name: Label vLLM namespace as exempt from Kyverno ClusterPolicies
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          label --overwrite namespace {{ vllm_namespace }}
+          homelab.internal/kyverno-exempt=true
+      register: vllm_kyverno_label_result
+      changed_when: "'labeled' in vllm_kyverno_label_result.stdout"
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
@@ -177,7 +222,7 @@
       failed_when: false
       when: bootstrap_node | default(false)
 
-    - name: Generate random API key for vLLM
+    - name: Generate vLLM API key
       ansible.builtin.command:
         cmd: openssl rand -base64 32
       register: vllm_api_key_gen
@@ -225,7 +270,7 @@
       changed_when: false
       when: bootstrap_node | default(false)
 
-    - name: Read Gitea admin password from Kubernetes secret
+    - name: Read Gitea admin password from Kubernetes Secret
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
@@ -322,7 +367,7 @@
         - bootstrap_node | default(false)
         - gitops_diff_result.rc != 0
 
-    - name: Remove gitops temporary directory
+    - name: Clean up gitops temporary directory
       ansible.builtin.file:
         path: /tmp/gitops-vllm
         state: absent
@@ -352,7 +397,7 @@
         'created' in argocd_app_result.stdout
       when: bootstrap_node | default(false)
 
-    - name: Remove ArgoCD Application manifest temporary file
+    - name: Clean up ArgoCD Application manifest for vLLM
       ansible.builtin.file:
         path: /tmp/vllm-app.yml
         state: absent

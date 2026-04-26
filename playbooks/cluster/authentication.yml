@@ -16,13 +16,16 @@
 # to the traefik-gateway. Authentik itself is not protected by ForwardAuth —
 # it is the identity provider.
 #
-# After Authentik is deployed, a Traefik ForwardAuth Middleware is applied to
-# the kube-system, longhorn-system, observability, gitea, argocd, immich,
-# syncthing, open-webui, firefly-iii, vaultwarden, and jellyfin namespaces,
-# and the Hubble, Traefik dashboard, Longhorn, Prometheus, Grafana,
-# Alertmanager, Gitea, ArgoCD, Immich, Syncthing, Open WebUI, Firefly III,
-# Vaultwarden, and Jellyfin HTTPRoutes are re-applied with the middleware
-# enabled. This protects those UIs behind Authentik authentication.
+# A single domain-level Forward Auth proxy provider (homelab-forward-auth) is
+# created in Authentik covering the entire DNS zone (*.{{ dns_zone }}). With
+# this single provider in place, any service in any namespace can opt into
+# ForwardAuth by deploying its own Traefik Middleware (authentik-forward-auth)
+# and HTTPRoute referencing that Middleware. This playbook does NOT deploy the
+# per-namespace Middlewares or service HTTPRoutes itself — each cluster
+# component (network.yml, storage.yml, observability.yml, security.yml) and
+# each service playbook in playbooks/services/ is responsible for applying its
+# own Middleware and HTTPRoute. Adding a new service therefore does NOT
+# require re-running this playbook.
 #
 # Variables:
 #   bootstrap_node:              Boolean indicating if the host is the control
@@ -32,64 +35,10 @@
 #                                group_vars.
 #   authentik_namespace:         Kubernetes namespace for Authentik
 #                                (default: authentik).
-#   authentik_chart_version:         Helm chart version of Authentik to install
+#   authentik_chart_version:     Helm chart version of Authentik to install
 #                                (default: 2026.2.1).
 #   authentik_hostname:          FQDN for the Authentik UI, derived from
 #                                dns_zone (default: authentik.<dns_zone>).
-#   hubble_hostname:             FQDN for the Hubble UI, derived from dns_zone
-#                                (default: hubble.<dns_zone>).
-#   traefik_namespace:           Kubernetes namespace where Traefik is deployed
-#                                (default: traefik).
-#   traefik_hostname:            FQDN for the Traefik dashboard, derived from
-#                                dns_zone (default: traefik.<dns_zone>).
-#   longhorn_namespace:          Kubernetes namespace for Longhorn
-#                                (default: longhorn-system).
-#   longhorn_hostname:           FQDN for the Longhorn UI, derived from
-#                                dns_zone (default: longhorn.<dns_zone>).
-#   observability_namespace:     Kubernetes namespace for the observability
-#                                stack (default: observability).
-#   prometheus_hostname:         FQDN for the Prometheus UI, derived from
-#                                dns_zone (default: prometheus.<dns_zone>).
-#   grafana_hostname:            FQDN for the Grafana UI, derived from
-#                                dns_zone (default: grafana.<dns_zone>).
-#   alertmanager_hostname:       FQDN for the Alertmanager UI, derived from
-#                                dns_zone (default: alertmanager.<dns_zone>).
-#   gitea_namespace:             Kubernetes namespace for Gitea
-#                                (default: gitea).
-#   gitea_hostname:              FQDN for the Gitea UI, derived from dns_zone
-#                                (default: gitea.<dns_zone>).
-#   argocd_namespace:            Kubernetes namespace for ArgoCD
-#                                (default: argocd).
-#   argocd_hostname:             FQDN for the ArgoCD UI, derived from dns_zone
-#                                (default: argocd.<dns_zone>).
-#   immich_namespace:            Kubernetes namespace for Immich
-#                                (default: immich).
-#   immich_hostname:             FQDN for the Immich UI, derived from dns_zone
-#                                (default: immich.<dns_zone>).
-#   syncthing_namespace:         Kubernetes namespace for Syncthing
-#                                (default: syncthing).
-#   syncthing_hostname:          FQDN for the Syncthing UI, derived from dns_zone
-#                                (default: syncthing.<dns_zone>).
-#   openwebui_namespace:         Kubernetes namespace for Open WebUI
-#                                (default: open-webui).
-#   openwebui_hostname:          FQDN for the Open WebUI, derived from dns_zone
-#                                (default: chat.<dns_zone>).
-#   firefly_namespace:           Kubernetes namespace for Firefly III
-#                                (default: firefly-iii).
-#   firefly_hostname:            FQDN for the Firefly III UI, derived from
-#                                dns_zone (default: firefly.<dns_zone>).
-#   vaultwarden_namespace:       Kubernetes namespace for Vaultwarden
-#                                (default: vaultwarden).
-#   vaultwarden_hostname:        FQDN for the Vaultwarden web vault, derived
-#                                from dns_zone (default: vault.<dns_zone>).
-#   jellyfin_namespace:          Kubernetes namespace for Jellyfin
-#                                (default: jellyfin).
-#   jellyfin_hostname:           FQDN for the Jellyfin UI, derived from
-#                                dns_zone (default: jellyfin.<dns_zone>).
-#   falco_namespace:             Kubernetes namespace for Falco and
-#                                Falcosidekick (default: falco).
-#   falco_ui_hostname:           FQDN for the Falcosidekick web UI, derived
-#                                from dns_zone (default: falco.<dns_zone>).
 #   kubectl_config_path:         Full path to the kubectl config file
 #                                (default: /home/<ansible_user>/.kube/config).
 #   authentik_bootstrap_token:   API token auto-generated on first run and
@@ -126,125 +75,7 @@
     authentik_db_username: authentik
     authentik_db_storage_size: 8Gi
     authentik_storage_class: longhorn
-    hubble_hostname: 'hubble.{{ dns_zone }}'
-    traefik_namespace: traefik
-    traefik_hostname: 'traefik.{{ dns_zone }}'
-    longhorn_namespace: longhorn-system
-    longhorn_hostname: 'longhorn.{{ dns_zone }}'
-    observability_namespace: observability
-    prometheus_hostname: 'prometheus.{{ dns_zone }}'
-    grafana_hostname: 'grafana.{{ dns_zone }}'
-    alertmanager_hostname: 'alertmanager.{{ dns_zone }}'
-    gitea_namespace: gitea
-    gitea_hostname: 'gitea.{{ dns_zone }}'
-    argocd_namespace: argocd
-    argocd_hostname: 'argocd.{{ dns_zone }}'
-    immich_namespace: immich
-    immich_hostname: 'immich.{{ dns_zone }}'
-    syncthing_namespace: syncthing
-    syncthing_hostname: 'syncthing.{{ dns_zone }}'
-    openwebui_namespace: open-webui
-    openwebui_hostname: 'chat.{{ dns_zone }}'
-    firefly_namespace: firefly-iii
-    firefly_hostname: 'firefly.{{ dns_zone }}'
-    vaultwarden_namespace: vaultwarden
-    vaultwarden_hostname: 'vault.{{ dns_zone }}'
-    jellyfin_namespace: jellyfin
-    jellyfin_hostname: 'jellyfin.{{ dns_zone }}'
-    falco_namespace: falco
-    falco_ui_hostname: 'falco.{{ dns_zone }}'
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
-    protected_httproutes:
-      - name: hubble-ui
-        route_ns: kube-system
-        hostname: '{{ hubble_hostname }}'
-        backend_name: hubble-ui
-        backend_ns: kube-system
-        backend_port: 80
-      - name: traefik-dashboard
-        route_ns: kube-system
-        hostname: '{{ traefik_hostname }}'
-        backend_name: traefik
-        backend_ns: '{{ traefik_namespace }}'
-        backend_port: 8080
-      - name: longhorn-ui
-        route_ns: '{{ longhorn_namespace }}'
-        hostname: '{{ longhorn_hostname }}'
-        backend_name: longhorn-frontend
-        backend_ns: '{{ longhorn_namespace }}'
-        backend_port: 80
-      - name: prometheus
-        route_ns: '{{ observability_namespace }}'
-        hostname: '{{ prometheus_hostname }}'
-        backend_name: kube-prometheus-stack-prometheus
-        backend_ns: '{{ observability_namespace }}'
-        backend_port: 9090
-      - name: grafana
-        route_ns: '{{ observability_namespace }}'
-        hostname: '{{ grafana_hostname }}'
-        backend_name: kube-prometheus-stack-grafana
-        backend_ns: '{{ observability_namespace }}'
-        backend_port: 80
-      - name: alertmanager
-        route_ns: '{{ observability_namespace }}'
-        hostname: '{{ alertmanager_hostname }}'
-        backend_name: kube-prometheus-stack-alertmanager
-        backend_ns: '{{ observability_namespace }}'
-        backend_port: 9093
-      - name: gitea
-        route_ns: '{{ gitea_namespace }}'
-        hostname: '{{ gitea_hostname }}'
-        backend_name: gitea-http
-        backend_ns: '{{ gitea_namespace }}'
-        backend_port: 3000
-      - name: argocd
-        route_ns: '{{ argocd_namespace }}'
-        hostname: '{{ argocd_hostname }}'
-        backend_name: argocd-server
-        backend_ns: '{{ argocd_namespace }}'
-        backend_port: 80
-      - name: immich
-        route_ns: '{{ immich_namespace }}'
-        hostname: '{{ immich_hostname }}'
-        backend_name: immich-server
-        backend_ns: '{{ immich_namespace }}'
-        backend_port: 2283
-      - name: syncthing
-        route_ns: '{{ syncthing_namespace }}'
-        hostname: '{{ syncthing_hostname }}'
-        backend_name: syncthing-gui
-        backend_ns: '{{ syncthing_namespace }}'
-        backend_port: 8384
-      - name: open-webui
-        route_ns: '{{ openwebui_namespace }}'
-        hostname: '{{ openwebui_hostname }}'
-        backend_name: open-webui
-        backend_ns: '{{ openwebui_namespace }}'
-        backend_port: 80
-      - name: firefly-iii
-        route_ns: '{{ firefly_namespace }}'
-        hostname: '{{ firefly_hostname }}'
-        backend_name: firefly-iii
-        backend_ns: '{{ firefly_namespace }}'
-        backend_port: 80
-      - name: vaultwarden
-        route_ns: '{{ vaultwarden_namespace }}'
-        hostname: '{{ vaultwarden_hostname }}'
-        backend_name: vaultwarden
-        backend_ns: '{{ vaultwarden_namespace }}'
-        backend_port: 80
-      - name: jellyfin
-        route_ns: '{{ jellyfin_namespace }}'
-        hostname: '{{ jellyfin_hostname }}'
-        backend_name: jellyfin
-        backend_ns: '{{ jellyfin_namespace }}'
-        backend_port: 8096
-      - name: falco-ui
-        route_ns: '{{ falco_namespace }}'
-        hostname: '{{ falco_ui_hostname }}'
-        backend_name: falco-falcosidekick-ui
-        backend_ns: '{{ falco_namespace }}'
-        backend_port: 2802
 
   tasks:
     # -------------------------------------------------------------------------
@@ -262,6 +93,25 @@
       failed_when:
         - authentik_ns_result.rc != 0
         - "'already exists' not in authentik_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Default ServiceAccount Hardening
+    # Disables the default ServiceAccount token automount in this namespace so
+    # ad-hoc pods that don't name a ServiceAccount cannot read a usable API
+    # bearer credential. The named Authentik ServiceAccounts created by the
+    # Helm chart are unaffected.
+    # -------------------------------------------------------------------------
+    - name: Disable default ServiceAccount token automount in Authentik namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch serviceaccount default
+          -n {{ authentik_namespace }}
+          --type=merge
+          -p '{"automountServiceAccountToken": false}'
+      register: authentik_sa_automount_result
+      changed_when: "'patched' in authentik_sa_automount_result.stdout"
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
@@ -732,97 +582,4 @@
       ansible.builtin.file:
         path: /tmp/authentik-httproute.yml
         state: absent
-      when: bootstrap_node | default(false)
-
-    # -------------------------------------------------------------------------
-    # ForwardAuth Middleware
-    # Deploys the Traefik ForwardAuth Middleware to every namespace that hosts
-    # protected HTTPRoutes. Traefik requires the Middleware to be in the same
-    # namespace as the HTTPRoute that references it. The middleware forwards
-    # each incoming request to the Authentik outpost for authentication before
-    # allowing it to reach the backend service.
-    # -------------------------------------------------------------------------
-    - name: Ensure namespaces exist for ForwardAuth Middleware deployment
-      ansible.builtin.command:
-        cmd: kubectl --kubeconfig={{ kubectl_config_path }} create namespace {{ item }}
-      register: ns_result
-      changed_when: ns_result.rc == 0
-      failed_when:
-        - ns_result.rc != 0
-        - "'already exists' not in ns_result.stderr"
-      loop: "{{ protected_httproutes | map(attribute='route_ns') | unique | list }}"
-      when: bootstrap_node | default(false)
-
-    - name: Write ForwardAuth Middleware manifests
-      ansible.builtin.template:
-        src: traefik-forward-auth-middleware.yml.j2
-        dest: /tmp/traefik-forward-auth-middleware-{{ item }}.yml
-        mode: "0644"
-      vars:
-        middleware_namespace: "{{ item }}"
-      loop: "{{ protected_httproutes | map(attribute='route_ns') | unique | list }}"
-      when: bootstrap_node | default(false)
-
-    - name: Apply ForwardAuth Middlewares
-      ansible.builtin.command:
-        cmd: >-
-          kubectl --kubeconfig={{ kubectl_config_path }}
-          apply -f /tmp/traefik-forward-auth-middleware-{{ item }}.yml
-      register: middleware_result
-      changed_when: >-
-        'created' in middleware_result.stdout or
-        'configured' in middleware_result.stdout
-      loop: "{{ protected_httproutes | map(attribute='route_ns') | unique | list }}"
-      when: bootstrap_node | default(false)
-
-    - name: Clean up ForwardAuth Middleware manifests
-      ansible.builtin.file:
-        path: /tmp/traefik-forward-auth-middleware-{{ item }}.yml
-        state: absent
-      loop: "{{ protected_httproutes | map(attribute='route_ns') | unique | list }}"
-      when: bootstrap_node | default(false)
-
-    # -------------------------------------------------------------------------
-    # Protected HTTPRoutes
-    # Re-applies the Hubble, Traefik dashboard, Longhorn, Prometheus, Grafana,
-    # Alertmanager, Gitea, ArgoCD, Immich, Syncthing, and Open WebUI HTTPRoutes
-    # with the ForwardAuth middleware enabled. This replaces the unauthenticated
-    # HTTPRoutes deployed by network.yml, storage.yml, and observability.yml.
-    # Service HTTPRoutes are managed here rather than in their individual service
-    # playbooks. If authentication.yml is not run, those services remain
-    # accessible without authentication.
-    # -------------------------------------------------------------------------
-    - name: Write Protected HTTPRoute manifests with ForwardAuth
-      ansible.builtin.template:
-        src: httproute.yml.j2
-        dest: "/tmp/{{ item.name }}-httproute.yml"
-        mode: "0644"
-      vars:
-        with_forward_auth: true
-        httproute_name: "{{ item.name }}"
-        httproute_namespace: "{{ item.route_ns }}"
-        httproute_hostname: "{{ item.hostname }}"
-        httproute_backend_name: "{{ item.backend_name }}"
-        httproute_backend_namespace: "{{ item.backend_ns }}"
-        httproute_backend_port: "{{ item.backend_port }}"
-      loop: "{{ protected_httproutes }}"
-      when: bootstrap_node | default(false)
-
-    - name: Apply Protected HTTPRoutes with ForwardAuth
-      ansible.builtin.command:
-        cmd: >-
-          kubectl --kubeconfig={{ kubectl_config_path }}
-          apply -f /tmp/{{ item.name }}-httproute.yml
-      register: protected_httproute_result
-      changed_when: >-
-        'created' in protected_httproute_result.stdout or
-        'configured' in protected_httproute_result.stdout
-      loop: "{{ protected_httproutes }}"
-      when: bootstrap_node | default(false)
-
-    - name: Clean up Protected HTTPRoute manifests
-      ansible.builtin.file:
-        path: "/tmp/{{ item.name }}-httproute.yml"
-        state: absent
-      loop: "{{ protected_httproutes }}"
       when: bootstrap_node | default(false)

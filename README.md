@@ -199,22 +199,20 @@ just lint playbooks/cluster/bootstrap.yml
 - **`become_exe` configuration**: `become_exe` must be set to `sudo.ws` to resolve an issue
   with Ansible. See [Ansible Issue #85837](https://github.com/ansible/ansible/issues/85837)
   for details.
-- **Service playbook run order**: Some Playbooks have dependencies on others. For example, the authentication Playbook must be (re)deployed after adding a new Kubernetes service:
+- **Service playbook run order**: Once the cluster Playbooks (`bootstrap`, `network`, `storage`, `database`, `observability`, `authentication`, `security`) have all been run, services in `playbooks/services/` are self-contained. Each service Playbook applies its own HTTPRoute, Traefik ForwardAuth Middleware, and namespace hardening, so adding a new service does NOT require re-running any cluster Playbook:
   ```sh
   just install services <SERVICE>
-  just install cluster authentication
   ```
-- **Pod Security Admission**: `cluster/security.yml` configures the kube-apiserver with a cluster-wide default Pod Security Standard (`baseline`) so every namespace is protected by default. Exempt namespaces (e.g. `kube-system`, `longhorn-system`, `vllm`, `observability`, `falco`) and namespaces opted up to the `restricted` profile (e.g. `default`, `syncthing`, `gitea`) are listed in the playbook `vars`. The playbook patches the static `kube-apiserver.yaml` pod manifest; the kubelet reloads the apiserver automatically. Run after `cluster/authentication.yml`:
+- **Pod Security Admission**: `cluster/security.yml` configures the kube-apiserver with a cluster-wide default Pod Security Standard (`restricted`) so every namespace is protected by default. Only true infrastructure namespaces (`kube-system`, `longhorn-system`, `cnpg-system`, `cert-manager`, `observability`, `falco`, `kyverno`) are listed in the apiserver-level `psa_exempt_namespaces` list. App service namespaces stay on the `restricted` default; if a service needs to opt out (e.g. `vllm` for hostPath GPU access), the service Playbook applies a `pod-security.kubernetes.io/enforce=privileged` label on its own namespace. Adding a new service therefore does not require editing `cluster/security.yml`. The playbook patches the static `kube-apiserver.yaml` pod manifest; the kubelet reloads the apiserver automatically. Run after `cluster/authentication.yml`:
   ```sh
   just install cluster security
   ```
-  When adding a new service that needs host access (privileged pods, hostPath, hostNetwork, hostPID), add its namespace to `psa_exempt_namespaces` in `cluster/security.yml` and re-run the playbook.
 - **Falco**: `cluster/security.yml` also deploys Falco as a DaemonSet via the `falcosecurity/falco` Helm chart. Falco monitors kernel syscalls using the modern eBPF driver (CO-RE, no kernel module required) and evaluates events against the default ruleset plus custom homelab rules. Falcosidekick forwards alerts to Alertmanager (`observability.yml` must be deployed first). The `falco` namespace is exempt from PSA enforcement because Falco pods require elevated kernel capabilities. To trigger a test detection:
   ```sh
   kubectl -n default run falco-test --image=alpine --restart=Never --rm -it -- sh
   ```
 - **Open WebUI and vLLM**: Open WebUI (`services/openwebui.yml`) connects to vLLM (`services/vllm.yml`) using the vLLM API key from the `vllm-credentials` Secret. vLLM must be deployed first. Open WebUI's built-in authentication is disabled — access is gated entirely by Traefik ForwardAuth (Authentik). The `vllm_host` inventory variable controls which nodes run a vLLM instance.
-- **Jellyfin**: Jellyfin (`services/jellyfin.yml`) is a self-hosted media server deployed via the official Helm chart. All access is gated by Traefik ForwardAuth backed by Authentik — no OIDC plugin is required. After deploying, re-run `cluster/authentication.yml` to apply the HTTPRoute and ForwardAuth middleware.
+- **Jellyfin**: Jellyfin (`services/jellyfin.yml`) is a self-hosted media server deployed via the official Helm chart. All access is gated by Traefik ForwardAuth backed by Authentik — no OIDC plugin is required. The HTTPRoute and ForwardAuth Middleware are applied by the Jellyfin Playbook itself.
 - **Local DNS Resolution**: To resolve homelab services (e.g., `*.homelab.internal`) from your local machine, configure your OS to use the cluster's Bind9 LoadBalancer IP as its nameserver. Note that Syncthing sync traffic uses a **dedicated LoadBalancer IP** (separate from the web GUI) to ensure high-performance data transfer.
   - **macOS Setup**:
     ```sh

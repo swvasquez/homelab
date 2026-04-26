@@ -55,6 +55,7 @@
     grafana_hostname: "grafana.{{ dns_zone }}"
     alertmanager_hostname: "alertmanager.{{ dns_zone }}"
     kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
+    authentik_namespace: authentik
     observability_httproutes:
       - name: prometheus
         hostname: "{{ prometheus_hostname }}"
@@ -217,10 +218,47 @@
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
+    # ForwardAuth Middleware (observability)
+    # Deploys the Traefik ForwardAuth Middleware in the observability namespace
+    # so that the Prometheus, Grafana, and Alertmanager HTTPRoutes can
+    # reference it. The Middleware itself just declares an outbound URL — it
+    # can be created before Authentik is installed; it only becomes functional
+    # once cluster/authentication.yml has run and the Authentik service is
+    # reachable in the cluster.
+    # -------------------------------------------------------------------------
+    - name: Write ForwardAuth Middleware manifest for observability
+      ansible.builtin.template:
+        src: traefik-forward-auth-middleware.yml.j2
+        dest: /tmp/traefik-forward-auth-middleware-observability.yml
+        mode: '0644'
+      vars:
+        middleware_namespace: '{{ observability_namespace }}'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ForwardAuth Middleware in observability namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/traefik-forward-auth-middleware-observability.yml
+      register: observability_middleware_result
+      changed_when: >-
+        'created' in observability_middleware_result.stdout or
+        'configured' in observability_middleware_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up observability ForwardAuth Middleware manifest
+      ansible.builtin.file:
+        path: /tmp/traefik-forward-auth-middleware-observability.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
     # UI Exposure
     # Exposes Prometheus, Grafana, and Alertmanager over HTTPS via Gateway API
     # HTTPRoutes attached to the traefik-gateway. ExternalDNS registers each
-    # hostname in Bind9 once the HTTPRoutes are accepted by the Gateway.
+    # hostname in Bind9 once the HTTPRoutes are accepted by the Gateway. Each
+    # route is gated by ForwardAuth and only becomes accessible once Authentik
+    # is installed by cluster/authentication.yml.
     # -------------------------------------------------------------------------
     - name: Write observability HTTPRoute manifests
       ansible.builtin.template:
@@ -234,6 +272,7 @@
         httproute_backend_name: "{{ item.backend_name }}"
         httproute_backend_namespace: "{{ observability_namespace }}"
         httproute_backend_port: "{{ item.backend_port }}"
+        with_forward_auth: true
       loop: "{{ observability_httproutes }}"
       when: bootstrap_node | default(false)
 

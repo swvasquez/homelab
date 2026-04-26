@@ -16,8 +16,8 @@
 # before they reach the Open WebUI pod.
 #
 # The web UI is exposed via a ClusterIP service and an HTTPRoute through Traefik
-# with Authentik ForwardAuth. After deploying this playbook, re-run
-# cluster/authentication.yml to apply the HTTPRoute and ForwardAuth middleware.
+# with Authentik ForwardAuth. The HTTPRoute and ForwardAuth Middleware are
+# applied by this playbook itself in the Open WebUI namespace.
 #
 # Run order:
 #   1. cluster/authentication.yml
@@ -25,7 +25,6 @@
 #   3. services/argocd.yml
 #   4. services/vllm.yml
 #   5. services/openwebui.yml (this playbook)
-#   6. cluster/authentication.yml (to apply HTTPRoute and ForwardAuth)
 #
 # Input Variables:
 #   bootstrap_node:              Boolean indicating if the host is the control
@@ -67,13 +66,15 @@
   become_exe: sudo.ws
   vars:
     openwebui_namespace: open-webui
-    openwebui_chart_version: "6.12.0"
+    openwebui_hostname: 'chat.{{ dns_zone }}'
+    openwebui_chart_version: '6.12.0'
     openwebui_storage_size: 2Gi
     openwebui_storage_class: longhorn
-    openwebui_gitops_path: apps/open-webui
     vllm_namespace: vllm
     vllm_api_port: 8000
+    openwebui_gitops_path: apps/open-webui
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    authentik_namespace: authentik
     gitea_namespace: gitea
     gitea_admin_username: gitea_admin
     gitea_gitops_repo: gitops
@@ -100,6 +101,91 @@
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
+    # Default ServiceAccount Hardening
+    # -------------------------------------------------------------------------
+    # Disables the default ServiceAccount token automount in this namespace so
+    # ad-hoc pods that don't name a ServiceAccount cannot read a usable API
+    # bearer credential.
+    # -------------------------------------------------------------------------
+    - name: Disable default ServiceAccount token automount in Open WebUI namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch serviceaccount default
+          -n {{ openwebui_namespace }}
+          --type=merge
+          -p '{"automountServiceAccountToken": false}'
+      register: openwebui_sa_automount_result
+      changed_when: "'patched' in openwebui_sa_automount_result.stdout"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ForwardAuth Middleware and HTTPRoute
+    # -------------------------------------------------------------------------
+    # Deploys the Traefik ForwardAuth Middleware in the Open WebUI namespace
+    # and exposes the Open WebUI over HTTPS via an HTTPRoute attached to the
+    # traefik-gateway. Authentik gates all access. Authentik must already be
+    # installed (cluster/authentication.yml) for the gate to function.
+    # -------------------------------------------------------------------------
+    - name: Write ForwardAuth Middleware manifest for Open WebUI
+      ansible.builtin.template:
+        src: ../cluster/templates/traefik-forward-auth-middleware.yml.j2
+        dest: /tmp/traefik-forward-auth-middleware-open-webui.yml
+        mode: '0644'
+      vars:
+        middleware_namespace: '{{ openwebui_namespace }}'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ForwardAuth Middleware in Open WebUI namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/traefik-forward-auth-middleware-open-webui.yml
+      register: openwebui_middleware_result
+      changed_when: >-
+        'created' in openwebui_middleware_result.stdout or
+        'configured' in openwebui_middleware_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Open WebUI ForwardAuth Middleware manifest
+      ansible.builtin.file:
+        path: /tmp/traefik-forward-auth-middleware-open-webui.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write Open WebUI HTTPRoute manifest
+      ansible.builtin.template:
+        src: ../cluster/templates/httproute.yml.j2
+        dest: /tmp/open-webui-httproute.yml
+        mode: '0644'
+      vars:
+        httproute_name: open-webui
+        httproute_namespace: '{{ openwebui_namespace }}'
+        httproute_hostname: '{{ openwebui_hostname }}'
+        httproute_backend_name: open-webui
+        httproute_backend_namespace: '{{ openwebui_namespace }}'
+        httproute_backend_port: 80
+        with_forward_auth: true
+      when: bootstrap_node | default(false)
+
+    - name: Apply Open WebUI HTTPRoute
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/open-webui-httproute.yml
+      register: openwebui_httproute_result
+      changed_when: >-
+        'created' in openwebui_httproute_result.stdout or
+        'configured' in openwebui_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Open WebUI HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/open-webui-httproute.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
     # Credentials
     # -------------------------------------------------------------------------
     # Generates a random secret key for the Open WebUI application and copies
@@ -116,7 +202,7 @@
       failed_when: false
       when: bootstrap_node | default(false)
 
-    - name: Generate random secret key for Open WebUI
+    - name: Generate Open WebUI secret key
       ansible.builtin.command:
         cmd: openssl rand -hex 32
       register: openwebui_secret_key_gen
@@ -197,7 +283,7 @@
       changed_when: false
       when: bootstrap_node | default(false)
 
-    - name: Read Gitea admin password from Kubernetes secret
+    - name: Read Gitea admin password from Kubernetes Secret
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
@@ -294,7 +380,7 @@
         - bootstrap_node | default(false)
         - gitops_diff_result.rc != 0
 
-    - name: Remove gitops temporary directory
+    - name: Clean up gitops temporary directory
       ansible.builtin.file:
         path: /tmp/gitops-openwebui
         state: absent
@@ -325,7 +411,7 @@
         'created' in argocd_app_result.stdout
       when: bootstrap_node | default(false)
 
-    - name: Remove ArgoCD Application manifest temporary file
+    - name: Clean up ArgoCD Application manifest for Open WebUI
       ansible.builtin.file:
         path: /tmp/openwebui-app.yml
         state: absent

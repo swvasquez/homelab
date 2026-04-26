@@ -135,6 +135,7 @@
     bind9_dns_port: '{{ ufw_allowed_ports.bind9_dns_tcp.port }}'
     externaldns_chart_version: 1.19.0
     upstream_dns: 8.8.8.8 1.1.1.1
+    authentik_namespace: authentik
 
   tasks:
     # -------------------------------------------------------------------------
@@ -389,6 +390,18 @@
         state: absent
       when: bootstrap_node | default(false)
 
+    - name: Disable default ServiceAccount token automount in Traefik namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch serviceaccount default
+          -n {{ traefik_namespace }}
+          --type=merge
+          -p '{"automountServiceAccountToken": false}'
+      register: traefik_sa_automount_result
+      changed_when: "'patched' in traefik_sa_automount_result.stdout"
+      when: bootstrap_node | default(false)
+
     # -------------------------------------------------------------------------
     # Gateway
     # Creates the traefik-gateway Gateway API resource in kube-system. This
@@ -422,12 +435,49 @@
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
+    # ForwardAuth Middleware (kube-system)
+    # Deploys the Traefik ForwardAuth Middleware in the kube-system namespace
+    # so that the Traefik dashboard and Hubble UI HTTPRoutes (also in
+    # kube-system) can reference it. The Middleware itself just declares an
+    # outbound URL — it can be created before Authentik is installed; it only
+    # becomes functional once cluster/authentication.yml has run and the
+    # Authentik service is reachable in the cluster.
+    # -------------------------------------------------------------------------
+    - name: Write ForwardAuth Middleware manifest for kube-system
+      ansible.builtin.template:
+        src: traefik-forward-auth-middleware.yml.j2
+        dest: /tmp/traefik-forward-auth-middleware-kube-system.yml
+        mode: '0644'
+      vars:
+        middleware_namespace: kube-system
+      when: bootstrap_node | default(false)
+
+    - name: Apply ForwardAuth Middleware in kube-system
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/traefik-forward-auth-middleware-kube-system.yml
+      register: kube_system_middleware_result
+      changed_when: >-
+        'created' in kube_system_middleware_result.stdout or
+        'configured' in kube_system_middleware_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up kube-system ForwardAuth Middleware manifest
+      ansible.builtin.file:
+        path: /tmp/traefik-forward-auth-middleware-kube-system.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
     # Dashboard Exposure
     # Exposes the Traefik dashboard over HTTPS via a Gateway API HTTPRoute
     # attached to the traefik-gateway. The HTTPRoute routes traffic matching
     # the Traefik hostname to the dashboard service on port 8080. HTTP traffic
     # is redirected to HTTPS by the Traefik entrypoint redirect configured in
-    # traefik-values.yml.j2.
+    # traefik-values.yml.j2. The route is gated by ForwardAuth and only
+    # becomes accessible once Authentik is installed by
+    # cluster/authentication.yml.
     # -------------------------------------------------------------------------
     - name: Write Traefik dashboard HTTPRoute manifest
       ansible.builtin.template:
@@ -441,6 +491,7 @@
         httproute_backend_name: traefik
         httproute_backend_namespace: '{{ traefik_namespace }}'
         httproute_backend_port: 8080
+        with_forward_auth: true
       when: bootstrap_node | default(false)
 
     - name: Apply Traefik dashboard HTTPRoute
@@ -555,7 +606,8 @@
     # -------------------------------------------------------------------------
     # Hubble UI Exposure
     # Exposes the Hubble UI over the LAN via an HTTPRoute attached to the
-    # traefik-gateway. No separate Gateway is needed.
+    # traefik-gateway. The route is gated by ForwardAuth and only becomes
+    # accessible once Authentik is installed by cluster/authentication.yml.
     # -------------------------------------------------------------------------
     - name: Write Hubble HTTPRoute manifest
       ansible.builtin.template:
@@ -569,6 +621,7 @@
         httproute_backend_name: hubble-ui
         httproute_backend_namespace: kube-system
         httproute_backend_port: 80
+        with_forward_auth: true
       when: bootstrap_node | default(false)
 
     - name: Apply Hubble HTTPRoute

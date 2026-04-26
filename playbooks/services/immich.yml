@@ -46,10 +46,8 @@
 # via kubectl. ArgoCD syncs automatically on push via the Gitea webhook
 # registered by argocd.yml.
 #
-# The Immich HTTPRoute is managed by authentication.yml, which centralizes
-# HTTPRoute management for all cluster services and applies the Authentik
-# ForwardAuth middleware. Run authentication.yml after this playbook to expose
-# the Immich UI over HTTPS.
+# The Immich HTTPRoute and Authentik ForwardAuth Middleware are applied by
+# this playbook itself in the Immich namespace.
 #
 # Run order:
 #   1. infrastructure/nfs.yml (NFS server and Kubernetes NFS path)
@@ -57,8 +55,6 @@
 #   3. services/gitea.yml
 #   4. services/argocd.yml
 #   5. services/immich.yml (this playbook)
-#   6. cluster/authentication.yml (re-run to apply HTTPRoutes and ForwardAuth
-#      middleware for all services including Immich)
 #
 # Variables:
 #   bootstrap_node:             Boolean indicating if the host is the control
@@ -131,27 +127,27 @@
   become_exe: sudo.ws
   vars:
     immich_namespace: immich
+    immich_hostname: 'immich.{{ dns_zone }}'
     immich_chart_version: 0.10.3
     immich_image_tag: v2.0.0
-    immich_hostname: 'immich.{{ dns_zone }}'
+    immich_storage_class: longhorn
     immich_db_name: immich
     immich_db_username: immich
     immich_db_image: ghcr.io/cloudnative-pg/postgresql:17
     immich_db_storage_size: 5Gi
     immich_library_nfs_path: '{{ nfs_k8s_path }}/immich'
     immich_library_nfs_size: 10Gi
-    immich_storage_class: longhorn
-    immich_gitops_path: apps/immich
     nfs_server_ip: >-
       {{ hostvars | dict2items
          | selectattr('value.nfs_server', 'defined')
          | selectattr('value.nfs_server', 'equalto', true)
          | map(attribute='value.private_ip')
          | first }}
+    immich_gitops_path: apps/immich
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
     authentik_namespace: authentik
     authentik_hostname: 'authentik.{{ dns_zone }}'
     authentik_signing_key_name: 'authentik Self-signed Certificate'
-    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
     gitea_namespace: gitea
     gitea_admin_username: gitea_admin
     gitea_gitops_repo: gitops
@@ -160,6 +156,7 @@
   tasks:
     # -------------------------------------------------------------------------
     # Namespace
+    # -------------------------------------------------------------------------
     # Creates the Immich namespace before any other resources so that the
     # immich-credentials Secret can be stored there before ArgoCD first syncs
     # the Helm release.
@@ -177,55 +174,94 @@
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
-    # NFS Library Directory
-    # Creates the Immich photo library subdirectory within the Kubernetes NFS
-    # path. Runs on the NFS server node to operate directly on the server
-    # filesystem, bypassing NFS root_squash restrictions. infrastructure/nfs.yml
-    # must have been run first to create nfs_k8s_path.
+    # Default ServiceAccount Hardening
     # -------------------------------------------------------------------------
-    - name: Create Immich library directory on NFS server
-      ansible.builtin.file:
-        path: '{{ immich_library_nfs_path }}'
-        state: directory
-        owner: root
-        group: '{{ nfs_group }}'
-        mode: '2775'
-      when: nfs_server | default(false)
-
+    # Disables the default ServiceAccount token automount in this namespace so
+    # ad-hoc pods that don't name a ServiceAccount cannot read a usable API
+    # bearer credential.
     # -------------------------------------------------------------------------
-    # NFS Library PersistentVolume
-    # Applies a static PersistentVolume and PersistentVolumeClaim for the
-    # Immich photo library backed by the NFS share. These are applied before
-    # ArgoCD syncs the Helm release so the PVC exists when the chart references
-    # it via existingClaim. The PV uses Retain reclaim policy so library data
-    # is not deleted if the PVC is removed.
-    # -------------------------------------------------------------------------
-    - name: Write Immich NFS library PV manifest
-      ansible.builtin.template:
-        src: templates/immich-nfs-library-pv.yml.j2
-        dest: /tmp/immich-nfs-library-pv.yml
-        mode: '0600'
-      when: bootstrap_node | default(false)
-
-    - name: Apply Immich NFS library PV and PVC
+    - name: Disable default ServiceAccount token automount in Immich namespace
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
-          apply -f /tmp/immich-nfs-library-pv.yml
-      register: immich_pv_result
-      changed_when: >-
-        'created' in immich_pv_result.stdout or
-        'configured' in immich_pv_result.stdout
+          patch serviceaccount default
+          -n {{ immich_namespace }}
+          --type=merge
+          -p '{"automountServiceAccountToken": false}'
+      register: immich_sa_automount_result
+      changed_when: "'patched' in immich_sa_automount_result.stdout"
       when: bootstrap_node | default(false)
 
-    - name: Remove Immich NFS library PV manifest temporary file
+    # -------------------------------------------------------------------------
+    # ForwardAuth Middleware and HTTPRoute
+    # -------------------------------------------------------------------------
+    # Deploys the Traefik ForwardAuth Middleware in the Immich namespace and
+    # exposes the Immich UI over HTTPS via an HTTPRoute attached to the
+    # traefik-gateway. Authentik gates browser access on top of Immich's own
+    # OIDC login. Authentik must already be installed
+    # (cluster/authentication.yml) for the gate to function.
+    # -------------------------------------------------------------------------
+    - name: Write ForwardAuth Middleware manifest for Immich
+      ansible.builtin.template:
+        src: ../cluster/templates/traefik-forward-auth-middleware.yml.j2
+        dest: /tmp/traefik-forward-auth-middleware-immich.yml
+        mode: '0644'
+      vars:
+        middleware_namespace: '{{ immich_namespace }}'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ForwardAuth Middleware in Immich namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/traefik-forward-auth-middleware-immich.yml
+      register: immich_middleware_result
+      changed_when: >-
+        'created' in immich_middleware_result.stdout or
+        'configured' in immich_middleware_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Immich ForwardAuth Middleware manifest
       ansible.builtin.file:
-        path: /tmp/immich-nfs-library-pv.yml
+        path: /tmp/traefik-forward-auth-middleware-immich.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write Immich HTTPRoute manifest
+      ansible.builtin.template:
+        src: ../cluster/templates/httproute.yml.j2
+        dest: /tmp/immich-httproute.yml
+        mode: '0644'
+      vars:
+        httproute_name: immich
+        httproute_namespace: '{{ immich_namespace }}'
+        httproute_hostname: '{{ immich_hostname }}'
+        httproute_backend_name: immich-server
+        httproute_backend_namespace: '{{ immich_namespace }}'
+        httproute_backend_port: 2283
+        with_forward_auth: true
+      when: bootstrap_node | default(false)
+
+    - name: Apply Immich HTTPRoute
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/immich-httproute.yml
+      register: immich_httproute_result
+      changed_when: >-
+        'created' in immich_httproute_result.stdout or
+        'configured' in immich_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Immich HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/immich-httproute.yml
         state: absent
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
     # Credentials
+    # -------------------------------------------------------------------------
     # Generates a database password and application secret key on first run and
     # persists them in a Kubernetes Secret named immich-credentials in the
     # immich namespace. The Helm values file references this Secret via
@@ -261,7 +297,7 @@
         - bootstrap_node | default(false)
         - existing_immich_credentials_check.rc != 0
 
-    - name: Create Immich credentials Kubernetes secret
+    - name: Create Immich credentials Secret
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
@@ -277,15 +313,16 @@
 
     # -------------------------------------------------------------------------
     # Database
+    # -------------------------------------------------------------------------
     # Provisions a CloudNativePG Cluster for Immich's PostgreSQL database using
     # the standard cnpg PostgreSQL 17 image. Immich v2.0+ uses pgvector (not
     # pgvecto-rs), which is included in the standard image. A cnpg-formatted
-    # credentials secret (immich-db-credentials) is created from the
+    # credentials Secret (immich-db-credentials) is created from the
     # db-password stored in immich-credentials. The postInitSQL bootstrap
     # creates the extensions required by Immich before ArgoCD first syncs the
     # Helm release.
     # -------------------------------------------------------------------------
-    - name: Read Immich database password from credentials secret
+    - name: Read Immich database password from credentials Secret
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
@@ -295,7 +332,7 @@
       changed_when: false
       when: bootstrap_node | default(false)
 
-    - name: Create Immich cnpg database credentials secret
+    - name: Create Immich cnpg database credentials Secret
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
@@ -351,7 +388,7 @@
         'configured' in immich_db_cluster_result.stdout
       when: bootstrap_node | default(false)
 
-    - name: Remove Immich cnpg Cluster manifest temporary file
+    - name: Clean up Immich cnpg Cluster manifest
       ansible.builtin.file:
         path: /tmp/immich-db-cluster.yml
         state: absent
@@ -372,6 +409,7 @@
 
     # -------------------------------------------------------------------------
     # Authentik OIDC Configuration
+    # -------------------------------------------------------------------------
     # Reads the Authentik bootstrap token from the existing authentik-credentials
     # Secret, then uses the Authentik REST API to create an OAuth2 provider and
     # application for Immich. The provider is configured for the confidential
@@ -387,7 +425,7 @@
     # API calls are made to the Authentik server ClusterIP, which is reachable
     # from cluster nodes via Cilium's eBPF kube-proxy replacement.
     # -------------------------------------------------------------------------
-    - name: Read Authentik bootstrap token from Kubernetes secret
+    - name: Read Authentik bootstrap token from Kubernetes Secret
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
@@ -652,7 +690,58 @@
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
-    # GitOps - Helm Values Commit
+    # NFS Library Directory
+    # -------------------------------------------------------------------------
+    # Creates the Immich photo library subdirectory within the Kubernetes NFS
+    # path. Runs on the NFS server node to operate directly on the server
+    # filesystem, bypassing NFS root_squash restrictions. infrastructure/nfs.yml
+    # must have been run first to create nfs_k8s_path.
+    # -------------------------------------------------------------------------
+    - name: Create Immich library directory on NFS server
+      ansible.builtin.file:
+        path: '{{ immich_library_nfs_path }}'
+        state: directory
+        owner: root
+        group: '{{ nfs_group }}'
+        mode: '2775'
+      when: nfs_server | default(false)
+
+    # -------------------------------------------------------------------------
+    # NFS Library PersistentVolume
+    # -------------------------------------------------------------------------
+    # Applies a static PersistentVolume and PersistentVolumeClaim for the
+    # Immich photo library backed by the NFS share. These are applied before
+    # ArgoCD syncs the Helm release so the PVC exists when the chart references
+    # it via existingClaim. The PV uses Retain reclaim policy so library data
+    # is not deleted if the PVC is removed.
+    # -------------------------------------------------------------------------
+    - name: Write Immich NFS library PV manifest
+      ansible.builtin.template:
+        src: templates/immich-nfs-library-pv.yml.j2
+        dest: /tmp/immich-nfs-library-pv.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Apply Immich NFS library PV and PVC
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/immich-nfs-library-pv.yml
+      register: immich_pv_result
+      changed_when: >-
+        'created' in immich_pv_result.stdout or
+        'configured' in immich_pv_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Immich NFS library PV manifest
+      ansible.builtin.file:
+        path: /tmp/immich-nfs-library-pv.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # GitOps - Helm Values Management
+    # -------------------------------------------------------------------------
     # Renders the Immich Helm values file from a Jinja2 template and commits it
     # to the Gitea gitops repository under apps/immich/values.yml. ArgoCD reads
     # this file via the multi-source Application and syncs the Helm release
@@ -682,7 +771,7 @@
       changed_when: false
       when: bootstrap_node | default(false)
 
-    - name: Read Gitea admin password from Kubernetes secret
+    - name: Read Gitea admin password from Kubernetes Secret
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
@@ -774,7 +863,7 @@
         - bootstrap_node | default(false)
         - gitops_diff_result.rc != 0
 
-    - name: Remove gitops temporary directory
+    - name: Clean up gitops temporary directory
       ansible.builtin.file:
         path: /tmp/gitops-immich
         state: absent
@@ -782,6 +871,7 @@
 
     # -------------------------------------------------------------------------
     # ArgoCD Application
+    # -------------------------------------------------------------------------
     # Renders the ArgoCD Application manifest from a Jinja2 template and applies
     # it to the cluster via kubectl. The Application uses the multi-source
     # feature to pull the Immich Helm chart from the upstream immich-app/immich-
@@ -806,7 +896,7 @@
         'created' in argocd_app_result.stdout
       when: bootstrap_node | default(false)
 
-    - name: Remove ArgoCD Application manifest temporary file
+    - name: Clean up ArgoCD Application manifest for Immich
       ansible.builtin.file:
         path: /tmp/immich-app.yml
         state: absent

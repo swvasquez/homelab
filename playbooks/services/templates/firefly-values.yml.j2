@@ -9,9 +9,9 @@
   are never committed to the gitops repository. The secret must contain keys named
   APP_KEY and DB_PASSWORD.
 
-  The bundled Bitnami postgresql subchart is disabled in favour of the cnpg-managed
-  database. Ingress is disabled in favour of a Traefik HTTPRoute with Authentik
-  ForwardAuth, managed by cluster/authentication.yml.
+  The bundled Bitnami postgresql subchart is disabled in favor of the cnpg-managed
+  database. Ingress is disabled in favor of a Traefik HTTPRoute with Authentik
+  ForwardAuth applied by firefly.yml itself in the Firefly III namespace.
 
   Note: MAIL_MAILER is set to 'log' to suppress mail delivery errors in a homelab
   environment where no SMTP server is configured.
