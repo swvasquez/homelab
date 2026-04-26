@@ -141,7 +141,7 @@
     # -------------------------------------------------------------------------
     - name: Write ForwardAuth Middleware manifest for Gitea
       ansible.builtin.template:
-        src: ../cluster/templates/traefik-forward-auth-middleware.yml.j2
+        src: templates/traefik-forward-auth-middleware.yml.j2
         dest: /tmp/traefik-forward-auth-middleware-gitea.yml
         mode: '0644'
       vars:
@@ -167,7 +167,7 @@
 
     - name: Write Gitea HTTPRoute manifest
       ansible.builtin.template:
-        src: ../cluster/templates/httproute.yml.j2
+        src: templates/httproute.yml.j2
         dest: /tmp/gitea-httproute.yml
         mode: '0644'
       vars:

@@ -21,10 +21,10 @@
 #
 # Run order:
 #   1. cluster/authentication.yml
-#   2. services/gitea.yml
-#   3. services/argocd.yml
-#   4. services/vllm.yml
-#   5. services/openwebui.yml (this playbook)
+#   2. cluster/git.yml
+#   3. cluster/gitops.yml
+#   4. service/vllm.yml
+#   5. service/openwebui.yml (this playbook)
 #
 # Input Variables:
 #   bootstrap_node:              Boolean indicating if the host is the control

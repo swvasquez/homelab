@@ -33,9 +33,9 @@
 # Run order:
 #   1. infrastructure/nfs.yml (NFS server and Kubernetes NFS path)
 #   2. cluster/authentication.yml
-#   3. services/gitea.yml
-#   4. services/argocd.yml
-#   5. services/syncthing.yml (this playbook — applies its own HTTPRoute and
+#   3. cluster/git.yml
+#   4. cluster/gitops.yml
+#   5. service/syncthing.yml (this playbook — applies its own HTTPRoute and
 #      ForwardAuth Middleware in the Syncthing namespace)
 #
 # Input Variables:

@@ -41,9 +41,9 @@
 #
 # Run order:
 #   1. cluster/authentication.yml (Authentik, Traefik, cert-manager)
-#   2. services/gitea.yml
-#   3. services/argocd.yml
-#   4. services/vaultwarden.yml (this playbook)
+#   2. cluster/git.yml
+#   3. cluster/gitops.yml
+#   4. service/vaultwarden.yml (this playbook)
 #
 # Input Variables:
 #   bootstrap_node:               Boolean indicating if the host is the control

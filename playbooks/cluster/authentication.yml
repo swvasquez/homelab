@@ -23,7 +23,7 @@
 # and HTTPRoute referencing that Middleware. This playbook does NOT deploy the
 # per-namespace Middlewares or service HTTPRoutes itself — each cluster
 # component (network.yml, storage.yml, observability.yml, security.yml) and
-# each service playbook in playbooks/services/ is responsible for applying its
+# each service playbook in playbooks/service/ is responsible for applying its
 # own Middleware and HTTPRoute. Adding a new service therefore does NOT
 # require re-running this playbook.
 #

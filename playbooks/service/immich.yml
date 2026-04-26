@@ -52,9 +52,9 @@
 # Run order:
 #   1. infrastructure/nfs.yml (NFS server and Kubernetes NFS path)
 #   2. cluster/authentication.yml (Authentik, Traefik, cert-manager)
-#   3. services/gitea.yml
-#   4. services/argocd.yml
-#   5. services/immich.yml (this playbook)
+#   3. cluster/git.yml
+#   4. cluster/gitops.yml
+#   5. service/immich.yml (this playbook)
 #
 # Variables:
 #   bootstrap_node:             Boolean indicating if the host is the control

@@ -144,9 +144,9 @@ Playbooks are organized logically into categories, and each category maintains i
 `templates/` folder (if applicable) to keep playbooks and their dependencies tightly coupled:
 
 - `infrastructure/`: OS-level configurations and bare-metal setup.
-- `cluster/`: Kubernetes cluster bootstrapping and core components.
+- `cluster/`: Kubernetes cluster bootstrapping and core platform components, including the Git server (`git.yml`) and GitOps controller (`gitops.yml`).
 - `development/`: Language toolchains and development environments.
-- `services/`: Cluster-hosted services (e.g. Gitea, ArgoCD, Syncthing).
+- `service/`: Cluster-hosted user services (e.g. Syncthing, Jellyfin, Vaultwarden).
 
 ## Usage
 
@@ -199,9 +199,9 @@ just lint playbooks/cluster/bootstrap.yml
 - **`become_exe` configuration**: `become_exe` must be set to `sudo.ws` to resolve an issue
   with Ansible. See [Ansible Issue #85837](https://github.com/ansible/ansible/issues/85837)
   for details.
-- **Service playbook run order**: Once the cluster Playbooks (`bootstrap`, `network`, `storage`, `database`, `observability`, `authentication`, `security`) have all been run, services in `playbooks/services/` are self-contained. Each service Playbook applies its own HTTPRoute, Traefik ForwardAuth Middleware, and namespace hardening, so adding a new service does NOT require re-running any cluster Playbook:
+- **Service playbook run order**: Once the cluster Playbooks (`bootstrap`, `network`, `storage`, `database`, `observability`, `authentication`, `git`, `gitops`, `security`) have all been run, services in `playbooks/service/` are self-contained. Each service Playbook applies its own HTTPRoute, Traefik ForwardAuth Middleware, and namespace hardening, so adding a new service does NOT require re-running any cluster Playbook:
   ```sh
-  just install services <SERVICE>
+  just install service <SERVICE>
   ```
 - **Pod Security Admission**: `cluster/security.yml` configures the kube-apiserver with a cluster-wide default Pod Security Standard (`restricted`) so every namespace is protected by default. Only true infrastructure namespaces (`kube-system`, `longhorn-system`, `cnpg-system`, `cert-manager`, `observability`, `falco`, `kyverno`) are listed in the apiserver-level `psa_exempt_namespaces` list. App service namespaces stay on the `restricted` default; if a service needs to opt out (e.g. `vllm` for hostPath GPU access), the service Playbook applies a `pod-security.kubernetes.io/enforce=privileged` label on its own namespace. Adding a new service therefore does not require editing `cluster/security.yml`. The playbook patches the static `kube-apiserver.yaml` pod manifest; the kubelet reloads the apiserver automatically. Run after `cluster/authentication.yml`:
   ```sh
@@ -211,8 +211,8 @@ just lint playbooks/cluster/bootstrap.yml
   ```sh
   kubectl -n default run falco-test --image=alpine --restart=Never --rm -it -- sh
   ```
-- **Open WebUI and vLLM**: Open WebUI (`services/openwebui.yml`) connects to vLLM (`services/vllm.yml`) using the vLLM API key from the `vllm-credentials` Secret. vLLM must be deployed first. Open WebUI's built-in authentication is disabled — access is gated entirely by Traefik ForwardAuth (Authentik). The `vllm_host` inventory variable controls which nodes run a vLLM instance.
-- **Jellyfin**: Jellyfin (`services/jellyfin.yml`) is a self-hosted media server deployed via the official Helm chart. All access is gated by Traefik ForwardAuth backed by Authentik — no OIDC plugin is required. The HTTPRoute and ForwardAuth Middleware are applied by the Jellyfin Playbook itself.
+- **Open WebUI and vLLM**: Open WebUI (`service/openwebui.yml`) connects to vLLM (`service/vllm.yml`) using the vLLM API key from the `vllm-credentials` Secret. vLLM must be deployed first. Open WebUI's built-in authentication is disabled — access is gated entirely by Traefik ForwardAuth (Authentik). The `vllm_host` inventory variable controls which nodes run a vLLM instance.
+- **Jellyfin**: Jellyfin (`service/jellyfin.yml`) is a self-hosted media server deployed via the official Helm chart. All access is gated by Traefik ForwardAuth backed by Authentik — no OIDC plugin is required. The HTTPRoute and ForwardAuth Middleware are applied by the Jellyfin Playbook itself.
 - **Local DNS Resolution**: To resolve homelab services (e.g., `*.homelab.internal`) from your local machine, configure your OS to use the cluster's Bind9 LoadBalancer IP as its nameserver. Note that Syncthing sync traffic uses a **dedicated LoadBalancer IP** (separate from the web GUI) to ensure high-performance data transfer.
   - **macOS Setup**:
     ```sh

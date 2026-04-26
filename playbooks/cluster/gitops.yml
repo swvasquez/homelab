@@ -41,8 +41,8 @@
 # Gitea, the old token is deleted before a new one is created, since Gitea only
 # exposes the token value at creation time.
 #
-# gitea.yml must be run before this playbook so that Gitea is deployed and the
-# gitea-credentials Secret exists in the gitea namespace.
+# cluster/git.yml must be run before this playbook so that Gitea is deployed
+# and the gitea-credentials Secret exists in the gitea namespace.
 #
 # Variables:
 #   bootstrap_node:            Boolean indicating if the host is the control
@@ -152,7 +152,7 @@
     # -------------------------------------------------------------------------
     - name: Write ForwardAuth Middleware manifest for ArgoCD
       ansible.builtin.template:
-        src: ../cluster/templates/traefik-forward-auth-middleware.yml.j2
+        src: templates/traefik-forward-auth-middleware.yml.j2
         dest: /tmp/traefik-forward-auth-middleware-argocd.yml
         mode: '0644'
       vars:
@@ -178,7 +178,7 @@
 
     - name: Write ArgoCD HTTPRoute manifest
       ansible.builtin.template:
-        src: ../cluster/templates/httproute.yml.j2
+        src: templates/httproute.yml.j2
         dest: /tmp/argocd-httproute.yml
         mode: '0644'
       vars:
@@ -589,8 +589,8 @@
     # managed separately by checking whether a hook pointing to the ArgoCD
     # webhook URL already exists on the repository.
     #
-    # Requires gitea.yml to have been run first so that the gitea-credentials
-    # Secret exists in the gitea namespace.
+    # Requires cluster/git.yml to have been run first so that the
+    # gitea-credentials Secret exists in the gitea namespace.
     # -------------------------------------------------------------------------
     - name: Check if ArgoCD Gitea repo-creds secret already exists
       ansible.builtin.command:
