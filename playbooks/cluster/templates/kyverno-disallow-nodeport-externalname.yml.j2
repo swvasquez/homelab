@@ -1,0 +1,63 @@
+{#
+  Kyverno ClusterPolicy: disallow-nodeport-externalname
+
+  Audits any Service in an application namespace whose type is NodePort or
+  ExternalName.
+
+  NodePort punches a random high port (30000-32767) through on every node's
+  host IP, making the service reachable from the LAN without going through
+  Traefik, ForwardAuth, or any other gateway control. ExternalName rewrites
+  in-cluster DNS to an arbitrary external hostname, which can silently
+  redirect traffic to an unintended destination.
+
+  Neither type is used intentionally anywhere in this cluster. External HTTP
+  traffic enters through Traefik's LoadBalancer Service; non-HTTP protocols
+  (Syncthing sync, Gitea SSH) use their own dedicated LoadBalancer Services
+  with explicit LAN IPs from the Cilium L2 pool. LoadBalancer is therefore
+  intentionally excluded from this policy.
+
+  Initial deployment runs in Audit mode — violations surface in
+  PolicyReports without blocking. Promote to Enforce once audit reports
+  are clean.
+
+  Variables:
+    kyverno_app_namespace_selector: Label selector that matches the
+                                    application namespaces this policy
+                                    applies to. Defined in
+                                    playbooks/cluster/security.yml.
+#}
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-nodeport-externalname
+  annotations:
+    policies.kyverno.io/title: Disallow NodePort and ExternalName Services
+    policies.kyverno.io/category: Network
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Service
+    policies.kyverno.io/description: >-
+      NodePort Services open a host port on every node, bypassing Traefik
+      and ForwardAuth. ExternalName Services can silently redirect
+      in-cluster DNS to an external host. Neither type is used
+      intentionally in this cluster.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: disallow-nodeport-externalname
+      match:
+        any:
+          - resources:
+              kinds:
+                - Service
+              namespaceSelector:
+{{ kyverno_app_namespace_selector | to_nice_yaml(indent=2) | indent(16, true) }}
+      validate:
+        message: >-
+          NodePort and ExternalName Services are not allowed. Use ClusterIP
+          and route external traffic through the Traefik Gateway API
+          HTTPRoute. Non-HTTP protocols may use a LoadBalancer Service.
+        pattern:
+          spec:
+            =(type): 'ClusterIP | LoadBalancer'

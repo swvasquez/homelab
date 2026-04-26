@@ -1,0 +1,68 @@
+{#
+  Kyverno ClusterPolicy: disallow-sa-token-override
+
+  Audits any Pod that uses the 'default' ServiceAccount AND sets
+  'automountServiceAccountToken: true' on the pod spec.
+
+  Play 1 of cluster/security.yml disables automount on the 'default'
+  ServiceAccount in every app namespace so that pods which do not name a
+  specific ServiceAccount do not receive a usable API bearer credential. A
+  pod can still re-enable automount by setting the field on its own pod
+  spec, which silently undoes the hardening — this policy catches that
+  override and surfaces it for review.
+
+  Pods using a named ServiceAccount are intentionally exempt: ArgoCD,
+  Authentik, Traefik, Immich, etc. assign their own SAs with narrowly
+  scoped RBAC and legitimately need their tokens projected. The hardening
+  only targeted the 'default' SA — applying this rule to every pod would
+  flag every legitimate API-using workload.
+
+  Initial deployment runs in Audit mode — violations surface in
+  PolicyReports without blocking. Promote to Enforce once reports are clean.
+
+  Variables:
+    kyverno_app_namespace_selector: Label selector that matches the
+                                    application namespaces this policy
+                                    applies to. Defined in
+                                    playbooks/cluster/security.yml.
+#}
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-sa-token-override
+  annotations:
+    policies.kyverno.io/title: Disallow Default ServiceAccount Token Automount Override
+    policies.kyverno.io/category: RBAC Best Practices
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Pods using the 'default' ServiceAccount may not re-enable
+      'automountServiceAccountToken' after the cluster has disabled it on
+      that SA. Workloads that need API access must use a named
+      ServiceAccount with its own RBAC binding.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: deny-default-sa-automount-override
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaceSelector:
+{{ kyverno_app_namespace_selector | to_nice_yaml(indent=2) | indent(16, true) }}
+      preconditions:
+        any:
+          - key: {% raw %}'{{ request.object.spec.serviceAccountName || ''default'' }}'{% endraw +%}
+            operator: Equals
+            value: default
+      validate:
+        message: >-
+          Pods using the default ServiceAccount may not set
+          'automountServiceAccountToken: true'. Assign a named
+          ServiceAccount with its own RBAC binding instead.
+        pattern:
+          spec:
+            =(automountServiceAccountToken): false

@@ -1,0 +1,54 @@
+{#
+  Kyverno ClusterPolicy: disallow-latest-tag
+
+  Audits any Pod that sets a container image to ':latest' or omits the tag
+  entirely. The latest-tag anti-pattern makes deployments non-reproducible
+  and rollbacks ambiguous because the image content silently changes when
+  the upstream maintainer pushes a new build.
+
+  Initial deployment runs in Audit mode — violations surface in
+  PolicyReports without blocking workload creation. Promote to Enforce
+  once the audit reports are clean.
+
+  Variables:
+    kyverno_app_namespace_selector: Label selector that matches the
+                                    application namespaces this policy
+                                    applies to. Defined in
+                                    playbooks/cluster/security.yml.
+#}
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-latest-tag
+  annotations:
+    policies.kyverno.io/title: Disallow Latest Tag
+    policies.kyverno.io/category: Best Practices
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Container images with the 'latest' tag or no tag mutate over time
+      and break reproducible deploys. Audit Pods that ship one.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: require-image-tag
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaceSelector:
+{{ kyverno_app_namespace_selector | to_nice_yaml(indent=2) | indent(16, true) }}
+      validate:
+        message: >-
+          An explicit, non-':latest' image tag is required on every container.
+        pattern:
+          spec:
+            containers:
+              - image: '!*:latest & *:*'
+            =(initContainers):
+              - image: '!*:latest & *:*'
+            =(ephemeralContainers):
+              - image: '!*:latest & *:*'

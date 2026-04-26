@@ -105,6 +105,7 @@ spec:
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             capabilities:
               drop:
                 - ALL
@@ -152,6 +153,8 @@ spec:
               mountPath: /etc/ssl/certs/homelab-ca.crt
               subPath: ca.crt
               readOnly: true
+            - name: tmp
+              mountPath: /tmp
           readinessProbe:
             httpGet:
               path: /alive
@@ -171,3 +174,5 @@ spec:
         - name: ca-cert
           configMap:
             name: vaultwarden-ca
+        - name: tmp
+          emptyDir: {}

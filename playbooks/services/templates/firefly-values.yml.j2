@@ -67,6 +67,23 @@ podSecurityContext:
   seccompProfile:
     type: RuntimeDefault
 
+# readOnlyRootFilesystem is intentionally not set on this chart.
+# The fireflyiii/core image is built on serversideup/php which runs
+# s6-overlay plus a numbered chain of /etc/entrypoint.d/*.sh init scripts
+# at startup. Those scripts render templates straight into /etc/nginx
+# (and other rootfs paths), so just enabling S6_READ_ONLY_ROOT=1 plus
+# emptyDirs at /run, /var/log, /var/cache, and /tmp is not enough — the
+# very first entrypoint step (10-init-webserver-config.sh) fails with
+# 'cannot create /etc/nginx/nginx.conf: Read-only file system'.
+# Mounting an emptyDir at /etc/nginx would shadow the templates the
+# entrypoint reads from, and the firefly-iii Helm chart does not expose
+# initContainers, so there is no clean way to seed those templates into
+# a writable volume before the main container starts.
+# The firefly-iii namespace is therefore listed in the NotIn exclusion
+# list of the require-readonly-rootfs Kyverno ClusterPolicy
+# (playbooks/cluster/templates/kyverno-policies/require-readonly-rootfs.yml.j2).
+# Revisit when the upstream image supports a true read-only mode or the
+# chart adds initContainer hooks.
 securityContext:
   allowPrivilegeEscalation: false
   capabilities:

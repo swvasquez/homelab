@@ -110,6 +110,7 @@ spec:
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             capabilities:
               drop:
                 - ALL
@@ -157,12 +158,15 @@ spec:
               mountPath: /var/syncthing
             - name: syncthing-nfs-data
               mountPath: /var/syncthing/data
+            - name: tmp
+              mountPath: /tmp
       containers:
         - name: syncthing
           image: '{{ syncthing_image }}:{{ syncthing_image_tag }}'
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             capabilities:
               drop:
                 - ALL
@@ -184,6 +188,8 @@ spec:
               mountPath: /var/syncthing
             - name: syncthing-nfs-data
               mountPath: /var/syncthing/data
+            - name: tmp
+              mountPath: /tmp
           readinessProbe:
             tcpSocket:
               port: {{ syncthing_gui_port }}
@@ -198,6 +204,8 @@ spec:
         - name: syncthing-nfs-data
           persistentVolumeClaim:
             claimName: syncthing-nfs-data
+        - name: tmp
+          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: syncthing-data

@@ -1,0 +1,50 @@
+# ==============================================================================
+# Kyverno Helm Values
+# ==============================================================================
+# Configures the kyverno/kyverno Helm chart for homelab deployment. Kyverno is
+# a dynamic admission webhook that validates and mutates Kubernetes resources
+# against ClusterPolicy CRs. ClusterPolicies live alongside this template under
+# templates/kyverno-policies/ and are applied by playbooks/cluster/security.yml
+# after the chart finishes installing.
+#
+# The kyverno namespace is exempt from PSA enforcement (listed in
+# psa_exempt_namespaces in Play 1) because the admission, reports, and
+# cleanup controllers need to read every incoming resource and emit metrics,
+# which is incompatible with the readOnlyRootFilesystem and capability drops
+# required by the cluster's restricted default profile.
+#
+# Resource limits below are conservative for a small homelab cluster — bump
+# admissionController memory if the apiserver starts logging webhook timeouts.
+
+admissionController:
+  replicas: 1
+  resources:
+    limits:
+      memory: 384Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+backgroundController:
+  resources:
+    limits:
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 64Mi
+
+reportsController:
+  resources:
+    limits:
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 64Mi
+
+cleanupController:
+  resources:
+    limits:
+      memory: 128Mi
+    requests:
+      cpu: 100m
+      memory: 64Mi

@@ -2,9 +2,10 @@
 # ==============================================================================
 # Playbook: Cluster Security Hardening
 # ==============================================================================
-# Hardens the Kubernetes cluster in two plays: namespace-level hardening
-# (Pod Security Admission and ServiceAccount token automount) and Falco
-# runtime security deployment.
+# Hardens the Kubernetes cluster in three plays: namespace-level hardening
+# (Pod Security Admission and ServiceAccount token automount), Falco
+# runtime security deployment, and Kyverno admission policy engine
+# deployment with a starter set of Enforce-mode ClusterPolicies.
 #
 # Play 1 — Pod Security Admission Defaults and Namespace Hardening:
 #   Configures the built-in Pod Security Admission controller with cluster-wide
@@ -56,6 +57,37 @@
 #   exempt from the baseline PSA profile. The falco namespace is listed in
 #   psa_exempt_namespaces in Play 1.
 #
+# Play 3 — Kyverno Admission Policy Engine:
+#   Deploys Kyverno via Helm and applies four ClusterPolicies enforcing
+#   workload-level hygiene rules PSA cannot express on its own:
+#
+#   - disallow-latest-tag:            deny ':latest' or untagged images
+#   - disallow-sa-token-override:     deny pods using the default SA with
+#                                     automountServiceAccountToken: true
+#   - disallow-nodeport-externalname: deny NodePort and ExternalName
+#                                     Services in app namespaces — these
+#                                     bypass Traefik and ForwardAuth
+#   - require-readonly-rootfs:        deny containers without
+#                                     securityContext.readOnlyRootFilesystem
+#                                     = true. firefly-iii is excluded
+#                                     because the upstream image's
+#                                     entrypoint writes config into /etc
+#                                     at startup; see the comment in
+#                                     services/templates/firefly-values.yml.j2.
+#
+#   All four policies use validationFailureAction: Enforce — Kyverno's
+#   admission webhook blocks non-compliant Pods and Services at create or
+#   update time, and PolicyReports are still emitted for visibility.
+#
+#   Each policy targets app namespaces only via a namespaceSelector that
+#   excludes the PSA-exempt system namespaces — Kyverno does not fire on
+#   workloads that legitimately need elevated permissions (Falco eBPF,
+#   Longhorn CSI, vLLM ROCm, observability node-exporter, etc.).
+#
+#   The kyverno namespace itself is exempt from PSA enforcement (added to
+#   psa_exempt_namespaces in Play 1) because the admission, reports, and
+#   cleanup controllers cannot run under the cluster's restricted default.
+#
 # Run this playbook after observability.yml (Falcosidekick requires Alertmanager).
 # It is idempotent — re-running is a no-op when the cluster is already hardened.
 # Playbook order: bootstrap.yml → network.yml → storage.yml → database.yml →
@@ -86,6 +118,19 @@
 # Expected: Falco emits an alert for "Terminal shell in container" and
 # Falcosidekick forwards it to Alertmanager within a few seconds.
 #
+# Validation — Kyverno (after the playbook completes):
+#
+#   kubectl get clusterpolicy
+#   kubectl get policyreport -A
+#   kubectl get clusterpolicyreport
+#
+# Expected: four ClusterPolicies in 'Ready' state and a populated set of
+# PolicyReport / ClusterPolicyReport objects across the app namespaces.
+# Each report lists 'pass' / 'fail' / 'warn' counts per policy. Inspect
+# any 'fail' entries with:
+#
+#   kubectl get policyreport -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.summary}{"\n"}{end}'
+#
 # Rollback — PSA: delete the --admission-control-config-file line, the
 # admission-config volumeMount, and the admission-config volume from
 # /etc/kubernetes/manifests/kube-apiserver.yaml. The kubelet reloads the
@@ -96,6 +141,12 @@
 # Kubernetes default (inherits true from the namespace).
 #
 # Rollback — Falco: helm uninstall falco -n falco
+#
+# Rollback — Kyverno: kubectl delete -f the four ClusterPolicies (or
+# kubectl delete clusterpolicy disallow-latest-tag
+#   disallow-sa-token-override disallow-nodeport-externalname
+#   require-readonly-rootfs), then 'helm uninstall kyverno -n kyverno'
+# and 'kubectl delete namespace kyverno'.
 #
 # Variables — Play 1 (PSA):
 #   admission_config_dir:      Directory on the control plane node where the
@@ -132,11 +183,12 @@
 #                              audit (default: restricted).
 #   psa_exempt_namespaces:     Namespaces exempt from PSA enforcement. These
 #                              host workloads that require host access (CNI,
-#                              CSI, GPU, node-exporter, Falco eBPF) and cannot
-#                              run under baseline (default: kube-system,
-#                              kube-public, kube-node-lease, longhorn-system,
-#                              cnpg-system, cert-manager, vllm, observability,
-#                              falco).
+#                              CSI, GPU, node-exporter, Falco eBPF, Kyverno
+#                              webhooks) and cannot run under baseline
+#                              (default: kube-system, kube-public,
+#                              kube-node-lease, longhorn-system, cnpg-system,
+#                              cert-manager, vllm, observability, falco,
+#                              kyverno).
 #   psa_restricted_namespaces: Namespaces opted up to the 'restricted' PSA
 #                              profile via an explicit namespace label. Also
 #                              used as the target list for the default
@@ -167,6 +219,32 @@
 #   kubectl_config_path:       Full path to the kubectl config file used on
 #                              the control plane
 #                              (default: /home/<ansible_user>/.kube/config).
+#
+# Variables — Play 3 (Kyverno):
+#   kyverno_namespace:         Kubernetes namespace for the Kyverno control
+#                              plane (default: kyverno).
+#   kyverno_chart_version:     Helm chart version of kyverno/kyverno to
+#                              install (default: 3.7.2).
+#   kyverno_app_namespace_selector: Label selector that scopes every
+#                              ClusterPolicy match block to application
+#                              namespaces only. Implemented as a NotIn
+#                              expression on 'kubernetes.io/metadata.name'
+#                              that excludes the system namespaces which
+#                              legitimately need elevated permissions
+#                              (default excludes: kube-system,
+#                              longhorn-system, cnpg-system, cert-manager,
+#                              vllm, observability, falco).
+#   kyverno_policies:          List of ClusterPolicy template basenames
+#                              applied after the chart finishes installing.
+#                              Each entry maps to
+#                              templates/kyverno-<name>.yml.j2
+#                              (default: disallow-latest-tag,
+#                              disallow-sa-token-override,
+#                              disallow-nodeport-externalname,
+#                              require-readonly-rootfs).
+#   kubectl_config_path:       Full path to the kubectl config file used on
+#                              the control plane
+#                              (default: /home/<ansible_user>/.kube/config).
 
 - name: Harden namespace defaults and Pod Security Admission
   hosts: homelab
@@ -192,6 +270,7 @@
       - vllm
       - observability
       - falco
+      - kyverno
     psa_restricted_namespaces:
       - default
       - syncthing
@@ -534,4 +613,143 @@
       ansible.builtin.file:
         path: /tmp/falco-ui-httproute.yml
         state: absent
+      when: bootstrap_node | default(false)
+
+- name: Deploy Kyverno admission policy engine
+  hosts: homelab
+  become: true
+  become_exe: sudo.ws
+  vars:
+    kyverno_namespace: kyverno
+    kyverno_chart_version: 3.7.2
+    kyverno_app_namespace_selector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - kube-system
+            - longhorn-system
+            - cnpg-system
+            - cert-manager
+            - vllm
+            - observability
+            - falco
+    kyverno_policies:
+      - disallow-latest-tag
+      - disallow-sa-token-override
+      - disallow-nodeport-externalname
+      - require-readonly-rootfs
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Namespace
+    # -------------------------------------------------------------------------
+    # Creates the kyverno namespace before the Helm install. The namespace is
+    # exempt from the cluster's restricted PSA default (see psa_exempt_namespaces
+    # in Play 1) — the admission, reports, and cleanup controllers all need
+    # to read every incoming resource and emit metrics, which is incompatible
+    # with the readOnlyRootFilesystem and capability drops required by the
+    # restricted profile.
+    # -------------------------------------------------------------------------
+    - name: Create kyverno namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create namespace {{ kyverno_namespace }}
+      register: kyverno_ns_result
+      changed_when: "'created' in kyverno_ns_result.stdout"
+      failed_when:
+        - kyverno_ns_result.rc != 0
+        - "'already exists' not in kyverno_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Kyverno Installation
+    # -------------------------------------------------------------------------
+    # Installs Kyverno via the official kyverno/kyverno Helm chart. The chart
+    # ships four controllers (admission, background, reports, cleanup) plus
+    # the Kyverno CRDs. Resource limits in the values template are tuned for
+    # the homelab cluster's modest CPU and memory headroom.
+    # -------------------------------------------------------------------------
+    - name: Add kyverno Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add kyverno https://kyverno.github.io/kyverno/
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Update Helm repositories
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Write Kyverno values file
+      ansible.builtin.template:
+        src: kyverno-values.yml.j2
+        dest: /tmp/kyverno-values.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Install or upgrade Kyverno via Helm
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade --install kyverno
+          kyverno/kyverno
+          --namespace {{ kyverno_namespace }}
+          --kubeconfig {{ kubectl_config_path }}
+          --values /tmp/kyverno-values.yml
+          --version {{ kyverno_chart_version }}
+          --timeout 10m
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Kyverno values file
+      ansible.builtin.file:
+        path: /tmp/kyverno-values.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Starter ClusterPolicies
+    # -------------------------------------------------------------------------
+    # Renders each ClusterPolicy template into /tmp, applies it via kubectl,
+    # then cleans up the rendered file. Every policy carries
+    # validationFailureAction: Enforce — Kyverno's admission webhook blocks
+    # non-compliant Pods and Services at create/update time, and
+    # PolicyReports are still emitted for visibility.
+    #
+    # Each policy's match block scopes to app namespaces only via the shared
+    # kyverno_app_namespace_selector — the PSA-exempt system namespaces
+    # (Falco eBPF, Longhorn CSI, vLLM ROCm, observability node-exporter,
+    # cert-manager, CNPG operator, kube-system, kyverno itself) are excluded
+    # because they legitimately need elevated permissions that these
+    # rules would otherwise flag. The require-readonly-rootfs policy
+    # additionally excludes firefly-iii — see its template for the reason.
+    # -------------------------------------------------------------------------
+    - name: Write Kyverno ClusterPolicy manifests
+      ansible.builtin.template:
+        src: 'kyverno-{{ item }}.yml.j2'
+        dest: '/tmp/kyverno-{{ item }}.yml'
+        mode: '0644'
+      loop: '{{ kyverno_policies }}'
+      when: bootstrap_node | default(false)
+
+    - name: Apply Kyverno ClusterPolicies
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/kyverno-{{ item }}.yml
+      register: kyverno_policy_apply_result
+      changed_when: >-
+        'created' in kyverno_policy_apply_result.stdout or
+        'configured' in kyverno_policy_apply_result.stdout
+      loop: '{{ kyverno_policies }}'
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Kyverno ClusterPolicy manifests
+      ansible.builtin.file:
+        path: '/tmp/kyverno-{{ item }}.yml'
+        state: absent
+      loop: '{{ kyverno_policies }}'
       when: bootstrap_node | default(false)

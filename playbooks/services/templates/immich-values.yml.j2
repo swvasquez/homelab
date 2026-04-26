@@ -76,6 +76,7 @@ immich:
 
 server:
   defaultPodOptions:
+    automountServiceAccountToken: false
     securityContext:
       runAsNonRoot: true
       runAsUser: {{ nonroot_uid }}
@@ -95,6 +96,7 @@ server:
             tag: '{{ immich_image_tag }}'
           securityContext:
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             capabilities:
               drop:
                 - ALL
@@ -119,10 +121,16 @@ server:
               memory: 256Mi
             limits:
               memory: 1Gi
+  persistence:
+    tmp:
+      type: emptyDir
+      globalMounts:
+        - path: /tmp
 
 machine-learning:
   enabled: true
   defaultPodOptions:
+    automountServiceAccountToken: false
     securityContext:
       runAsNonRoot: true
       runAsUser: {{ nonroot_uid }}
@@ -138,6 +146,7 @@ machine-learning:
             tag: '{{ immich_image_tag }}'
           securityContext:
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             capabilities:
               drop:
                 - ALL
@@ -147,10 +156,20 @@ machine-learning:
               memory: 512Mi
             limits:
               memory: 2Gi
+  persistence:
+    tmp:
+      type: emptyDir
+      globalMounts:
+        - path: /tmp
+    cache:
+      type: emptyDir
+      globalMounts:
+        - path: /cache
 
 valkey:
   enabled: true
   defaultPodOptions:
+    automountServiceAccountToken: false
     securityContext:
       runAsNonRoot: true
       runAsUser: {{ nonroot_uid }}
@@ -164,6 +183,7 @@ valkey:
         main:
           securityContext:
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             capabilities:
               drop:
                 - ALL
@@ -174,3 +194,7 @@ valkey:
       size: 1Gi
       accessMode: ReadWriteOnce
       storageClass: '{{ immich_storage_class }}'
+    tmp:
+      type: emptyDir
+      globalMounts:
+        - path: /tmp

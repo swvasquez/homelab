@@ -54,7 +54,7 @@
 #   vaultwarden_image:            Container image for Vaultwarden
 #                                 (default: vaultwarden/server).
 #   vaultwarden_image_tag:        Container image tag for Vaultwarden
-#                                 (default: latest).
+#                                 (default: 1.35.7).
 #   vaultwarden_storage_size:     Storage size for the Vaultwarden data PVC
 #                                 (default: 5Gi).
 #   vaultwarden_storage_class:    Kubernetes StorageClass for the data and
@@ -106,7 +106,7 @@
   vars:
     vaultwarden_namespace: vaultwarden
     vaultwarden_image: vaultwarden/server
-    vaultwarden_image_tag: latest
+    vaultwarden_image_tag: '1.35.7'
     vaultwarden_storage_size: '5Gi'
     vaultwarden_storage_class: longhorn
     vaultwarden_db_storage_size: '5Gi'

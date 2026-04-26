@@ -55,9 +55,18 @@ podSecurityContext:
 
 containerSecurityContext:
   allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
   capabilities:
     drop:
       - ALL
+
+extraVolumes:
+  - name: tmp
+    emptyDir: {}
+
+extraVolumeMounts:
+  - name: tmp
+    mountPath: /tmp
 
 persistence:
   enabled: true

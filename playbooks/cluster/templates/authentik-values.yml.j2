@@ -65,9 +65,16 @@ server:
       type: RuntimeDefault
   containerSecurityContext:
     allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
     capabilities:
       drop:
         - ALL
+  volumes:
+    - name: tmp
+      emptyDir: {}
+  volumeMounts:
+    - name: tmp
+      mountPath: /tmp
 
 worker:
   securityContext:
@@ -79,9 +86,16 @@ worker:
       type: RuntimeDefault
   containerSecurityContext:
     allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
     capabilities:
       drop:
         - ALL
+  volumes:
+    - name: tmp
+      emptyDir: {}
+  volumeMounts:
+    - name: tmp
+      mountPath: /tmp
 
 postgresql:
   enabled: false
