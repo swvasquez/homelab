@@ -145,7 +145,7 @@ Playbooks are organized logically into categories, and each category maintains i
 
 - `infrastructure/`: OS-level configurations and bare-metal setup.
 - `cluster/`: Kubernetes cluster bootstrapping and core platform components, including the Git server (`git.yml`) and GitOps controller (`gitops.yml`).
-- `development/`: Language toolchains and development environments.
+- `development/`: Language toolchains, development environments, and common CLI utilities.
 - `service/`: Cluster-hosted user services (e.g. Syncthing, Jellyfin, Vaultwarden).
 
 ## Usage

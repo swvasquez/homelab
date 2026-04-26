@@ -12,7 +12,6 @@
 #   - bat:       A 'cat' replacement with syntax highlighting and git integration.
 #                Installed as 'batcat'; symlinked to 'bat' in /usr/local/bin.
 #   - btop:      A modern, interactive process and resource monitor.
-#   - chrony:    A versatile NTP client and server for time synchronization.
 #   - duf:       A user-friendly disk usage summary, replacing 'df'.
 #   - fd-find:   A simple, fast, and user-friendly alternative to 'find'.
 #   - fzf:       A general-purpose command-line fuzzy finder.
@@ -46,7 +45,7 @@
 #
 # Variables:
 #   util_packages:         List of APT packages to install as common CLI utilities
-#                          (default: [atuin, chrony, fd-find, ...]).
+#                          (default: [atuin, bat, btop, duf, fd-find, ...]).
 #   bash_preexec_url:      URL to download the bash-preexec script
 #                          (default: https://raw.githubusercontent.com/rcaloras/bash-preexec/master/bash-preexec.sh).
 #   bash_preexec_dest:     System-wide installation path for the bash-preexec script
@@ -70,7 +69,6 @@
       - atuin
       - bat
       - btop
-      - chrony
       - duf
       - fd-find
       - fzf
