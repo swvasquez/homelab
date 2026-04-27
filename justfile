@@ -12,14 +12,13 @@ lint target="playbooks":
     uv run ansible-lint {{ target }}
 
 # Run a specific Ansible playbook on a subset of machines
-install category playbook subset="homelab":
+install group category playbook:
     #!/usr/bin/env sh
     set -euxo pipefail
     uv run ansible-playbook \
         --ask-become-pass \
-        --limit {{ subset }} \
         -i inventory.yml \
-        "playbooks/{{ category }}/{{ playbook }}.yml"
+        "playbooks/{{ group }}/{{ category }}/{{ playbook }}.yml"
 
 # Verify that a subset of machines are reachable via Ansible
 ping subset="homelab":

@@ -1,6 +1,6 @@
 # Homelab
 
-Ansible Playbooks to configure Ubuntu x86_64 machines and manage a Kubernetes homelab cluster.
+Ansible playbooks to configure Ubuntu x86_64 compute nodes, Arch Linux-based IP KVM devices, and manage a Kubernetes homelab cluster.
 
 > This code was generated with AI assistance.
 
@@ -26,9 +26,9 @@ Ansible Playbooks to configure Ubuntu x86_64 machines and manage a Kubernetes ho
           vars:
             ansible_port: <SSH_PORT>
             ansible_python_interpreter: <PYTHON_PATH>
+            ansible_user: <USER>
           hosts:
             <HOSTNAME>:
-              ansible_user: <USER>
               private_ip: <IP>
               network_interface: <INTERFACE>
               mac_address: <MAC>
@@ -39,6 +39,14 @@ Ansible Playbooks to configure Ubuntu x86_64 machines and manage a Kubernetes ho
               slurm_controller: <true|false>
               slurm_compute_node: <true|false>
               vllm_host: <true|false>
+        ipkvm:
+          vars:
+            ansible_python_interpreter: <PYTHON_PATH>
+            ansible_user: <USER>
+            ansible_remote_tmp: <TMP_PATH>
+          hosts:
+            <HOSTNAME>:
+              private_ip: <IP>
     ```
 
 3.  Create a `group_vars/homelab.yml` file for group-level variables:
@@ -140,34 +148,34 @@ Ansible Playbooks to configure Ubuntu x86_64 machines and manage a Kubernetes ho
 
 ## Directory Structure
 
-Playbooks are organized logically into categories, and each category maintains its own
-`templates/` folder (if applicable) to keep playbooks and their dependencies tightly coupled:
+Playbooks are organized by Ansible inventory group, then by category. Each category maintains its
+own `templates/` folder (if applicable) to keep playbooks and their dependencies tightly coupled:
 
-- `infrastructure/`: OS-level configurations and bare-metal setup.
-- `cluster/`: Kubernetes cluster bootstrapping and core platform components, including the Git server (`git.yml`) and GitOps controller (`gitops.yml`).
-- `development/`: Language toolchains, development environments, and common CLI utilities.
-- `service/`: Cluster-hosted user services (e.g. Syncthing, Jellyfin, Vaultwarden).
+- `playbooks/homelab/infrastructure/`: OS-level configurations and bare-metal setup.
+- `playbooks/homelab/cluster/`: Kubernetes cluster bootstrapping and core platform components,
+  including the Git server (`git.yml`) and GitOps controller (`gitops.yml`).
+- `playbooks/homelab/development/`: Language toolchains, development environments, and common CLI
+  utilities.
+- `playbooks/homelab/service/`: Cluster-hosted user services (e.g. Syncthing, Jellyfin,
+  Vaultwarden).
+- `playbooks/ipkvm/infrastructure/`: OS-level configurations for IP KVM devices.
 
 ## Usage
 
 ### Run a Playbook
 
-To run a specific playbook on a subset of machines, specify the category and the playbook name:
+To run a specific playbook, specify the inventory group, category, and playbook name:
 
 ```sh
-just install <CATEGORY> <PLAYBOOK> [SUBSET]
+just install <GROUP> <CATEGORY> <PLAYBOOK>
 ```
 
-**Example:**
+**Examples:**
 
 ```sh
-just install infrastructure docker
-```
-
-or
-
-```sh
-just install cluster observability homelab
+just install homelab infrastructure docker
+just install homelab cluster observability
+just install ipkvm infrastructure tailscale
 ```
 
 ### Verify Connectivity
@@ -189,14 +197,15 @@ just lint [TARGET]
 **Example:**
 
 ```sh
-just lint playbooks/cluster/bootstrap.yml
+just lint playbooks/homelab/cluster/bootstrap.yml
 ```
 
 ## Kubernetes
 
 ### Deploy a New Cluster
 
-Requires `ssh`, `network`, `docker`, and optionally `nfs` from `playbooks/infrastructure/` to be installed first. Then run the cluster playbooks in this order:
+Requires `ssh`, `network`, `docker`, and optionally `nfs` from `playbooks/homelab/infrastructure/`
+to be installed first. Then run the cluster playbooks in this order:
 
 1. `kubernetes`
 2. `bootstrap`
@@ -209,7 +218,8 @@ Requires `ssh`, `network`, `docker`, and optionally `nfs` from `playbooks/infras
 9. `gitops`
 10. `security`
 
-Once complete, services in `playbooks/service/` are self-contained and can be installed in any order.
+Once complete, services in `playbooks/homelab/service/` are self-contained and can be installed in
+any order.
 
 ### Destroy the Cluster
 
@@ -221,32 +231,66 @@ kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock
 
 ## Notes
 
-- **Fixed-port services**: The following `ufw_allowed_ports` entries have standard ports that are not consumed by any playbook configuration — the port values defined here are used only by the UFW firewall rules and must match what the service actually listens on: `ssh`, `kubelet`, `etcd_client`, `etcd_peer`, `cilium_vxlan`, `cilium_health`, `hubble_peer`, and `nfs`.
-- **SSH port**: `ufw_allowed_ports.ssh.port` in `group_vars/homelab.yml` must match `ansible_port` in `inventory.yml`.
-- **`become_exe` configuration**: `become_exe` must be set to `sudo.ws` to resolve an issue
-  with Ansible. See [Ansible Issue #85837](https://github.com/ansible/ansible/issues/85837)
-  for details.
-- **Service playbook run order**: Once the cluster Playbooks (`bootstrap`, `network`, `storage`, `database`, `observability`, `authentication`, `git`, `gitops`, `security`) have all been run, services in `playbooks/service/` are self-contained. Each service Playbook applies its own HTTPRoute, Traefik ForwardAuth Middleware, and namespace hardening, so adding a new service does NOT require re-running any cluster Playbook:
+- **Fixed-port services**: The following `ufw_allowed_ports` entries have standard ports that are
+  not consumed by any playbook configuration — the port values defined here are used only by the
+  UFW firewall rules and must match what the service actually listens on: `ssh`, `kubelet`,
+  `etcd_client`, `etcd_peer`, `cilium_vxlan`, `cilium_health`, `hubble_peer`, and `nfs`.
+- **SSH port**: `ufw_allowed_ports.ssh.port` in `group_vars/homelab.yml` must match `ansible_port`
+  in `inventory.yml`.
+- **`become_exe` configuration**: `become_exe` must be set to `sudo.ws` on homelab nodes to resolve
+  an issue with Ansible. See [Ansible Issue #85837](https://github.com/ansible/ansible/issues/85837)
+  for details. IP KVM playbooks use standard `sudo` as `sudo.ws` is not available on Arch Linux.
+- **Service playbook run order**: Once the cluster playbooks (`bootstrap`, `network`, `storage`,
+  `database`, `observability`, `authentication`, `git`, `gitops`, `security`) have all been run,
+  services in `playbooks/homelab/service/` are self-contained. Each service playbook applies its
+  own HTTPRoute, Traefik ForwardAuth Middleware, and namespace hardening, so adding a new service
+  does NOT require re-running any cluster playbook:
   ```sh
-  just install service <SERVICE>
+  just install homelab service <SERVICE>
   ```
-- **Pod Security Admission**: `cluster/security.yml` configures the kube-apiserver with a cluster-wide default Pod Security Standard (`restricted`) so every namespace is protected by default. Only true infrastructure namespaces (`kube-system`, `longhorn-system`, `cnpg-system`, `cert-manager`, `observability`, `falco`, `kyverno`) are listed in the apiserver-level `psa_exempt_namespaces` list. App service namespaces stay on the `restricted` default; if a service needs to opt out (e.g. `vllm` for hostPath GPU access), the service Playbook applies a `pod-security.kubernetes.io/enforce=privileged` label on its own namespace. Adding a new service therefore does not require editing `cluster/security.yml`. The playbook patches the static `kube-apiserver.yaml` pod manifest; the kubelet reloads the apiserver automatically. Run after `cluster/authentication.yml`:
+- **Pod Security Admission**: `cluster/security.yml` configures the kube-apiserver with a
+  cluster-wide default Pod Security Standard (`restricted`) so every namespace is protected by
+  default. Only true infrastructure namespaces (`kube-system`, `longhorn-system`, `cnpg-system`,
+  `cert-manager`, `observability`, `falco`, `kyverno`) are listed in the apiserver-level
+  `psa_exempt_namespaces` list. App service namespaces stay on the `restricted` default; if a
+  service needs to opt out (e.g. `vllm` for hostPath GPU access), the service playbook applies a
+  `pod-security.kubernetes.io/enforce=privileged` label on its own namespace. Adding a new service
+  therefore does not require editing `cluster/security.yml`. The playbook patches the static
+  `kube-apiserver.yaml` pod manifest; the kubelet reloads the apiserver automatically. Run after
+  `cluster/authentication.yml`:
   ```sh
-  just install cluster security
+  just install homelab cluster security
   ```
-- **Falco**: `cluster/security.yml` also deploys Falco as a DaemonSet via the `falcosecurity/falco` Helm chart. Falco monitors kernel syscalls using the modern eBPF driver (CO-RE, no kernel module required) and evaluates events against the default ruleset plus custom homelab rules. Falcosidekick forwards alerts to Alertmanager (`observability.yml` must be deployed first). The `falco` namespace is exempt from PSA enforcement because Falco pods require elevated kernel capabilities. To trigger a test detection:
+- **Falco**: `cluster/security.yml` also deploys Falco as a DaemonSet via the
+  `falcosecurity/falco` Helm chart. Falco monitors kernel syscalls using the modern eBPF driver
+  (CO-RE, no kernel module required) and evaluates events against the default ruleset plus custom
+  homelab rules. Falcosidekick forwards alerts to Alertmanager (`observability.yml` must be
+  deployed first). The `falco` namespace is exempt from PSA enforcement because Falco pods require
+  elevated kernel capabilities. To trigger a test detection:
   ```sh
   kubectl -n default run falco-test --image=alpine --restart=Never --rm -it -- sh
   ```
-- **Open WebUI and vLLM**: Open WebUI (`service/openwebui.yml`) connects to vLLM (`service/vllm.yml`) using the vLLM API key from the `vllm-credentials` Secret. vLLM must be deployed first. Open WebUI's built-in authentication is disabled — access is gated entirely by Traefik ForwardAuth (Authentik). The `vllm_host` inventory variable controls which nodes run a vLLM instance.
-- **Jellyfin**: Jellyfin (`service/jellyfin.yml`) is a self-hosted media server deployed via the official Helm chart. All access is gated by Traefik ForwardAuth backed by Authentik — no OIDC plugin is required. The HTTPRoute and ForwardAuth Middleware are applied by the Jellyfin Playbook itself.
-- **Local DNS Resolution**: To resolve homelab services (e.g., `*.homelab.internal`) from your local machine, configure your OS to use the cluster's Bind9 LoadBalancer IP as its nameserver. Note that Syncthing sync traffic uses a **dedicated LoadBalancer IP** (separate from the web GUI) to ensure high-performance data transfer.
+- **Open WebUI and vLLM**: Open WebUI (`service/openwebui.yml`) connects to vLLM
+  (`service/vllm.yml`) using the vLLM API key from the `vllm-credentials` Secret. vLLM must be
+  deployed first. Open WebUI's built-in authentication is disabled — access is gated entirely by
+  Traefik ForwardAuth (Authentik). The `vllm_host` inventory variable controls which nodes run a
+  vLLM instance.
+- **Jellyfin**: Jellyfin (`service/jellyfin.yml`) is a self-hosted media server deployed via the
+  official Helm chart. All access is gated by Traefik ForwardAuth backed by Authentik — no OIDC
+  plugin is required. The HTTPRoute and ForwardAuth Middleware are applied by the Jellyfin playbook
+  itself.
+- **Local DNS Resolution**: To resolve homelab services (e.g., `*.homelab.internal`) from your
+  local machine, configure your OS to use the cluster's Bind9 LoadBalancer IP as its nameserver.
+  Note that Syncthing sync traffic uses a **dedicated LoadBalancer IP** (separate from the web GUI)
+  to ensure high-performance data transfer.
   - **macOS Setup**:
     ```sh
     sudo mkdir -p /etc/resolver
     echo "nameserver <BIND9_LB_IP>" | sudo tee /etc/resolver/<DNS_ZONE>
     ```
-- **Flushing the local DNS cache**: If a service is unreachable or resolves to a stale IP after a cluster change, flush the local DNS cache. Common triggers include deploying a new service, changing a LoadBalancer IP, or redeploying Bind9:
+- **Flushing the local DNS cache**: If a service is unreachable or resolves to a stale IP after a
+  cluster change, flush the local DNS cache. Common triggers include deploying a new service,
+  changing a LoadBalancer IP, or redeploying Bind9:
   ```sh
   just flush-dns
   ```

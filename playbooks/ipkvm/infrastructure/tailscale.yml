@@ -1,0 +1,116 @@
+---
+# ==============================================================================
+# Playbook: Install and Configure Tailscale on IP KVM
+# ==============================================================================
+# Installs and configures the Tailscale mesh VPN client on Arch Linux-based
+# IP KVM devices (e.g., PiKVM).
+#
+# This playbook performs the following actions:
+#   - Remounts the root filesystem as read-write (PiKVM is read-only by default).
+#   - Enables IP forwarding to allow the host to act as a subnet router or
+#     exit node.
+#   - Installs the Tailscale package from the official Arch Linux repository.
+#   - Enables and starts the tailscaled service.
+#   - Attempts to connect the machine to the Tailscale network using
+#     'tailscale up'.
+#   - Remounts the root filesystem as read-only regardless of task outcome.
+#
+# Note: The 'tailscale up' command may require interactive browser-based
+# authentication. For a non-interactive setup, an auth key must be provided
+# as a command-line argument.
+#
+# Variables:
+#   tailscale_packages:  List of packages to install for Tailscale
+#                        (default: [tailscale]).
+#   tailscale_port:      UDP port the tailscaled daemon binds for WireGuard peer
+#                        connections. Written to /etc/default/tailscaled as
+#                        FLAGS="--port=<value>".
+
+- name: Install and configure Tailscale on IP KVM
+  hosts: ipkvm
+  become: true
+  become_exe: sudo
+  vars:
+    tailscale_packages:
+      - tailscale
+    tailscale_port: '0'
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Filesystem
+    # PiKVM mounts the root filesystem read-only by default. All write
+    # operations are wrapped in a block so the filesystem is always restored
+    # to read-only, even if a task fails.
+    # -------------------------------------------------------------------------
+    - name: Remount root filesystem as read-write
+      ansible.builtin.command: # noqa: command-instead-of-module
+        cmd: mount -o remount,rw /
+      changed_when: false
+
+    - name: Install and configure Tailscale
+      block:
+        # -----------------------------------------------------------------------
+        # System Configuration
+        # Enables IPv4 and IPv6 forwarding so this host can act as a Tailscale
+        # subnet router or exit node.
+        # -----------------------------------------------------------------------
+        - name: Enable IP forwarding for subnet routing or exit node
+          ansible.posix.sysctl:
+            name: '{{ item }}'
+            value: '1'
+            state: present
+            sysctl_set: true
+            reload: true
+          loop:
+            - net.ipv4.ip_forward
+            - net.ipv6.conf.all.forwarding
+
+        # -----------------------------------------------------------------------
+        # Installation
+        # Installs Tailscale from the official Arch Linux repository.
+        # -----------------------------------------------------------------------
+        - name: Install Tailscale package
+          community.general.pacman:
+            name: '{{ tailscale_packages }}'
+            state: present
+            update_cache: true
+
+        # -----------------------------------------------------------------------
+        # Service Configuration and Network Connection
+        # Configures the tailscaled daemon port, enables the service, and
+        # connects the host to the Tailscale network.
+        # -----------------------------------------------------------------------
+        - name: Set Tailscale WireGuard listen port in daemon configuration
+          ansible.builtin.lineinfile:
+            path: /etc/default/tailscaled
+            regexp: '^FLAGS='
+            line: 'FLAGS="--port={{ tailscale_port }}"'
+            create: true
+            mode: '0644'
+          notify: Restart tailscaled
+
+        - name: Enable and start tailscaled service
+          ansible.builtin.service:
+            name: tailscaled
+            enabled: true
+            state: started
+
+        - name: Connect to Tailscale network
+          ansible.builtin.command:
+            cmd: tailscale up
+          changed_when: false
+
+        - name: Flush handlers before remounting read-only
+          ansible.builtin.meta: flush_handlers
+
+      always:
+        - name: Remount root filesystem as read-only
+          ansible.builtin.command: # noqa: command-instead-of-module
+            cmd: mount -o remount,ro /
+          changed_when: false
+
+  handlers:
+    - name: Restart tailscaled
+      ansible.builtin.service:
+        name: tailscaled
+        state: restarted
