@@ -19,8 +19,13 @@
 # CoreDNS hosts override that resolves authentik.homelab.internal to Traefik's
 # ClusterIP is managed by playbooks/cluster/network.yml.
 #
-# The full database connection URL is stored in the vaultwarden-db-url Secret
-# and injected into the Deployment via secretKeyRef.
+# The Vaultwarden Deployment consumes the database connection as a single
+# DATABASE_URL DSN string from the vaultwarden-db-url Secret (Vaultwarden's
+# Postgres driver requires a full URL, not separate components). The canonical
+# Postgres password lives in the cnpg-formatted vaultwarden-db-credentials
+# Secret, which CloudNativePG uses to provision the user. vaultwarden-db-url
+# is rebuilt from that canonical password by Ansible. The admin token is the
+# only credential held in the vaultwarden-credentials Secret.
 #
 # An OAuth2/OIDC provider and application are created in Authentik via the
 # REST API, enabling users to log in to the Vaultwarden web vault using their
@@ -232,20 +237,31 @@
     # -------------------------------------------------------------------------
     # Credentials
     # -------------------------------------------------------------------------
-    # Generates a random Vaultwarden admin token and a PostgreSQL database
-    # password on first run and stores them in the vaultwarden-credentials
-    # Kubernetes Secret. A separate cnpg-formatted Secret
-    # (vaultwarden-db-credentials) is created for the CloudNativePG operator.
-    # A third Secret (vaultwarden-db-url) stores the full PostgreSQL connection
-    # URL used by the Vaultwarden Deployment. On subsequent runs the existing
+    # Generates a random Vaultwarden admin token (held in vaultwarden-
+    # credentials) and a Postgres password (held in the cnpg-formatted
+    # vaultwarden-db-credentials Secret, which CloudNativePG uses to provision
+    # the user). The two Secrets are guarded independently for idempotency so
+    # they can evolve separately. A migration task strips the legacy
+    # DB_PASSWORD key from vaultwarden-credentials on clusters that were
+    # installed before the de-duplication. On subsequent runs the existing
     # Secrets are reused so credentials remain stable across upgrades.
     # -------------------------------------------------------------------------
-    - name: Check if Vaultwarden credentials Secret exists
+    - name: Check if Vaultwarden admin credentials Secret exists
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
           get secret vaultwarden-credentials -n {{ vaultwarden_namespace }}
       register: vaultwarden_secret_check
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Check if Vaultwarden database credentials Secret exists
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret vaultwarden-db-credentials -n {{ vaultwarden_namespace }}
+      register: vaultwarden_db_creds_check
       changed_when: false
       failed_when: false
       when: bootstrap_node | default(false)
@@ -266,32 +282,21 @@
       changed_when: false
       when:
         - bootstrap_node | default(false)
-        - vaultwarden_secret_check.rc != 0
+        - vaultwarden_db_creds_check.rc != 0
 
-    - name: Create Vaultwarden credentials Secret
+    - name: Create Vaultwarden admin credentials Secret
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
           create secret generic vaultwarden-credentials
           -n {{ vaultwarden_namespace }}
           --from-literal=admin-token={{ vaultwarden_admin_token_gen.stdout }}
-          --from-literal=DB_PASSWORD={{ vaultwarden_db_password_gen.stdout }}
       register: vaultwarden_secret_result
       changed_when: "'created' in vaultwarden_secret_result.stdout"
       when:
         - bootstrap_node | default(false)
         - vaultwarden_secret_check.rc != 0
       no_log: true
-
-    - name: Read Vaultwarden database password from credentials Secret
-      ansible.builtin.command:
-        cmd: >-
-          kubectl --kubeconfig={{ kubectl_config_path }}
-          get secret vaultwarden-credentials -n {{ vaultwarden_namespace }}
-          -o jsonpath='{.data.DB_PASSWORD}'
-      register: vaultwarden_db_password_b64
-      changed_when: false
-      when: bootstrap_node | default(false)
 
     - name: Create Vaultwarden cnpg database credentials Secret
       ansible.builtin.command:
@@ -300,14 +305,45 @@
           create secret generic vaultwarden-db-credentials
           -n {{ vaultwarden_namespace }}
           --from-literal=username={{ vaultwarden_db_username }}
-          --from-literal=password={{ vaultwarden_db_password_b64.stdout | b64decode }}
+          --from-literal=password={{ vaultwarden_db_password_gen.stdout }}
       register: vaultwarden_db_creds_result
       changed_when: "'created' in vaultwarden_db_creds_result.stdout"
-      failed_when:
-        - vaultwarden_db_creds_result.rc != 0
-        - "'already exists' not in vaultwarden_db_creds_result.stderr"
-      when: bootstrap_node | default(false)
+      when:
+        - bootstrap_node | default(false)
+        - vaultwarden_db_creds_check.rc != 0
       no_log: true
+
+    - name: Read Vaultwarden database password from cnpg credentials Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret vaultwarden-db-credentials -n {{ vaultwarden_namespace }}
+          -o jsonpath='{.data.password}'
+      register: vaultwarden_db_password_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Check for legacy DB_PASSWORD key in vaultwarden-credentials
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret vaultwarden-credentials -n {{ vaultwarden_namespace }}
+          -o jsonpath='{.data.DB_PASSWORD}'
+      register: legacy_db_password_check
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Remove legacy DB_PASSWORD key from vaultwarden-credentials
+      ansible.builtin.shell:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch secret vaultwarden-credentials -n {{ vaultwarden_namespace }}
+          --type=merge
+          -p '{"data":{"DB_PASSWORD":null}}'
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - legacy_db_password_check.stdout != ''
 
     - name: Check if Vaultwarden database URL Secret exists
       ansible.builtin.command:
