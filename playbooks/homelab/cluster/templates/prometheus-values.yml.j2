@@ -1,8 +1,16 @@
 {#
   Helm values for kube-prometheus-stack. Configures Prometheus, Grafana, and
-  Alertmanager with Grafana admin credentials sourced from the grafana-credentials
-  Kubernetes Secret. Native Ingress is disabled for all three components — UIs
-  are exposed via Gateway API HTTPRoutes defined in the observability playbook.
+  Alertmanager. Native Ingress is disabled for all three components — UIs are
+  exposed via Gateway API HTTPRoutes defined in the observability playbook and
+  gated by Traefik ForwardAuth → Authentik.
+
+  Grafana is configured for anonymous admin access on the assumption that
+  ForwardAuth fronts the UI. The chart-generated admin user in the
+  kube-prometheus-stack-grafana Secret is left in place but is not consumed by
+  any meaningful auth path: the UI never prompts for it (anonymous admin), the
+  HTTP API is gated by ForwardAuth at the gateway, and the in-pod
+  dashboards-sidecar reaches Grafana over localhost where anonymous admin
+  applies. No credential is injected from Ansible.
 
   Prometheus is configured to discover ServiceMonitors across all namespaces.
   Grafana's root_url is set to the HTTPS hostname so that redirect links and
@@ -13,13 +21,9 @@
   dashboards.
 
   Variables:
-    grafana_hostname:       FQDN for the Grafana UI (e.g. grafana.homelab.internal).
-    grafana_admin_password: Grafana admin password read from the grafana-credentials
-                            Kubernetes Secret.
+    grafana_hostname: FQDN for the Grafana UI (e.g. grafana.homelab.internal).
 #}
 grafana:
-  adminUser: admin
-  adminPassword: '{{ grafana_admin_password }}'
   ingress:
     enabled: false
   grafana.ini:

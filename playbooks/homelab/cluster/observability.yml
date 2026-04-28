@@ -6,10 +6,11 @@
 # cluster, providing Prometheus for metrics collection, Alertmanager for alert
 # routing, and Grafana for visualization and dashboards.
 #
-# Grafana admin credentials are auto-generated on first run and stored in a
-# Kubernetes Secret named grafana-credentials in the observability namespace. On
-# subsequent runs the existing secret is reused so credentials remain stable
-# across upgrades.
+# Grafana is configured for anonymous admin access; UI access is gated by
+# Traefik ForwardAuth → Authentik. The chart's admin user remains in
+# kube-prometheus-stack-grafana with a chart-generated password but is not
+# consumed by any meaningful auth path, so no admin credential is generated or
+# stored by this playbook.
 #
 # Each component UI is exposed over HTTPS via a Gateway API HTTPRoute attached
 # to the traefik-gateway. ExternalDNS registers the hostnames in Bind9 once the
@@ -73,8 +74,8 @@
   tasks:
     # -------------------------------------------------------------------------
     # Namespace
-    # Creates the observability namespace before any other resources so that the
-    # Grafana credentials Secret can be stored there prior to the Helm install.
+    # Creates the observability namespace before any other resources so that
+    # subsequent kubectl applies in this playbook can target it.
     # -------------------------------------------------------------------------
     - name: Create observability namespace
       ansible.builtin.command:
@@ -89,65 +90,11 @@
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
-    # Grafana Credentials
-    # Generates a Grafana admin password on first run and persists it in a
-    # Kubernetes Secret named grafana-credentials. On subsequent runs the
-    # existing Secret is reused so credentials remain stable across upgrades.
-    # -------------------------------------------------------------------------
-    - name: Check if Grafana credentials secret already exists
-      ansible.builtin.command:
-        cmd: >-
-          kubectl --kubeconfig={{ kubectl_config_path }}
-          get secret grafana-credentials -n {{ observability_namespace }}
-      register: existing_grafana_credentials_check
-      changed_when: false
-      failed_when: false
-      when: bootstrap_node | default(false)
-
-    - name: Generate Grafana admin password
-      ansible.builtin.command:
-        cmd: openssl rand -base64 24
-      register: generated_grafana_password
-      changed_when: false
-      when:
-        - bootstrap_node | default(false)
-        - existing_grafana_credentials_check.rc != 0
-
-    - name: Create Grafana credentials Kubernetes secret
-      ansible.builtin.command:
-        cmd: >-
-          kubectl --kubeconfig={{ kubectl_config_path }}
-          create secret generic grafana-credentials
-          -n {{ observability_namespace }}
-          --from-literal=admin-password={{ generated_grafana_password.stdout }}
-      when:
-        - bootstrap_node | default(false)
-        - existing_grafana_credentials_check.rc != 0
-      changed_when: true
-
-    - name: Read Grafana admin password from Kubernetes secret
-      ansible.builtin.command:
-        cmd: >-
-          kubectl --kubeconfig={{ kubectl_config_path }}
-          get secret grafana-credentials -n {{ observability_namespace }}
-          -o jsonpath='{.data.admin-password}'
-      register: grafana_password_b64
-      changed_when: false
-      when: bootstrap_node | default(false)
-
-    - name: Set Grafana admin password fact
-      ansible.builtin.set_fact:
-        grafana_admin_password: "{{ grafana_password_b64.stdout | b64decode }}"
-      when: bootstrap_node | default(false)
-
-    # -------------------------------------------------------------------------
     # kube-prometheus-stack Installation
     # Installs kube-prometheus-stack via Helm, deploying Prometheus,
     # Alertmanager, Grafana, node-exporter, kube-state-metrics, and a default
-    # set of recording rules and alert rules. Grafana admin credentials are
-    # injected via the values file rendered from the grafana-credentials Secret.
-    # Native Ingress is disabled for all components — UIs are exposed via
-    # Gateway API HTTPRoutes instead.
+    # set of recording rules and alert rules. Native Ingress is disabled for
+    # all components — UIs are exposed via Gateway API HTTPRoutes instead.
     # -------------------------------------------------------------------------
     - name: Add Prometheus community Helm repository
       ansible.builtin.command:
