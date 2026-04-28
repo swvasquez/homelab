@@ -25,13 +25,26 @@
   preExtraInitContainer is rendered verbatim by the chart, so its
   securityContext is declared inline to keep it restricted-compliant.
 
+  The Gitea PostgreSQL password is not rendered into the chart values. Instead
+  it is injected at runtime via the GITEA__database__PASSWD environment
+  variable, sourced from the canonical gitea-db-credentials Secret managed by
+  CloudNativePG. Gitea's env-var override (GITEA__<section>__<KEY>) takes
+  precedence over app.ini, so the inline-config Secret no longer carries the
+  password and the value lives in one place instead of three.
+
+  The Authentik OIDC client_id and client_secret are not rendered into the
+  chart values either. They live in a dedicated gitea-oidc Secret (with keys
+  `key` and `secret` per the chart's convention), and the oauth block uses
+  existingSecret to reference it. The chart injects the values as
+  GITEA_OAUTH_KEY_<idx>/GITEA_OAUTH_SECRET_<idx> env vars at runtime, so the
+  literal never appears in the rendered Helm release blob or in the
+  chart-generated configure_gitea.sh script.
+
   Variables:
     gitea_admin_password:     Gitea admin account password. Read from the
                               gitea-credentials Kubernetes Secret.
     admin_email:              Email address for the Gitea admin account.
                               Read from group_vars.
-    gitea_postgres_password:  Password for the Gitea PostgreSQL user. Read
-                              from the gitea-credentials Kubernetes Secret.
     gitea_hostname:           FQDN for the Gitea web UI
                               (e.g. gitea.homelab.internal).
     gitea_ssh_hostname:       FQDN for the Gitea SSH LoadBalancer service.
@@ -41,10 +54,6 @@
                               Derived from ufw_allowed_ports.gitea_ssh.port.
     authentik_hostname:       FQDN for the Authentik UI, used to construct
                               the OIDC discovery and icon URLs.
-    gitea_oidc_client_id:     OAuth2 client ID from the Authentik provider.
-                              Fetched from the Authentik API by the playbook.
-    gitea_oidc_client_secret: OAuth2 client secret from the Authentik provider.
-                              Fetched from the Authentik API by the playbook.
     nonroot_uid:              Shared non-root UID and GID for every pod in the
                               gitea namespace. Read from group_vars.
 #}
@@ -60,7 +69,6 @@ gitea:
       HOST: 'gitea-db-rw.gitea.svc:5432'
       NAME: gitea
       USER: gitea
-      PASSWD: '{{ gitea_postgres_password }}'
     server:
       DOMAIN: '{{ gitea_hostname }}'
       ROOT_URL: 'https://{{ gitea_hostname }}'
@@ -73,12 +81,23 @@ gitea:
   oauth:
     - name: Authentik
       provider: openidConnect
-      key: '{{ gitea_oidc_client_id }}'
-      secret: '{{ gitea_oidc_client_secret }}'
+      existingSecret: gitea-oidc
       autoDiscoverUrl: >-
         https://{{ authentik_hostname }}/application/o/gitea/.well-known/openid-configuration
       iconUrl: 'https://{{ authentik_hostname }}/static/dist/assets/icons/icon.png'
       scopes: openid email profile
+
+# Injects the Gitea PostgreSQL password at runtime as a GITEA__database__PASSWD
+# environment variable, sourced from the canonical gitea-db-credentials Secret
+# managed by CloudNativePG. Gitea's env-var override takes precedence over
+# app.ini, so the inline-config Secret no longer needs to embed the password.
+deployment:
+  env:
+    - name: GITEA__database__PASSWD
+      valueFrom:
+        secretKeyRef:
+          name: gitea-db-credentials
+          key: password
 
 # Applied to the gitea Deployment pod and propagated by the chart to the
 # built-in init containers (init-directories, init-app-ini, configure-gitea)

@@ -13,15 +13,23 @@
 # shell.
 #
 # Gitea admin and PostgreSQL credentials are auto-generated on first run and
-# stored in a Kubernetes Secret named gitea-credentials in the gitea namespace.
-# On subsequent runs the existing Secret is reused so credentials remain stable
-# across upgrades.
+# persisted in two separate Secrets in the gitea namespace:
+#   - gitea-credentials holds the admin-password (consumed by the Helm chart
+#     to seed the gitea_admin user on first boot).
+#   - gitea-db-credentials holds the cnpg-formatted username + password
+#     (consumed by the CloudNativePG operator to provision the Postgres user
+#     and by the Gitea Deployment via env-var injection).
+# On subsequent runs the existing Secrets are reused so credentials remain
+# stable across upgrades.
 #
 # Authentik is configured as the OIDC identity provider for Gitea, allowing
 # users to sign in with their Authentik credentials. An OAuth2 provider and
 # application are created in Authentik via the REST API on first run. The OIDC
-# client credentials are fetched from Authentik on every run and injected into
-# the Helm values, so they remain consistent if the provider already exists.
+# client credentials are fetched from Authentik on every run and persisted in
+# a dedicated gitea-oidc Secret (keys `key` and `secret` per the Gitea Helm
+# chart's convention). The chart references that Secret via
+# gitea.oauth[0].existingSecret, so the literal client_secret never enters the
+# rendered Helm release blob or the chart-generated init script.
 # Local account registration is disabled — all accounts must be created via
 # Authentik OIDC. The Gitea admin account is provisioned directly by Helm and
 # is not subject to this restriction.
@@ -246,17 +254,30 @@
 
     # -------------------------------------------------------------------------
     # Gitea Credentials
-    # Generates a Gitea admin password and a PostgreSQL password on first run
-    # and persists them in a Kubernetes Secret named gitea-credentials. On
-    # subsequent runs the existing Secret is reused so credentials remain stable
-    # across upgrades.
+    # Generates a Gitea admin password and a PostgreSQL password on first run.
+    # Each password lives in its own canonical Secret: gitea-credentials holds
+    # admin-password only, gitea-db-credentials holds the cnpg-formatted
+    # username + password. The two Secrets are guarded independently for
+    # idempotency so they can evolve separately. A migration task strips the
+    # legacy postgresql-password key from gitea-credentials on clusters that
+    # were installed before the de-duplication.
     # -------------------------------------------------------------------------
-    - name: Check if Gitea credentials secret already exists
+    - name: Check if Gitea admin credentials secret already exists
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
           get secret gitea-credentials -n {{ gitea_namespace }}
       register: existing_gitea_credentials_check
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Check if Gitea database credentials secret already exists
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret gitea-db-credentials -n {{ gitea_namespace }}
+      register: existing_gitea_db_credentials_check
       changed_when: false
       failed_when: false
       when: bootstrap_node | default(false)
@@ -277,19 +298,31 @@
       changed_when: false
       when:
         - bootstrap_node | default(false)
-        - existing_gitea_credentials_check.rc != 0
+        - existing_gitea_db_credentials_check.rc != 0
 
-    - name: Create Gitea credentials Kubernetes secret
+    - name: Create Gitea admin credentials Kubernetes secret
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
           create secret generic gitea-credentials
           -n {{ gitea_namespace }}
           --from-literal=admin-password={{ generated_gitea_admin_password.stdout }}
-          --from-literal=postgresql-password={{ generated_gitea_postgres_password.stdout }}
       when:
         - bootstrap_node | default(false)
         - existing_gitea_credentials_check.rc != 0
+      changed_when: true
+
+    - name: Create Gitea cnpg database credentials Kubernetes secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic gitea-db-credentials
+          -n {{ gitea_namespace }}
+          --from-literal=username={{ gitea_db_username }}
+          --from-literal=password={{ generated_gitea_postgres_password.stdout }}
+      when:
+        - bootstrap_node | default(false)
+        - existing_gitea_db_credentials_check.rc != 0
       changed_when: true
 
     - name: Read Gitea admin password from Kubernetes secret
@@ -306,8 +339,8 @@
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
-          get secret gitea-credentials -n {{ gitea_namespace }}
-          -o jsonpath='{.data.postgresql-password}'
+          get secret gitea-db-credentials -n {{ gitea_namespace }}
+          -o jsonpath='{.data.password}'
       register: gitea_postgres_password_b64
       changed_when: false
       when: bootstrap_node | default(false)
@@ -317,6 +350,28 @@
         gitea_admin_password: "{{ gitea_admin_password_b64.stdout | b64decode }}"
         gitea_postgres_password: "{{ gitea_postgres_password_b64.stdout | b64decode }}"
       when: bootstrap_node | default(false)
+
+    - name: Check for legacy postgresql-password key in gitea-credentials
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret gitea-credentials -n {{ gitea_namespace }}
+          -o jsonpath='{.data.postgresql-password}'
+      register: legacy_pg_pw_check
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Remove legacy postgresql-password key from gitea-credentials
+      ansible.builtin.shell:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch secret gitea-credentials -n {{ gitea_namespace }}
+          --type=merge
+          -p '{"data":{"postgresql-password":null}}'
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - legacy_pg_pw_check.stdout != ''
 
     # -------------------------------------------------------------------------
     # Authentik OIDC Configuration
@@ -511,29 +566,35 @@
         gitea_oidc_client_secret: "{{ gitea_oidc_provider_details.json.client_secret }}"
       when: bootstrap_node | default(false)
 
-    # -------------------------------------------------------------------------
-    # Database
-    # Provisions a CloudNativePG Cluster for Gitea's PostgreSQL database. A
-    # cnpg-formatted credentials secret (gitea-db-credentials) is created from
-    # the postgresql-password in gitea-credentials. The Cluster resource is
-    # applied idempotently via kubectl apply and the playbook waits for it to
-    # reach a healthy state before proceeding with the Helm install.
-    # -------------------------------------------------------------------------
-    - name: Create Gitea cnpg database credentials secret
-      ansible.builtin.command:
+    # Persists the OIDC client_id and client_secret in a dedicated gitea-oidc
+    # Kubernetes Secret using apply semantics so the values stay in sync if
+    # Authentik ever rotates them. The Helm chart references this Secret via
+    # gitea.oauth[0].existingSecret, so the literal client_secret never enters
+    # the rendered Helm release blob or the chart-generated init script. Key
+    # names follow the chart's convention (`key` for client_id, `secret` for
+    # client_secret).
+    - name: Create or update Gitea OIDC credentials Secret
+      ansible.builtin.shell:
         cmd: >-
+          set -o pipefail;
           kubectl --kubeconfig={{ kubectl_config_path }}
-          create secret generic gitea-db-credentials
-          -n {{ gitea_namespace }}
-          --from-literal=username={{ gitea_db_username }}
-          --from-literal=password={{ gitea_postgres_password }}
-      register: gitea_db_creds_result
-      changed_when: "'created' in gitea_db_creds_result.stdout"
-      failed_when:
-        - gitea_db_creds_result.rc != 0
-        - "'already exists' not in gitea_db_creds_result.stderr"
+          create secret generic gitea-oidc -n {{ gitea_namespace }}
+          --from-literal=key={{ gitea_oidc_client_id }}
+          --from-literal=secret={{ gitea_oidc_client_secret }}
+          --dry-run=client -o yaml |
+          kubectl --kubeconfig={{ kubectl_config_path }} apply -f -
+      register: gitea_oidc_secret_apply
+      changed_when: "'unchanged' not in gitea_oidc_secret_apply.stdout"
       when: bootstrap_node | default(false)
 
+    # -------------------------------------------------------------------------
+    # Database
+    # Provisions a CloudNativePG Cluster for Gitea's PostgreSQL database. The
+    # cnpg-formatted credentials Secret (gitea-db-credentials) is created in
+    # the Gitea Credentials section above. The Cluster resource is applied
+    # idempotently via kubectl apply and the playbook waits for it to reach a
+    # healthy state before proceeding with the Helm install.
+    # -------------------------------------------------------------------------
     - name: Write Gitea cnpg Cluster manifest
       ansible.builtin.copy:
         dest: /tmp/gitea-db-cluster.yml
