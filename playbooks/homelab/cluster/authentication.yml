@@ -80,10 +80,19 @@
 #                                the Ansible host. Used by 'bao kv put' to
 #                                write the bootstrap password
 #                                (default: openbao.<dns_zone>).
-#   openbao_keychain:            Filename of the macOS keychain that stores
-#                                the OpenBao root token (created by
-#                                cluster/secrets.yml; default:
-#                                openbao.keychain).
+#   homelab_keychain:            Filename of the dedicated macOS keychain
+#                                on the Ansible host that holds cluster
+#                                master credentials. Created by
+#                                cluster/bootstrap.yml on first install,
+#                                populated with OpenBao unseal keys +
+#                                root token by cluster/secrets.yml, and
+#                                read here for the root token used to
+#                                write to OpenBao. Read from group_vars
+#                                and derived from keychain_prefix.
+#   keychain_prefix:             Prefix for the dedicated macOS keychain
+#                                filename. Read from group_vars
+#                                ('<keychain_prefix>.keychain' is the
+#                                full filename).
 #   keychain_service:            'service' field used to look up the OpenBao
 #                                root token in the keychain (default:
 #                                openbao).
@@ -112,7 +121,7 @@
     authentik_storage_class: longhorn
     authentik_bootstrap_secret_name: authentik-eso-bootstrap
     openbao_hostname: 'openbao.{{ dns_zone }}'
-    openbao_keychain: openbao.keychain
+    homelab_keychain: '{{ keychain_prefix }}.keychain'
     openbao_authentik_bootstrap_path: secret/authentik/bootstrap_password
     keychain_service: openbao
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
@@ -413,10 +422,10 @@
         authentik_bootstrap_secret_present: "{{ authentik_bootstrap_secret_probe.rc == 0 }}"
       when: bootstrap_node | default(false)
 
-    - name: Prompt for openbao macOS keychain password
+    - name: Prompt for homelab macOS keychain password
       ansible.builtin.pause:
         prompt: |
-          Enter the password for the openbao macOS keychain.
+          Enter the password for the homelab macOS keychain.
           (Needed to write the Authentik bootstrap password to OpenBao.)
         echo: false
       register: authentik_keychain_password_input
@@ -431,7 +440,7 @@
         cmd: |
           set -euo pipefail
 
-          KEYCHAIN='{{ openbao_keychain }}'
+          KEYCHAIN='{{ homelab_keychain }}'
           KEYCHAIN_PWD='{{ authentik_keychain_password_input.user_input }}'
 
           security lock-keychain "$KEYCHAIN"

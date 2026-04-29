@@ -68,6 +68,7 @@ Ansible playbooks to configure Ubuntu x86_64 compute nodes, Arch Linux-based IP 
     router_private_ip: <ROUTER_IP>
     shutdown_schedule: <SHUTDOWN_SCHEDULE>
     admin_email: <ADMIN_EMAIL>
+    keychain_prefix: <KEYCHAIN_PREFIX>
     falco_sensitive_file_container_only: <true|false>
     ufw_allowed_ports:
       ssh:
@@ -249,6 +250,28 @@ kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock
   ```sh
   just install homelab service <SERVICE>
   ```
+- **Cluster master credentials in `homelab.keychain`**: every cluster-level master key — the etcd
+  encryption-at-rest key plus the OpenBao unseal keys + root token — lives in a single dedicated
+  macOS keychain on the Ansible host (`~/Library/Keychains/homelab.keychain-db`). The keychain is
+  password-locked, idle-auto-locked, and FileVault-encrypted at rest. `cluster/bootstrap.yml`
+  creates it on first install, prompts for the password the operator sets, and stores the etcd
+  key under `service=kubernetes, account=etcd-encryption-key`. `cluster/secrets.yml` later
+  populates it with `service=openbao, account=unseal-key-1..5` and `service=openbao,
+  account=root-token`. A single backup of `homelab.keychain-db` therefore covers the cluster's
+  entire master-key set.
+- **etcd encryption at rest**: `cluster/bootstrap.yml` enables AES-CBC encryption for all
+  Kubernetes Secret resources. The 32-byte AES key is generated on the Ansible host on first
+  install and stored in `homelab.keychain` (see above); the playbook then renders
+  `/etc/kubernetes/encryption/encryption-config.yaml` from that keychain entry, mounts the
+  directory read-only into the kube-apiserver pod, and patches the static pod manifest to consume
+  it via `--encryption-provider-config`. After the apiserver picks the config up, the playbook
+  re-encrypts every existing Secret with a `kubectl get secrets -A -o json | kubectl replace -f -`
+  pass. The key never leaves the keychain or that single config file on the control plane, and
+  never goes to git. If the control-plane file is ever lost, re-running `bootstrap.yml` reads the
+  existing key from the keychain and restores the file (no ciphertext rotation needed). To
+  rotate, edit the config file on the control plane by hand (and update the keychain entry to
+  match), add the new key as the FIRST entry under `keys:`, leave the old one as the second, and
+  re-run `bootstrap.yml`.
 - **Pod Security Admission**: `cluster/security.yml` configures the kube-apiserver with a
   cluster-wide default Pod Security Standard (`restricted`) so every namespace is protected by
   default. Only true infrastructure namespaces (`kube-system`, `longhorn-system`, `cnpg-system`,
@@ -281,14 +304,15 @@ kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock
   plugin is required. The HTTPRoute and ForwardAuth Middleware are applied by the Jellyfin playbook
   itself.
 - **OpenBao secrets engine**: `cluster/secrets.yml` installs OpenBao (single-replica StatefulSet),
-  the External Secrets Operator, and a cluster-scoped `openbao` SecretStore. Five unseal keys plus
-  the initial root token are persisted to a dedicated macOS keychain
-  (`~/Library/Keychains/openbao.keychain-db`) on the Ansible host — nothing is written to
-  `group_vars` or rendered Helm values. The keychain has its own password (set on first install,
-  re-prompted only when OpenBao is sealed) and an idle auto-lock. Local tooling required: `bao`,
-  `kubectl`, `helm`, `jq`, `curl`; the host resolver must point at bind9 (see *Local DNS Resolution*
-  below). The API is exposed at `openbao.<DNS_ZONE>/v1/*` (token-authenticated, no ForwardAuth).
-  After every cluster reboot OpenBao comes up sealed; re-running the same command unseals it:
+  the External Secrets Operator, and a cluster-scoped `openbao` SecretStore. The five unseal keys
+  plus the initial root token are persisted to `homelab.keychain` on the Ansible host (see
+  *Cluster master credentials* above) — nothing is written to `group_vars` or rendered Helm
+  values. The keychain prompt fires only when OpenBao is sealed or `openbao_force_reconfigure=true`
+  is passed; on healthy already-unsealed clusters the playbook is a fast no-op. Local tooling
+  required: `bao`, `kubectl`, `helm`, `jq`, `curl`; the host resolver must point at bind9 (see
+  *Local DNS Resolution* below). The API is exposed at `openbao.<DNS_ZONE>/v1/*`
+  (token-authenticated, no ForwardAuth). After every cluster reboot OpenBao comes up sealed;
+  re-running the same command unseals it:
   ```sh
   just install homelab cluster secrets
   ```

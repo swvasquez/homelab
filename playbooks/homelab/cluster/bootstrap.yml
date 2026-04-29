@@ -17,6 +17,19 @@
 #   - Optionally removes the NoSchedule taint from the control plane node to
 #     allow it to also schedule workloads (when `worker_node: true` is set on
 #     the control plane host in inventory).
+#   - Configures etcd encryption-at-rest for Kubernetes Secrets. On first
+#     install the play prompts for the homelab macOS keychain password
+#     (creating the keychain if it does not yet exist), generates a 32-byte
+#     AES key, stores it under the 'etcd-encryption-key' account in that
+#     keychain, then renders an EncryptionConfiguration file under
+#     /etc/kubernetes/encryption on the control plane and patches the
+#     kube-apiserver static pod manifest to consume it via
+#     --encryption-provider-config. After the apiserver picks the config
+#     up, every existing Secret is re-encrypted with a 'kubectl get | kubectl
+#     replace' pass so no cleartext copies survive in etcd. The keychain
+#     is the canonical home for the key (same store the OpenBao unseal
+#     keys + root token end up in via cluster/secrets.yml), and the
+#     control-plane file is regeneratable from it.
 #   - Installs Metrics Server via Helm on the bootstrap node to enable resource
 #     monitoring.
 #
@@ -54,6 +67,60 @@
 #                            (default: 3.13.0).
 #   metrics_server_ns:       Kubernetes namespace for metrics-server
 #                            (default: kube-system).
+#   encryption_config_dir:   Directory on the control plane node where the
+#                            EncryptionConfiguration file lives. Mounted
+#                            read-only into the kube-apiserver pod
+#                            (default: /etc/kubernetes/encryption).
+#   encryption_config_path:  Full path to the EncryptionConfiguration file
+#                            (default:
+#                            /etc/kubernetes/encryption/encryption-config.yaml).
+#   apiserver_manifest_path: Full path to the kube-apiserver static pod
+#                            manifest the kubelet watches
+#                            (default:
+#                            /etc/kubernetes/manifests/kube-apiserver.yaml).
+#   apiserver_manifest_staging_path:
+#                            Temporary path used to stage manifest edits
+#                            atomically. Must be on the same filesystem as
+#                            apiserver_manifest_path so the final copy is a
+#                            rename(2) and the kubelet never sees a
+#                            partially-edited manifest (default:
+#                            /etc/kubernetes/kube-apiserver.yaml.encryption-staging).
+#   apiserver_health_url:    URL polled to confirm the apiserver is healthy
+#                            after the manifest edit lands (default:
+#                            https://127.0.0.1:6443/livez).
+#   apiserver_reload_wait_seconds:
+#                            Seconds to pause after manifest promotion
+#                            before polling apiserver health, giving the
+#                            kubelet time to detect the change and recreate
+#                            the pod (default: 30).
+#   apiserver_health_retries:
+#                            Maximum apiserver health polls before failing
+#                            (default: 60).
+#   apiserver_health_delay:  Seconds between apiserver health polls
+#                            (default: 2).
+#   homelab_keychain:        Filename of the dedicated macOS keychain on
+#                            the Ansible host that stores the etcd
+#                            encryption-at-rest key (and, after
+#                            cluster/secrets.yml runs, the OpenBao unseal
+#                            keys + root token). Created on first install
+#                            here; reused by secrets.yml later. Read from
+#                            group_vars and derived from keychain_prefix.
+#   keychain_prefix:         Prefix for the dedicated macOS keychain
+#                            filename. Read from group_vars
+#                            ('<keychain_prefix>.keychain' is the full
+#                            filename).
+#   homelab_keychain_idle_lock_seconds:
+#                            Idle-timeout in seconds after which the
+#                            dedicated keychain re-locks automatically
+#                            (default: 7200, two hours).
+#   keychain_service:        'service' field on every keychain entry this
+#                            playbook reads or writes. Different from
+#                            secrets.yml's value ('openbao') so etcd-side
+#                            cluster keys live under their own subsystem
+#                            namespace (default: kubernetes).
+#   encryption_key_account:  'account' field on the keychain entry that
+#                            holds the AES-256 etcd encryption key
+#                            (default: etcd-encryption-key).
 
 - name: Initialize Kubernetes control plane
   hosts: homelab
@@ -67,6 +134,18 @@
     kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
     fetch_kubeconfig: true
     local_kubeconfig_path: ~/.kube/config
+    encryption_config_dir: /etc/kubernetes/encryption
+    encryption_config_path: /etc/kubernetes/encryption/encryption-config.yaml
+    apiserver_manifest_path: /etc/kubernetes/manifests/kube-apiserver.yaml
+    apiserver_manifest_staging_path: /etc/kubernetes/kube-apiserver.yaml.encryption-staging
+    apiserver_health_url: 'https://127.0.0.1:6443/livez'
+    apiserver_reload_wait_seconds: 30
+    apiserver_health_retries: 60
+    apiserver_health_delay: 2
+    homelab_keychain: '{{ keychain_prefix }}.keychain'
+    homelab_keychain_idle_lock_seconds: 7200
+    keychain_service: kubernetes
+    encryption_key_account: etcd-encryption-key
 
   tasks:
     # -------------------------------------------------------------------------
@@ -167,6 +246,264 @@
       register: kubeadm_join_command
       changed_when: false
       when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # etcd Encryption-at-Rest for Secrets
+    # -------------------------------------------------------------------------
+    # Configures the kube-apiserver to encrypt every Secret resource at
+    # rest in etcd via --encryption-provider-config. The cipher is AES-CBC
+    # with a single 32-byte key; the 'identity' provider is listed second
+    # so reads of pre-encryption Secrets continue to work while the
+    # re-encryption pass at the end of this section rewrites them through
+    # the apiserver.
+    #
+    # The dedicated homelab macOS keychain on the Ansible host (the same
+    # one that holds the OpenBao unseal keys + root token, created here on
+    # first install if missing) is the canonical home for the AES key.
+    # cluster/secrets.yml later adds the unseal keys + root token to the
+    # same keychain, so a single backup of homelab.keychain-db restores
+    # every cluster master credential.
+    #
+    # On first install, this section prompts for the keychain password,
+    # creates the keychain if it does not exist, generates a 32-byte AES
+    # key from /dev/urandom and stores it under the 'etcd-encryption-key'
+    # account, then renders the EncryptionConfiguration file on the
+    # control plane with the key inlined. On every subsequent run this
+    # section is skipped entirely as long as the EncryptionConfiguration
+    # file exists on disk — no keychain prompt, no re-render, no apiserver
+    # restart. If the control-plane file is ever lost (e.g. node
+    # reprovisioned), re-running this playbook reads the existing key
+    # from the keychain and restores the file without rotating the
+    # ciphertext on disk.
+    #
+    # To rotate, edit the file on the control plane by hand: add a new
+    # entry as the FIRST item under 'keys:', leave the old one as the
+    # second, then update the corresponding keychain entry by hand or via
+    # 'security add-generic-password -U' so the values stay in sync.
+    # Re-run the playbook to push the apiserver restart and the
+    # re-encryption pass.
+    #
+    # Manifest patching follows the same staged-and-atomically-promoted
+    # pattern as cluster/security.yml's PSA hardening: the working copy of
+    # /etc/kubernetes/manifests/kube-apiserver.yaml is built up under
+    # apiserver_manifest_staging_path, then promoted with a single
+    # rename-on-the-same-filesystem so the kubelet never observes a
+    # partial edit. A SHA-256 checksum of the EncryptionConfiguration file
+    # is stamped into a pod annotation, which forces kubelet to recreate
+    # the apiserver pod whenever the file content changes (e.g. on a key
+    # rotation). Without that stamp, an in-place edit of the config file
+    # leaves the running apiserver on its stale in-memory copy until the
+    # manifest itself changes for some other reason.
+    #
+    # After the new manifest lands, the play waits for the apiserver to
+    # report /livez OK on 6443, then re-keys every existing Secret with a
+    # 'kubectl get | kubectl replace' loop. On a fresh cluster this
+    # encrypts the system Secrets that kubeadm created during 'kubeadm
+    # init' before we patched the manifest. On an already-running cluster
+    # this re-encrypts every Secret accumulated by every other playbook
+    # (a no-op when nothing actually changed).
+    # -------------------------------------------------------------------------
+    - name: Create encryption configuration directory on control plane
+      ansible.builtin.file:
+        path: '{{ encryption_config_dir }}'
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      when: bootstrap_node | default(false)
+
+    - name: Stat encryption-config.yaml on control plane
+      ansible.builtin.stat:
+        path: '{{ encryption_config_path }}'
+      register: encryption_config_existing
+      when: bootstrap_node | default(false)
+
+    - name: Prompt for homelab macOS keychain password (encryption key)
+      ansible.builtin.pause:
+        prompt: |
+          Enter the password for the homelab macOS keychain.
+          (Created on first run; same password used by cluster/secrets.yml.
+          Needed to read or generate the etcd encryption-at-rest key.)
+        echo: false
+      register: encryption_keychain_password_input
+      delegate_to: localhost
+      no_log: true
+      when:
+        - bootstrap_node | default(false)
+        - not encryption_config_existing.stat.exists
+
+    - name: Ensure homelab keychain holds etcd-encryption-key and emit it
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+
+          KEYCHAIN='{{ homelab_keychain }}'
+          KEYCHAIN_FILE="$HOME/Library/Keychains/${KEYCHAIN}-db"
+          KEYCHAIN_PWD='{{ encryption_keychain_password_input.user_input }}'
+
+          if [ ! -f "$KEYCHAIN_FILE" ]; then
+            security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+            security set-keychain-settings \
+              -lut {{ homelab_keychain_idle_lock_seconds }} "$KEYCHAIN"
+          else
+            # 'unlock-keychain' is a no-op on an already-unlocked keychain
+            # and skips password validation, so lock first to force the
+            # password through.
+            security lock-keychain "$KEYCHAIN"
+          fi
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          unset KEYCHAIN_PWD
+
+          if ! security find-generic-password \
+                 -a '{{ encryption_key_account }}' \
+                 -s '{{ keychain_service }}' \
+                 -w "$KEYCHAIN" >/dev/null 2>&1; then
+            KEY="$(head -c 32 /dev/urandom | base64)"
+            security add-generic-password -U \
+              -a '{{ encryption_key_account }}' \
+              -s '{{ keychain_service }}' \
+              -w "$KEY" \
+              "$KEYCHAIN"
+            unset KEY
+          fi
+
+          security find-generic-password \
+            -a '{{ encryption_key_account }}' \
+            -s '{{ keychain_service }}' \
+            -w "$KEYCHAIN"
+        executable: /bin/sh
+      delegate_to: localhost
+      become: false
+      register: encryption_key_result
+      changed_when: true
+      no_log: true
+      when:
+        - bootstrap_node | default(false)
+        - not encryption_config_existing.stat.exists
+
+    - name: Render encryption-config.yaml on control plane from keychain key
+      ansible.builtin.template:
+        src: encryption-config.yml.j2
+        dest: '{{ encryption_config_path }}'
+        owner: root
+        group: root
+        mode: '0600'
+      vars:
+        encryption_key: "{{ encryption_key_result.stdout | trim }}"
+      register: encryption_config_create
+      no_log: true
+      when:
+        - bootstrap_node | default(false)
+        - not encryption_config_existing.stat.exists
+
+    - name: Read EncryptionConfiguration checksum for manifest annotation
+      ansible.builtin.stat:
+        path: '{{ encryption_config_path }}'
+        checksum_algorithm: sha256
+      register: encryption_config_stat
+      when: bootstrap_node | default(false)
+
+    - name: Stage a working copy of the kube-apiserver manifest for encryption
+      ansible.builtin.copy:
+        src: '{{ apiserver_manifest_path }}'
+        dest: '{{ apiserver_manifest_staging_path }}'
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0600'
+      when: bootstrap_node | default(false)
+      changed_when: false
+
+    - name: Ensure encryption-provider-config flag is present in staged manifest
+      ansible.builtin.lineinfile:
+        path: '{{ apiserver_manifest_staging_path }}'
+        regexp: '^    - --encryption-provider-config='
+        line: '    - --encryption-provider-config={{ encryption_config_path }}'
+        insertafter: '^    - --allow-privileged=true$'
+        state: present
+      when: bootstrap_node | default(false)
+
+    - name: Ensure encryption-config volumeMount is present in staged manifest
+      ansible.builtin.blockinfile:
+        path: '{{ apiserver_manifest_staging_path }}'
+        marker: '    # {mark} ANSIBLE MANAGED: encryption-config volumeMount'
+        insertafter: '^    volumeMounts:$'
+        block: |2
+              - mountPath: {{ encryption_config_dir }}
+                name: encryption-config
+                readOnly: true
+      when: bootstrap_node | default(false)
+
+    - name: Ensure encryption-config hostPath volume is present in staged manifest
+      ansible.builtin.blockinfile:
+        path: '{{ apiserver_manifest_staging_path }}'
+        marker: '  # {mark} ANSIBLE MANAGED: encryption-config volume'
+        insertafter: '^  volumes:$'
+        block: |2
+            - hostPath:
+                path: {{ encryption_config_dir }}
+                type: DirectoryOrCreate
+              name: encryption-config
+      when: bootstrap_node | default(false)
+
+    - name: Stamp encryption-config SHA-256 annotation into staged manifest
+      ansible.builtin.lineinfile:
+        path: '{{ apiserver_manifest_staging_path }}'
+        regexp: '^    homelab\.internal/encryption-config-sha256: '
+        line: '    homelab.internal/encryption-config-sha256: "{{ encryption_config_stat.stat.checksum }}"'
+        insertafter: '^  annotations:$'
+        state: present
+      when: bootstrap_node | default(false)
+
+    - name: Promote staged manifest atomically into the kubelet manifests directory
+      ansible.builtin.copy:
+        src: '{{ apiserver_manifest_staging_path }}'
+        dest: '{{ apiserver_manifest_path }}'
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0600'
+      register: encryption_apiserver_manifest_promote
+      when: bootstrap_node | default(false)
+
+    - name: Remove staged encryption manifest
+      ansible.builtin.file:
+        path: '{{ apiserver_manifest_staging_path }}'
+        state: absent
+      when: bootstrap_node | default(false)
+      changed_when: false
+
+    - name: Pause to allow kubelet to detect the updated kube-apiserver manifest
+      ansible.builtin.pause:
+        seconds: '{{ apiserver_reload_wait_seconds }}'
+      when:
+        - bootstrap_node | default(false)
+        - encryption_apiserver_manifest_promote.changed
+
+    - name: Wait for kube-apiserver /livez to report healthy after encryption patch
+      ansible.builtin.uri:
+        url: '{{ apiserver_health_url }}'
+        validate_certs: false
+        status_code: 200
+      register: encryption_apiserver_livez
+      until: encryption_apiserver_livez.status == 200
+      retries: '{{ apiserver_health_retries }}'
+      delay: '{{ apiserver_health_delay }}'
+      when: bootstrap_node | default(false)
+
+    - name: Re-encrypt all existing Secrets with the current encryption key
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          kubectl --kubeconfig={{ kubectl_config_path }} \
+            get secrets -A -o json \
+          | kubectl --kubeconfig={{ kubectl_config_path }} replace -f -
+      register: encryption_reencrypt_result
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - (encryption_config_create.changed | default(false))
+            or (encryption_apiserver_manifest_promote.changed | default(false))
 
     # -------------------------------------------------------------------------
     # Control Plane Taint Removal (Optional)
