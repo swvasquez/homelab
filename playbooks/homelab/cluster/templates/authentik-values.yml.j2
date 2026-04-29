@@ -1,18 +1,32 @@
 {#
   Helm values for the Authentik identity provider.
 
-  Configures the authentik chart with the auto-generated credentials from the
-  authentik-credentials Kubernetes Secret. PostgreSQL and Redis subcharts are
-  enabled to provide persistent storage and caching within the cluster.
+  Credentials reach the chart from two sources:
 
-  The bootstrap_token sets AUTHENTIK_BOOTSTRAP_TOKEN, which creates a persistent
-  API token in the Authentik database on first run. This token is used by the
-  authentication.yml playbook to configure Authentik via the REST API without
-  requiring manual UI interaction.
+    - secret_key, postgresql.password, and bootstrap_token come from the
+      'authentik-credentials' Kubernetes Secret created by
+      cluster/authentication.yml on first install (random values, then
+      reused on subsequent runs).
+    - bootstrap_password is NOT in this values file; the chart reads
+      AUTHENTIK_BOOTSTRAP_PASSWORD from the pod environment via the
+      global.envFrom block below, which references a separate Secret
+      ('authentik-eso-bootstrap') that ESO materializes from
+      secret/authentik/bootstrap_password in OpenBao.
 
-  The bootstrap_email sets the default admin account email on first run via
-  AUTHENTIK_BOOTSTRAP_EMAIL. On subsequent runs this value is ignored by
-  Authentik if the account already exists.
+  PostgreSQL and Redis subcharts are configured for persistent storage and
+  caching: PostgreSQL is disabled here because Authentik connects to a
+  CloudNativePG cluster created by authentication.yml; Redis stays as the
+  bundled subchart.
+
+  The bootstrap_token sets AUTHENTIK_BOOTSTRAP_TOKEN, which creates a
+  persistent API token in the Authentik database on first run. This token
+  is used by authentication.yml to configure Authentik via the REST API
+  without manual UI interaction.
+
+  The bootstrap_email sets the default admin account email on first run
+  via AUTHENTIK_BOOTSTRAP_EMAIL. On subsequent runs this value is ignored
+  by Authentik if the account already exists, the same as the
+  bootstrap_password.
 
   The namespace runs under Pod Security Admission 'restricted'. The server and
   worker pods each carry a full restricted securityContext via the chart's
@@ -38,8 +52,17 @@
                                  authentik-credentials Kubernetes Secret.
     admin_email:                 Email address for the default admin account.
                                  Read from group_vars.
-    bootstrap_admin_password:    Initial password for the default admin account.
-                                 Read from group_vars.
+    authentik_bootstrap_secret_name:
+                                 Name of the Kubernetes Secret produced by
+                                 the External Secrets Operator that carries
+                                 the AUTHENTIK_BOOTSTRAP_PASSWORD env var.
+                                 Materialized by ESO from
+                                 secret/authentik/bootstrap_password in
+                                 OpenBao. The Authentik server and worker
+                                 deployments envFrom this Secret so the
+                                 password lands in the pod environment at
+                                 startup; once the admin user exists in the
+                                 Authentik database the env var is ignored.
     nonroot_uid:                 Shared non-root UID for the authentik server
                                  and worker pods. Read from group_vars.
 #}
@@ -53,7 +76,15 @@ authentik:
     password: '{{ authentik_postgres_password }}'
   bootstrap_token: '{{ authentik_bootstrap_token }}'
   bootstrap_email: '{{ admin_email }}'
-  bootstrap_password: '{{ bootstrap_admin_password }}'
+  # bootstrap_password is intentionally NOT set inline. It is provided to
+  # the server and worker pods via envFrom (global.envFrom below), reading
+  # AUTHENTIK_BOOTSTRAP_PASSWORD from a Kubernetes Secret materialized by
+  # ESO from secret/authentik/bootstrap_password in OpenBao.
+
+global:
+  envFrom:
+    - secretRef:
+        name: '{{ authentik_bootstrap_secret_name }}'
 
 server:
   securityContext:

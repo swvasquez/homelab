@@ -22,6 +22,14 @@
     httproute_backend_name:      Name of the backend Service to route traffic to.
     httproute_backend_port:      Port of the backend Service.
     httproute_backend_namespace: Kubernetes namespace of the backend Service.
+    httproute_path_prefix:       (Optional) URL path prefix to match. When set
+                                 to a non-default value (e.g. /v1 or /ui),
+                                 only requests under that prefix are routed
+                                 through this HTTPRoute. Combined with
+                                 longest-prefix matching across multiple
+                                 HTTPRoutes on the same hostname, this lets
+                                 different prefixes carry different filters
+                                 (default: /, which matches everything).
     with_forward_auth:           (Optional) When true, applies the authentik-forward-auth
                                  Middleware to the route (default: false).
 #}
@@ -54,7 +62,11 @@ spec:
   hostnames:
     - '{{ httproute_hostname }}'
   rules:
-    - backendRefs:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: '{{ httproute_path_prefix | default("/") }}'
+      backendRefs:
         - name: '{{ httproute_backend_name }}'
           namespace: '{{ httproute_backend_namespace }}'
           port: {{ httproute_backend_port }}

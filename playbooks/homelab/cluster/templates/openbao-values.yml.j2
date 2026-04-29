@@ -1,0 +1,126 @@
+{#
+  Helm values for OpenBao server.
+
+  Variables:
+    nonroot_uid:               Shared non-root UID for the OpenBao pod and
+                               its data volume fsGroup. Read from group_vars.
+    openbao_storage_class:     Kubernetes StorageClass for the OpenBao data
+                               volume. Provided by the playbook (longhorn).
+    openbao_storage_size:      Size of the OpenBao data volume PVC. Provided
+                               by the playbook.
+
+  Notes on configuration:
+
+  - Single replica with the Raft integrated storage backend. Raft is chosen
+    over the file backend so that the storage layout is consistent if HA is
+    ever turned on in this cluster — adding replicas later does not require
+    a data migration.
+
+  - 'disable_mlock = true' is set so the OpenBao process does not need the
+    IPC_LOCK Linux capability. The cluster's restricted Pod Security
+    Admission default forbids capabilities other than NET_BIND_SERVICE, so
+    without this OpenBao would fail to start under the homelab's PSA policy.
+    The tradeoff is that secret material may be paged out by the kernel; on
+    a single-tenant homelab host with swap configured conservatively this
+    is an accepted risk.
+
+  - TLS is intentionally disabled on the OpenBao listener. LAN-facing
+    traffic is terminated by Traefik using the homelab wildcard cert
+    (cluster/authentication.yml exposes /ui/* through ForwardAuth and
+    cluster/secrets.yml exposes /v1/* unauthenticated to the API).
+    In-cluster ESO traffic uses the ClusterIP service directly over
+    plaintext, which is acceptable on a single-tenant private cluster.
+    Adding native TLS on the listener (e.g. via cert-manager) would create
+    a circular dependency (cert-manager would need to read certs that
+    OpenBao stores) and is deferred.
+
+  - The image runs as the upstream-default 'bao' user (uid 100). The pod
+    securityContext pins runAsUser/runAsGroup/fsGroup to the homelab's
+    nonroot_uid so the longhorn-backed PVC ends up owned by the same UID
+    every other homelab service uses, and the container drops every
+    capability and disables privilege escalation so the workload satisfies
+    the cluster's restricted PSA profile.
+#}
+global:
+  enabled: true
+  tlsDisable: true
+
+injector:
+  enabled: false
+
+# Note on UI: 'ui = true' is set inside server.standalone.config below so
+# the UI process is enabled inside the OpenBao pod. (The chart's top-level
+# 'ui.enabled' value is ignored when we provide our own standalone.config
+# block, which is why the flag has to live in the HCL itself.)
+#
+# Whether the UI is reachable on the LAN is governed by HTTPRoutes:
+# cluster/secrets.yml exposes only /v1/* (API) and cluster/authentication.yml
+# later applies a / -prefix HTTPRoute gated by Authentik ForwardAuth that
+# surfaces the UI behind SSO. When authentication.yml has not yet run,
+# /ui/* returns 404 from Traefik even though the UI process is up.
+
+server:
+  ha:
+    enabled: false
+
+  standalone:
+    enabled: true
+    config: |
+      disable_mlock = true
+      ui            = true
+
+      listener "tcp" {
+        address     = "[::]:8200"
+        cluster_address = "[::]:8201"
+        tls_disable = 1
+      }
+
+      storage "raft" {
+        path = "/openbao/data"
+      }
+
+      service_registration "kubernetes" {}
+
+  dataStorage:
+    enabled: true
+    size: '{{ openbao_storage_size }}'
+    storageClass: '{{ openbao_storage_class }}'
+    accessMode: ReadWriteOnce
+
+  auditStorage:
+    enabled: false
+
+  ingress:
+    enabled: false
+
+  service:
+    enabled: true
+
+  serviceAccount:
+    create: true
+
+  statefulSet:
+    securityContext:
+      pod:
+        runAsNonRoot: true
+        runAsUser: {{ nonroot_uid }}
+        runAsGroup: {{ nonroot_uid }}
+        fsGroup: {{ nonroot_uid }}
+        seccompProfile:
+          type: RuntimeDefault
+      container:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+  readinessProbe:
+    enabled: true
+    path: '/v1/sys/health?standbyok=true&sealedcode=204&uninitcode=204'

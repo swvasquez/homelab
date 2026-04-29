@@ -1,0 +1,70 @@
+{#
+  Helm values for External Secrets Operator (ESO).
+
+  ESO ships three deployments — the controller (reconciles
+  ExternalSecret/ClusterExternalSecret resources), the cert-controller
+  (manages internal webhook certs), and the webhook (validates ESO
+  custom resources at admission). All three run with the cluster's
+  restricted PSA profile by default; the values below pin the
+  securityContext explicitly so the cluster's restricted PSA enforcement
+  does not silently regress if upstream relaxes a default.
+
+  No PVC is needed — ESO is stateless and stores all reconciliation state
+  in the K8s API.
+
+  Variables:
+    nonroot_uid: Shared non-root UID for all three ESO deployments. Read
+                 from group_vars and matched against the openbao install
+                 so the cluster's nonroot identity is consistent.
+#}
+{% set securityContexts = {
+  "podSecurityContext": {
+    "runAsNonRoot": True,
+    "runAsUser": nonroot_uid,
+    "runAsGroup": nonroot_uid,
+    "fsGroup": nonroot_uid,
+    "seccompProfile": {"type": "RuntimeDefault"},
+  },
+  "containerSecurityContext": {
+    "allowPrivilegeEscalation": False,
+    "capabilities": {"drop": ["ALL"]},
+    "readOnlyRootFilesystem": True,
+  },
+} %}
+installCRDs: true
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+podSecurityContext:
+{{ securityContexts.podSecurityContext | to_nice_yaml(indent=2) | indent(2, true) }}
+securityContext:
+{{ securityContexts.containerSecurityContext | to_nice_yaml(indent=2) | indent(2, true) }}
+
+webhook:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+  podSecurityContext:
+{{ securityContexts.podSecurityContext | to_nice_yaml(indent=2) | indent(4, true) }}
+  securityContext:
+{{ securityContexts.containerSecurityContext | to_nice_yaml(indent=2) | indent(4, true) }}
+
+certController:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+  podSecurityContext:
+{{ securityContexts.podSecurityContext | to_nice_yaml(indent=2) | indent(4, true) }}
+  securityContext:
+{{ securityContexts.containerSecurityContext | to_nice_yaml(indent=2) | indent(4, true) }}

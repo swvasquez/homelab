@@ -1,0 +1,37 @@
+{#
+  ClusterRoleBinding granting OpenBao's ServiceAccount permission to call
+  the kube-apiserver's TokenReview endpoint. Required by the OpenBao
+  Kubernetes auth method: when ESO (or any other client) presents a
+  Kubernetes ServiceAccount token to OpenBao at
+  POST /v1/auth/kubernetes/login, OpenBao calls
+  POST /apis/authentication.k8s.io/v1/tokenreviews on the kube-apiserver
+  to verify the token. The kube-apiserver authorizes that call by checking
+  whether OpenBao's own SA holds the 'system:auth-delegator' ClusterRole.
+
+  The 'system:auth-delegator' role is built into Kubernetes and grants
+  exactly two permissions:
+    - create tokenreviews.authentication.k8s.io
+    - create subjectaccessreviews.authorization.k8s.io
+  Nothing else. Binding it here is the minimum permission OpenBao needs to
+  validate incoming SA tokens; it does not let OpenBao read any cluster
+  state, mutate any resources, or read any secrets.
+
+  Variables:
+    openbao_namespace:    Namespace where the OpenBao StatefulSet runs and
+                          where its ServiceAccount lives.
+    openbao_sa_name:      Name of OpenBao's ServiceAccount (created by the
+                          openbao Helm chart with serviceAccount.create:
+                          true; defaults to the release name 'openbao').
+#}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: '{{ openbao_sa_name }}-auth-delegator'
+subjects:
+  - kind: ServiceAccount
+    name: '{{ openbao_sa_name }}'
+    namespace: '{{ openbao_namespace }}'
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: 'system:auth-delegator'

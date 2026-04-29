@@ -8,6 +8,7 @@ Ansible playbooks to configure Ubuntu x86_64 compute nodes, Arch Linux-based IP 
 
 - [just](https://github.com/casey/just)
 - [uv](https://github.com/astral-sh/uv)
+- [bao](https://openbao.org/)
 
 ## Setup
 
@@ -67,7 +68,6 @@ Ansible playbooks to configure Ubuntu x86_64 compute nodes, Arch Linux-based IP 
     router_private_ip: <ROUTER_IP>
     shutdown_schedule: <SHUTDOWN_SCHEDULE>
     admin_email: <ADMIN_EMAIL>
-    bootstrap_admin_password: <BOOTSTRAP_ADMIN_PASSWORD>
     falco_sensitive_file_container_only: <true|false>
     ufw_allowed_ports:
       ssh:
@@ -213,10 +213,11 @@ to be installed first. Then run the cluster playbooks in this order:
 4. `storage`
 5. `database`
 6. `observability`
-7. `authentication`
-8. `git`
-9. `gitops`
-10. `security`
+7. `secrets`
+8. `authentication`
+9. `git`
+10. `gitops`
+11. `security`
 
 Once complete, services in `playbooks/homelab/service/` are self-contained and can be installed in
 any order.
@@ -241,7 +242,7 @@ kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock
   an issue with Ansible. See [Ansible Issue #85837](https://github.com/ansible/ansible/issues/85837)
   for details. IP KVM playbooks use standard `sudo` as `sudo.ws` is not available on Arch Linux.
 - **Service playbook run order**: Once the cluster playbooks (`bootstrap`, `network`, `storage`,
-  `database`, `observability`, `authentication`, `git`, `gitops`, `security`) have all been run,
+  `database`, `observability`, `secrets`, `authentication`, `git`, `gitops`, `security`) have all been run,
   services in `playbooks/homelab/service/` are self-contained. Each service playbook applies its
   own HTTPRoute, Traefik ForwardAuth Middleware, and namespace hardening, so adding a new service
   does NOT require re-running any cluster playbook:
@@ -279,6 +280,26 @@ kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock
   official Helm chart. All access is gated by Traefik ForwardAuth backed by Authentik — no OIDC
   plugin is required. The HTTPRoute and ForwardAuth Middleware are applied by the Jellyfin playbook
   itself.
+- **OpenBao secrets engine**: `cluster/secrets.yml` installs OpenBao (single-replica StatefulSet),
+  the External Secrets Operator, and a cluster-scoped `openbao` SecretStore. Five unseal keys plus
+  the initial root token are persisted to a dedicated macOS keychain
+  (`~/Library/Keychains/openbao.keychain-db`) on the Ansible host — nothing is written to
+  `group_vars` or rendered Helm values. The keychain has its own password (set on first install,
+  re-prompted only when OpenBao is sealed) and an idle auto-lock. Local tooling required: `bao`,
+  `kubectl`, `helm`, `jq`, `curl`; the host resolver must point at bind9 (see *Local DNS Resolution*
+  below). The API is exposed at `openbao.<DNS_ZONE>/v1/*` (token-authenticated, no ForwardAuth).
+  After every cluster reboot OpenBao comes up sealed; re-running the same command unseals it:
+  ```sh
+  just install homelab cluster secrets
+  ```
+  The web UI is enabled in the pod but only reachable after `cluster/authentication.yml` runs,
+  which adds a `/`-prefix HTTPRoute gated by Authentik ForwardAuth (so `openbao.<DNS_ZONE>/ui/`
+  requires SSO, then OpenBao's own login). `authentication.yml` also sources the Authentik
+  bootstrap password from OpenBao via ESO instead of `group_vars`. For ad-hoc CLI work:
+  ```sh
+  just bao-shell             # subshell with BAO_ADDR, BAO_SKIP_VERIFY, BAO_TOKEN preset
+  just bao-token | pbcopy    # copy the root token for the UI Token auth method
+  ```
 - **Local DNS Resolution**: To resolve homelab services (e.g., `*.homelab.internal`) from your
   local machine, configure your OS to use the cluster's Bind9 LoadBalancer IP as its nameserver.
   Note that Syncthing sync traffic uses a **dedicated LoadBalancer IP** (separate from the web GUI)

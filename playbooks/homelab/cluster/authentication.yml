@@ -7,10 +7,15 @@
 # LDAP authentication for homelab services.
 #
 # Authentik uses CloudNativePG for PostgreSQL and Redis as a subchart for
-# caching. Credentials (secret key and PostgreSQL password) are auto-generated
-# on first run and stored in a Kubernetes Secret named authentik-credentials.
-# On subsequent runs the existing secret is reused so credentials remain stable
-# across upgrades.
+# caching. Three of the four startup credentials — secret_key,
+# postgresql.password, and bootstrap_token — are auto-generated on first run
+# and stored in a Kubernetes Secret named authentik-credentials. The fourth,
+# AUTHENTIK_BOOTSTRAP_PASSWORD, is generated on first run and written to
+# OpenBao at secret/authentik/bootstrap_password by this playbook; ESO
+# materializes it into a separate Kubernetes Secret named
+# authentik-eso-bootstrap, which the chart consumes via global.envFrom. This
+# requires cluster/secrets.yml to have run first (OpenBao + ESO +
+# ClusterSecretStore must be in place).
 #
 # The Authentik UI is exposed over HTTPS via a Gateway API HTTPRoute attached
 # to the traefik-gateway. Authentik itself is not protected by ForwardAuth —
@@ -26,6 +31,16 @@
 # each service playbook in playbooks/service/ is responsible for applying its
 # own Middleware and HTTPRoute. Adding a new service therefore does NOT
 # require re-running this playbook.
+#
+# The OpenBao web UI is the one exception. cluster/secrets.yml exposes
+# OpenBao's API at /v1/* but leaves /ui/* unrouted because exposing the UI
+# requires Authentik ForwardAuth — and Authentik itself depends on this
+# playbook. After Authentik is installed, the tail of this playbook applies
+# an authentik-forward-auth Middleware in the openbao namespace and a
+# / -prefix HTTPRoute that gates the OpenBao UI behind SSO. The result is
+# that openbao.<dns_zone>/v1/* stays unauthenticated (token-based; ESO and
+# the bao CLI use this) while openbao.<dns_zone>/ui/* requires Authentik
+# login first, then OpenBao's own login form.
 #
 # Variables:
 #   bootstrap_node:              Boolean indicating if the host is the control
@@ -48,10 +63,30 @@
 #                                account. Read from group_vars. Only applied on
 #                                first Authentik startup — update via the UI
 #                                after initial deployment.
-#   bootstrap_admin_password:    Initial password for the Authentik default
-#                                admin account. Read from group_vars. Only
-#                                applied on first Authentik startup — update
-#                                via the UI after initial deployment.
+#   authentik_bootstrap_secret_name:
+#                                Name of the K8s Secret materialized by ESO
+#                                from secret/authentik/bootstrap_password in
+#                                OpenBao. Authentik server and worker pods
+#                                envFrom this Secret to read
+#                                AUTHENTIK_BOOTSTRAP_PASSWORD on first start
+#                                (default: authentik-eso-bootstrap).
+#   openbao_authentik_bootstrap_path:
+#                                KV path in OpenBao that holds the random
+#                                bootstrap password. Generated on first
+#                                install; never rotated automatically by
+#                                this playbook (default:
+#                                secret/authentik/bootstrap_password).
+#   openbao_hostname:            FQDN under which OpenBao is reachable from
+#                                the Ansible host. Used by 'bao kv put' to
+#                                write the bootstrap password
+#                                (default: openbao.<dns_zone>).
+#   openbao_keychain:            Filename of the macOS keychain that stores
+#                                the OpenBao root token (created by
+#                                cluster/secrets.yml; default:
+#                                openbao.keychain).
+#   keychain_service:            'service' field used to look up the OpenBao
+#                                root token in the keychain (default:
+#                                openbao).
 #   authentik_db_name:           PostgreSQL database name for Authentik
 #                                (default: authentik).
 #   authentik_db_username:       PostgreSQL username for Authentik
@@ -75,6 +110,11 @@
     authentik_db_username: authentik
     authentik_db_storage_size: 8Gi
     authentik_storage_class: longhorn
+    authentik_bootstrap_secret_name: authentik-eso-bootstrap
+    openbao_hostname: 'openbao.{{ dns_zone }}'
+    openbao_keychain: openbao.keychain
+    openbao_authentik_bootstrap_path: secret/authentik/bootstrap_password
+    keychain_service: openbao
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
 
   tasks:
@@ -334,11 +374,164 @@
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
+    # Authentik Bootstrap Password Sourced From OpenBao via ESO
+    # -------------------------------------------------------------------------
+    # Generates a random bootstrap password on first install, writes it to
+    # OpenBao at secret/authentik/bootstrap_password, applies an
+    # ExternalSecret pointing at it, and waits for ESO to materialize the
+    # K8s Secret 'authentik-eso-bootstrap'. The Authentik Helm values
+    # consume that Secret via global.envFrom so the pods read
+    # AUTHENTIK_BOOTSTRAP_PASSWORD from their environment at startup.
+    #
+    # Idempotency:
+    #   The K8s Secret 'authentik-eso-bootstrap' is probed first. If it
+    #   already exists, the entire OpenBao+ESO setup is skipped on this
+    #   run — no keychain prompt, no bao writes, no ExternalSecret
+    #   re-render. ESO continues syncing the value on its own
+    #   refreshInterval. To rotate manually, run
+    #   'just bao-shell; bao kv put secret/authentik/bootstrap_password
+    #   value=<new>; exit'; ESO will pick up the change within the
+    #   refreshInterval and Reloader (when installed) will roll the pods.
+    #
+    # Pre-conditions: cluster/secrets.yml must have run first so OpenBao,
+    # ESO, and the 'openbao' ClusterSecretStore are in place. README's
+    # cluster install order reflects this dependency.
+    # -------------------------------------------------------------------------
+    - name: Probe whether authentik-eso-bootstrap K8s Secret already exists
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret authentik-eso-bootstrap
+          -n {{ authentik_namespace }}
+      register: authentik_bootstrap_secret_probe
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set fact authentik_bootstrap_secret_present
+      ansible.builtin.set_fact:
+        authentik_bootstrap_secret_present: "{{ authentik_bootstrap_secret_probe.rc == 0 }}"
+      when: bootstrap_node | default(false)
+
+    - name: Prompt for openbao macOS keychain password
+      ansible.builtin.pause:
+        prompt: |
+          Enter the password for the openbao macOS keychain.
+          (Needed to write the Authentik bootstrap password to OpenBao.)
+        echo: false
+      register: authentik_keychain_password_input
+      delegate_to: localhost
+      no_log: true
+      when:
+        - bootstrap_node | default(false)
+        - not authentik_bootstrap_secret_present | default(false)
+
+    - name: Generate random Authentik bootstrap password and store in OpenBao
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+
+          KEYCHAIN='{{ openbao_keychain }}'
+          KEYCHAIN_PWD='{{ authentik_keychain_password_input.user_input }}'
+
+          security lock-keychain "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          unset KEYCHAIN_PWD
+
+          BAO_TOKEN="$(security find-generic-password \
+            -a root-token -s '{{ keychain_service }}' -w "$KEYCHAIN")"
+          export BAO_TOKEN
+          export BAO_ADDR='https://{{ openbao_hostname }}'
+          export BAO_SKIP_VERIFY=true
+
+          # Idempotent: only write a new password if the path is empty.
+          # Re-running the playbook never rotates the password by accident.
+          if ! bao kv get -format=json '{{ openbao_authentik_bootstrap_path }}' \
+              >/dev/null 2>&1; then
+            VALUE="$(openssl rand -base64 24)"
+            bao kv put '{{ openbao_authentik_bootstrap_path }}' value="$VALUE" \
+              >/dev/null
+            unset VALUE
+            echo "wrote {{ openbao_authentik_bootstrap_path }} (new)"
+          else
+            echo "{{ openbao_authentik_bootstrap_path }} already set; reusing"
+          fi
+
+          unset BAO_TOKEN
+        executable: /bin/sh
+      delegate_to: localhost
+      become: false
+      changed_when: true
+      no_log: true
+      when:
+        - bootstrap_node | default(false)
+        - not authentik_bootstrap_secret_present | default(false)
+
+    - name: Write Authentik bootstrap ExternalSecret manifest
+      ansible.builtin.template:
+        src: externalsecret.yml.j2
+        dest: /tmp/authentik-bootstrap-externalsecret.yml
+        mode: '0644'
+      vars:
+        es_name: authentik-bootstrap
+        es_namespace: '{{ authentik_namespace }}'
+        es_target_secret_name: '{{ authentik_bootstrap_secret_name }}'
+        es_data:
+          - secret_key: AUTHENTIK_BOOTSTRAP_PASSWORD
+            remote_key: '{{ openbao_authentik_bootstrap_path | regex_replace("^secret/", "") }}'
+            remote_property: value
+      when:
+        - bootstrap_node | default(false)
+        - not authentik_bootstrap_secret_present | default(false)
+
+    - name: Apply Authentik bootstrap ExternalSecret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/authentik-bootstrap-externalsecret.yml
+      register: authentik_bootstrap_es_apply_result
+      changed_when: >-
+        'created' in authentik_bootstrap_es_apply_result.stdout or
+        'configured' in authentik_bootstrap_es_apply_result.stdout
+      when:
+        - bootstrap_node | default(false)
+        - not authentik_bootstrap_secret_present | default(false)
+
+    - name: Clean up Authentik bootstrap ExternalSecret manifest
+      ansible.builtin.file:
+        path: /tmp/authentik-bootstrap-externalsecret.yml
+        state: absent
+      when:
+        - bootstrap_node | default(false)
+        - not authentik_bootstrap_secret_present | default(false)
+
+    - name: Wait for ESO to materialize authentik-eso-bootstrap Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret {{ authentik_bootstrap_secret_name }}
+          -n {{ authentik_namespace }}
+      register: authentik_bootstrap_secret_wait
+      changed_when: false
+      retries: 30
+      delay: 2
+      until: authentik_bootstrap_secret_wait.rc == 0
+      when:
+        - bootstrap_node | default(false)
+        - not authentik_bootstrap_secret_present | default(false)
+
+    # -------------------------------------------------------------------------
     # Authentik Installation
-    # Installs Authentik via Helm using the official goauthentik chart
-    # repository. PostgreSQL is managed by CloudNativePG. Redis subchart
-    # remains enabled for caching. Credentials are injected via a values
-    # file rendered from the generated or existing Kubernetes Secret.
+    # -------------------------------------------------------------------------
+    # Installs Authentik via the official goauthentik Helm chart. PostgreSQL
+    # is supplied by the CloudNativePG cluster created above; the chart's
+    # bundled postgresql subchart is disabled in authentik-values.yml.j2.
+    # The Redis subchart stays enabled for caching. Credentials reach the
+    # chart via two paths: the authentik-credentials Kubernetes Secret
+    # (secret_key, postgresql.password, bootstrap_token) and the
+    # authentik-eso-bootstrap Secret materialized by ESO above
+    # (AUTHENTIK_BOOTSTRAP_PASSWORD). The values file is rendered from
+    # those Secrets and removed after the helm upgrade completes.
     # -------------------------------------------------------------------------
     - name: Add Authentik Helm repository
       ansible.builtin.command:
@@ -581,5 +774,85 @@
     - name: Clean up Authentik HTTPRoute manifest
       ansible.builtin.file:
         path: /tmp/authentik-httproute.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # OpenBao UI Exposure Behind ForwardAuth
+    # -------------------------------------------------------------------------
+    # cluster/secrets.yml installs OpenBao with the UI process enabled in
+    # the pod and applies an HTTPRoute that surfaces only the API
+    # (/v1/*) — leaving /ui/* unrouted on Traefik until Authentik exists.
+    # This block, run after Authentik is fully installed, finishes the
+    # exposure: it deploys the authentik-forward-auth Middleware in the
+    # openbao namespace and applies a / -prefix HTTPRoute that gates
+    # everything else (the UI) behind Authentik SSO.
+    #
+    # The result is a hostname (openbao.<dns_zone>) where:
+    #   - /v1/*  is the API, no auth (token in Authorization header).
+    #   - /ui/*  and bare /  go through Authentik first, then OpenBao's
+    #            own login form (the UI presents a token/userpass/OIDC
+    #            picker).
+    #
+    # Both rules share the openbao backend; longest-prefix matching means
+    # /v1/* requests still hit the no-auth secrets.yml HTTPRoute and never
+    # see ForwardAuth.
+    # -------------------------------------------------------------------------
+    - name: Write ForwardAuth Middleware manifest for openbao
+      ansible.builtin.template:
+        src: traefik-forward-auth-middleware.yml.j2
+        dest: /tmp/traefik-forward-auth-middleware-openbao.yml
+        mode: '0644'
+      vars:
+        middleware_namespace: openbao
+      when: bootstrap_node | default(false)
+
+    - name: Apply ForwardAuth Middleware in openbao namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/traefik-forward-auth-middleware-openbao.yml
+      register: openbao_middleware_result
+      changed_when: >-
+        'created' in openbao_middleware_result.stdout or
+        'configured' in openbao_middleware_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up openbao ForwardAuth Middleware manifest
+      ansible.builtin.file:
+        path: /tmp/traefik-forward-auth-middleware-openbao.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write OpenBao UI HTTPRoute manifest (/, ForwardAuth-gated)
+      ansible.builtin.template:
+        src: httproute.yml.j2
+        dest: /tmp/openbao-ui-httproute.yml
+        mode: '0644'
+      vars:
+        httproute_name: openbao-ui
+        httproute_namespace: openbao
+        httproute_hostname: 'openbao.{{ dns_zone }}'
+        httproute_backend_name: openbao
+        httproute_backend_namespace: openbao
+        httproute_backend_port: 8200
+        httproute_path_prefix: /
+        with_forward_auth: true
+      when: bootstrap_node | default(false)
+
+    - name: Apply OpenBao UI HTTPRoute
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/openbao-ui-httproute.yml
+      register: openbao_ui_httproute_result
+      changed_when: >-
+        'created' in openbao_ui_httproute_result.stdout or
+        'configured' in openbao_ui_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up OpenBao UI HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/openbao-ui-httproute.yml
         state: absent
       when: bootstrap_node | default(false)
