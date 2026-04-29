@@ -19,21 +19,49 @@
 # CoreDNS hosts override that resolves authentik.homelab.internal to Traefik's
 # ClusterIP is managed by playbooks/cluster/network.yml.
 #
-# The Vaultwarden Deployment consumes the database connection as a single
-# DATABASE_URL DSN string from the vaultwarden-db-url Secret (Vaultwarden's
-# Postgres driver requires a full URL, not separate components). The canonical
-# Postgres password lives in the cnpg-formatted vaultwarden-db-credentials
-# Secret, which CloudNativePG uses to provision the user. vaultwarden-db-url
-# is rebuilt from that canonical password by Ansible. The admin token is the
-# only credential held in the vaultwarden-credentials Secret.
+# Every Vaultwarden runtime credential is sourced from OpenBao via ESO and
+# rolled into the running pod by Stakater Reloader. Three K8s Secrets are
+# materialized in the vaultwarden namespace:
 #
-# An OAuth2/OIDC provider and application are created in Authentik via the
-# REST API, enabling users to log in to the Vaultwarden web vault using their
-# Authentik credentials. The generated client ID and client secret are stored
-# in the vaultwarden-oidc Kubernetes Secret and injected into the Deployment
-# via secretKeyRef so that no credentials are committed to the gitops
-# repository. New user registrations are disabled; accounts are provisioned
-# automatically on first SSO login via Authentik.
+#   vaultwarden-credentials       admin-token
+#   vaultwarden-db-credentials    username, password, url (CNPG-format
+#                                 keys plus a templated DSN for the
+#                                 Vaultwarden DATABASE_URL env var)
+#   vaultwarden-oidc              SSO_CLIENT_ID, SSO_CLIENT_SECRET
+#
+# Each ExternalSecret references a path under secret/vaultwarden/* in
+# OpenBao. Rotating any value is 'just bao-shell; bao kv put
+# secret/vaultwarden/<name> value=<new>; exit'. ESO syncs within
+# refreshInterval, the K8s Secret updates, and Reloader (annotated via
+# reloader.stakater.com/auto on the Vaultwarden Deployment) rolls the
+# pod so the new env arrives. For the DB password, the cnpg Cluster's
+# managed.roles entry additionally runs ALTER USER on the postgres role
+# so the database itself accepts the new value.
+#
+# An OAuth2/OIDC provider and application are created in Authentik via
+# the REST API, enabling users to log in to the Vaultwarden web vault
+# using their Authentik credentials. Authentik generates the client ID
+# and client secret; the playbook writes those values into OpenBao on
+# first install, then ESO materializes them into the vaultwarden-oidc
+# Secret. New user registrations are disabled
+# (SIGNUPS_ALLOWED=false): a Vaultwarden account must already exist for
+# SSO to land in a vault — the first-time SSO auto-provision flow
+# (SSO_SIGNUPS_MATCH_EMAIL / org-invite) is not configured here.
+#
+# Because Authentik also stores the OIDC client_secret (and client_id),
+# ESO alone cannot keep the two sides aligned: ESO can pull values out of
+# OpenBao but cannot push them into Authentik. A small CronJob
+# ('vaultwarden-oidc-reconciler') deployed by this playbook closes that
+# loop on a 5-minute schedule — see the OpenBao -> Authentik OIDC
+# Reconciler section below and
+# service/templates/openbao-authentik-oidc-reconciler.yml.j2.
+#
+# The cnpg Cluster's managed.roles entry binds the postgres user's
+# password to the vaultwarden-db-credentials Secret; the matching
+# ExternalSecret labels that Secret with 'cnpg.io/reload: "true"' so the
+# CNPG operator's Secret-watch predicate fires and an ALTER USER runs on
+# every rotation. Without that label CNPG silently ignores Secret data
+# changes.
 #
 # Access to the web vault is additionally gated by Traefik ForwardAuth backed
 # by Authentik, requiring an active Authentik session before the request
@@ -45,10 +73,12 @@
 # Middleware are applied by this playbook itself in the Vaultwarden namespace.
 #
 # Run order:
-#   1. cluster/authentication.yml (Authentik, Traefik, cert-manager)
-#   2. cluster/git.yml
-#   3. cluster/gitops.yml
-#   4. service/vaultwarden.yml (this playbook)
+#   1. cluster/secrets.yml (OpenBao, ESO, Reloader — required for every
+#      ExternalSecret in this playbook to materialize)
+#   2. cluster/authentication.yml (Authentik, Traefik, cert-manager)
+#   3. cluster/git.yml
+#   4. cluster/gitops.yml
+#   5. service/vaultwarden.yml (this playbook)
 #
 # Input Variables:
 #   bootstrap_node:               Boolean indicating if the host is the control
@@ -102,6 +132,70 @@
 #   nonroot_uid:                  Shared non-root UID/GID for the Vaultwarden pod
 #                                 and container securityContext. Read from
 #                                 group_vars (default: 65532).
+#   openbao_hostname:             FQDN under which OpenBao is reachable from
+#                                 the Ansible host. Used by 'bao kv put' to
+#                                 seed credentials
+#                                 (default: openbao.<dns_zone>).
+#   homelab_keychain:             Filename of the dedicated macOS keychain
+#                                 holding cluster master credentials. Read
+#                                 from group_vars and derived from
+#                                 keychain_prefix.
+#   keychain_service:             'service' field used to look up the OpenBao
+#                                 root token in the keychain (default:
+#                                 openbao).
+#   vaultwarden_admin_token_kv_path:
+#                                 OpenBao KV path holding the Vaultwarden
+#                                 admin token (default:
+#                                 secret/vaultwarden/admin_token).
+#   vaultwarden_db_password_kv_path:
+#                                 OpenBao KV path holding the Postgres
+#                                 password used by the cnpg Cluster's
+#                                 managed.roles entry (default:
+#                                 secret/vaultwarden/db_password).
+#   vaultwarden_oidc_client_id_kv_path:
+#                                 OpenBao KV path holding the Authentik OIDC
+#                                 client_id (default:
+#                                 secret/vaultwarden/oidc_client_id).
+#   vaultwarden_oidc_client_secret_kv_path:
+#                                 OpenBao KV path holding the Authentik OIDC
+#                                 client_secret (default:
+#                                 secret/vaultwarden/oidc_client_secret).
+#   vaultwarden_oidc_reconciler_name:
+#                                 Resource name prefix for the
+#                                 OpenBao->Authentik reconciler ServiceAccount,
+#                                 ConfigMap, and CronJob in the vaultwarden
+#                                 namespace, plus the Role+RoleBinding the
+#                                 reconciler uses to read the Authentik
+#                                 bootstrap-token Secret (default:
+#                                 vaultwarden-oidc-reconciler).
+#   vaultwarden_oidc_reconciler_role:
+#                                 OpenBao kubernetes auth-method role name
+#                                 the reconciler logs in with. Bound to the
+#                                 reconciler ServiceAccount and granted the
+#                                 reconciler policy (default:
+#                                 vaultwarden-oidc-reconciler).
+#   vaultwarden_oidc_reconciler_policy:
+#                                 OpenBao policy attached to the reconciler
+#                                 role. Grants read on the OIDC client_id and
+#                                 client_secret KV paths only — nothing else
+#                                 in OpenBao is reachable from this role
+#                                 (default: vaultwarden-oidc-reconciler).
+#   vaultwarden_oidc_reconciler_schedule:
+#                                 CronJob schedule expression for the
+#                                 reconciler. Drift between an OpenBao 'bao
+#                                 kv put' and Authentik resolves within one
+#                                 tick (default: '*/5 * * * *').
+#   vaultwarden_oidc_reconciler_fields:
+#                                 List of dicts, each with keys
+#                                 'openbao_path' (KV-v2 API path including
+#                                 the '/data/' segment) and 'authentik_field'
+#                                 (JSON field on the Authentik OAuth2
+#                                 provider resource). The reconciler reads
+#                                 each path on every tick and PATCHes
+#                                 Authentik with everything that has drifted
+#                                 in a single API call. Default reconciles
+#                                 client_id and client_secret on the
+#                                 vaultwarden-sso provider.
 
 - name: Deploy Vaultwarden via ArgoCD GitOps
   hosts: homelab
@@ -126,6 +220,27 @@
     gitea_admin_username: gitea_admin
     gitea_gitops_repo: gitops
     argocd_namespace: argocd
+    openbao_hostname: 'openbao.{{ dns_zone }}'
+    homelab_keychain: '{{ keychain_prefix }}.keychain'
+    keychain_service: openbao
+    vaultwarden_admin_token_kv_path: secret/vaultwarden/admin_token
+    vaultwarden_db_password_kv_path: secret/vaultwarden/db_password
+    vaultwarden_oidc_client_id_kv_path: secret/vaultwarden/oidc_client_id
+    vaultwarden_oidc_client_secret_kv_path: secret/vaultwarden/oidc_client_secret
+    vaultwarden_oidc_reconciler_name: vaultwarden-oidc-reconciler
+    vaultwarden_oidc_reconciler_role: vaultwarden-oidc-reconciler
+    vaultwarden_oidc_reconciler_policy: vaultwarden-oidc-reconciler
+    vaultwarden_oidc_reconciler_schedule: '*/5 * * * *'
+    # Each entry maps an OpenBao KV-v2 path to a JSON field on Authentik's
+    # vaultwarden-sso OAuth2 provider resource. The reconciler reconciles
+    # every entry on each tick.
+    vaultwarden_oidc_reconciler_fields:
+      - openbao_path: >-
+          {{ vaultwarden_oidc_client_id_kv_path | regex_replace("^secret/", "secret/data/") }}
+        authentik_field: client_id
+      - openbao_path: >-
+          {{ vaultwarden_oidc_client_secret_kv_path | regex_replace("^secret/", "secret/data/") }}
+        authentik_field: client_secret
 
   tasks:
     # -------------------------------------------------------------------------
@@ -235,147 +350,242 @@
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
-    # Credentials
+    # Credentials Sourced From OpenBao via ESO
     # -------------------------------------------------------------------------
-    # Generates a random Vaultwarden admin token (held in vaultwarden-
-    # credentials) and a Postgres password (held in the cnpg-formatted
-    # vaultwarden-db-credentials Secret, which CloudNativePG uses to provision
-    # the user). The two Secrets are guarded independently for idempotency so
-    # they can evolve separately. A migration task strips the legacy
-    # DB_PASSWORD key from vaultwarden-credentials on clusters that were
-    # installed before the de-duplication. On subsequent runs the existing
-    # Secrets are reused so credentials remain stable across upgrades.
+    # Vaultwarden's runtime credentials live in OpenBao under
+    # secret/vaultwarden/*. ESO materializes the values into Kubernetes
+    # Secrets in the vaultwarden namespace; Reloader (cluster/secrets.yml)
+    # rolls the Vaultwarden Deployment whenever those Secrets change so
+    # rotation is end-to-end with a single 'bao kv put'. The DB password
+    # is additionally bound to a CNPG managed.roles entry on the
+    # vaultwarden-db Cluster so the postgres user's stored hash also gets
+    # ALTER USER'd on rotation (see the Database section below).
+    #
+    # Two K8s Secrets are produced here:
+    #
+    #   vaultwarden-credentials      keys: admin-token
+    #     consumed by:               Vaultwarden Deployment env ADMIN_TOKEN
+    #     OpenBao path:              secret/vaultwarden/admin_token
+    #
+    #   vaultwarden-db-credentials   keys: username, password, url
+    #     consumed by:               CNPG Cluster (username, password)
+    #                                Vaultwarden Deployment env DATABASE_URL
+    #     OpenBao path:              secret/vaultwarden/db_password
+    #     username:                  literal '{{ vaultwarden_db_username }}'
+    #                                via ESO target.template
+    #     url:                       'postgresql://<user>:<pw>@host/<db>'
+    #                                via ESO target.template referencing
+    #                                {{ .password }} from data[]
+    #
+    # Three states the seed shell block handles idempotently:
+    #
+    #   1. OpenBao path empty + K8s Secret missing  -> fresh install:
+    #      generate random, write to OpenBao, ESO materializes Secret.
+    #   2. OpenBao path empty + K8s Secret exists   -> migration from a
+    #      pre-OpenBao install: read the existing kubectl-created K8s
+    #      Secret value, write it verbatim to OpenBao, ExternalSecret
+    #      adopts the Secret without changing its value.
+    #   3. OpenBao path set                         -> normal re-run:
+    #      no-op; ESO continues syncing on its refreshInterval.
     # -------------------------------------------------------------------------
-    - name: Check if Vaultwarden admin credentials Secret exists
+    - name: Probe vaultwarden-credentials Secret for migration
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
           get secret vaultwarden-credentials -n {{ vaultwarden_namespace }}
-      register: vaultwarden_secret_check
+          -o jsonpath={.data.admin-token}
+      register: vaultwarden_existing_admin_token_b64
       changed_when: false
       failed_when: false
+      no_log: true
       when: bootstrap_node | default(false)
 
-    - name: Check if Vaultwarden database credentials Secret exists
+    - name: Probe vaultwarden-db-credentials Secret for migration
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
           get secret vaultwarden-db-credentials -n {{ vaultwarden_namespace }}
-      register: vaultwarden_db_creds_check
+          -o jsonpath={.data.password}
+      register: vaultwarden_existing_db_password_b64
       changed_when: false
       failed_when: false
-      when: bootstrap_node | default(false)
-
-    - name: Generate Vaultwarden admin token
-      ansible.builtin.command:
-        cmd: openssl rand -base64 48
-      register: vaultwarden_admin_token_gen
-      changed_when: false
-      when:
-        - bootstrap_node | default(false)
-        - vaultwarden_secret_check.rc != 0
-
-    - name: Generate Vaultwarden database password
-      ansible.builtin.command:
-        cmd: openssl rand -hex 32
-      register: vaultwarden_db_password_gen
-      changed_when: false
-      when:
-        - bootstrap_node | default(false)
-        - vaultwarden_db_creds_check.rc != 0
-
-    - name: Create Vaultwarden admin credentials Secret
-      ansible.builtin.command:
-        cmd: >-
-          kubectl --kubeconfig={{ kubectl_config_path }}
-          create secret generic vaultwarden-credentials
-          -n {{ vaultwarden_namespace }}
-          --from-literal=admin-token={{ vaultwarden_admin_token_gen.stdout }}
-      register: vaultwarden_secret_result
-      changed_when: "'created' in vaultwarden_secret_result.stdout"
-      when:
-        - bootstrap_node | default(false)
-        - vaultwarden_secret_check.rc != 0
       no_log: true
+      when: bootstrap_node | default(false)
 
-    - name: Create Vaultwarden cnpg database credentials Secret
-      ansible.builtin.command:
-        cmd: >-
-          kubectl --kubeconfig={{ kubectl_config_path }}
-          create secret generic vaultwarden-db-credentials
-          -n {{ vaultwarden_namespace }}
-          --from-literal=username={{ vaultwarden_db_username }}
-          --from-literal=password={{ vaultwarden_db_password_gen.stdout }}
-      register: vaultwarden_db_creds_result
-      changed_when: "'created' in vaultwarden_db_creds_result.stdout"
-      when:
-        - bootstrap_node | default(false)
-        - vaultwarden_db_creds_check.rc != 0
+    - name: Prompt for homelab macOS keychain password
+      ansible.builtin.pause:
+        prompt: |
+          Enter the password for the homelab macOS keychain.
+          (Needed to seed Vaultwarden credentials in OpenBao.)
+        echo: false
+      register: vaultwarden_keychain_password_input
+      delegate_to: localhost
       no_log: true
-
-    - name: Read Vaultwarden database password from cnpg credentials Secret
-      ansible.builtin.command:
-        cmd: >-
-          kubectl --kubeconfig={{ kubectl_config_path }}
-          get secret vaultwarden-db-credentials -n {{ vaultwarden_namespace }}
-          -o jsonpath='{.data.password}'
-      register: vaultwarden_db_password_b64
-      changed_when: false
       when: bootstrap_node | default(false)
 
-    - name: Check for legacy DB_PASSWORD key in vaultwarden-credentials
-      ansible.builtin.command:
-        cmd: >-
-          kubectl --kubeconfig={{ kubectl_config_path }}
-          get secret vaultwarden-credentials -n {{ vaultwarden_namespace }}
-          -o jsonpath='{.data.DB_PASSWORD}'
-      register: legacy_db_password_check
-      changed_when: false
-      when: bootstrap_node | default(false)
-
-    - name: Remove legacy DB_PASSWORD key from vaultwarden-credentials
+    - name: Seed Vaultwarden credentials in OpenBao
       ansible.builtin.shell:
-        cmd: >-
-          kubectl --kubeconfig={{ kubectl_config_path }}
-          patch secret vaultwarden-credentials -n {{ vaultwarden_namespace }}
-          --type=merge
-          -p '{"data":{"DB_PASSWORD":null}}'
+        cmd: |
+          set -euo pipefail
+
+          KEYCHAIN='{{ homelab_keychain }}'
+          KEYCHAIN_PWD='{{ vaultwarden_keychain_password_input.user_input }}'
+
+          security lock-keychain "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          unset KEYCHAIN_PWD
+
+          BAO_TOKEN="$(security find-generic-password \
+            -a root-token -s '{{ keychain_service }}' -w "$KEYCHAIN")"
+          export BAO_TOKEN
+          export BAO_ADDR='https://{{ openbao_hostname }}'
+          export BAO_SKIP_VERIFY=true
+
+          # admin_token: write only if missing in OpenBao. Migration path
+          # decodes the existing K8s Secret value if present.
+          if ! bao kv get -format=json '{{ vaultwarden_admin_token_kv_path }}' \
+              >/dev/null 2>&1; then
+            EXISTING_B64='{{ vaultwarden_existing_admin_token_b64.stdout | default("") }}'
+            if [ -n "$EXISTING_B64" ]; then
+              VALUE="$(printf '%s' "$EXISTING_B64" | base64 -d)"
+            else
+              VALUE="$(openssl rand -base64 48)"
+            fi
+            bao kv put '{{ vaultwarden_admin_token_kv_path }}' value="$VALUE" >/dev/null
+            unset VALUE EXISTING_B64
+          fi
+
+          # db_password: same pattern.
+          if ! bao kv get -format=json '{{ vaultwarden_db_password_kv_path }}' \
+              >/dev/null 2>&1; then
+            EXISTING_B64='{{ vaultwarden_existing_db_password_b64.stdout | default("") }}'
+            if [ -n "$EXISTING_B64" ]; then
+              VALUE="$(printf '%s' "$EXISTING_B64" | base64 -d)"
+            else
+              VALUE="$(openssl rand -hex 32)"
+            fi
+            bao kv put '{{ vaultwarden_db_password_kv_path }}' value="$VALUE" >/dev/null
+            unset VALUE EXISTING_B64
+          fi
+
+          unset BAO_TOKEN
+        executable: /bin/sh
+      delegate_to: localhost
+      become: false
       changed_when: true
-      when:
-        - bootstrap_node | default(false)
-        - legacy_db_password_check.stdout != ''
+      no_log: true
+      when: bootstrap_node | default(false)
 
-    - name: Check if Vaultwarden database URL Secret exists
+    - name: Write vaultwarden-credentials ExternalSecret manifest
+      ansible.builtin.template:
+        src: ../cluster/templates/externalsecret.yml.j2
+        dest: /tmp/vaultwarden-credentials-externalsecret.yml
+        mode: '0644'
+      vars:
+        es_name: vaultwarden-credentials
+        es_namespace: '{{ vaultwarden_namespace }}'
+        es_target_secret_name: vaultwarden-credentials
+        es_data:
+          - secret_key: admin-token
+            remote_key: '{{ vaultwarden_admin_token_kv_path | regex_replace("^secret/", "") }}'
+            remote_property: value
+      when: bootstrap_node | default(false)
+
+    - name: Apply vaultwarden-credentials ExternalSecret
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
-          get secret vaultwarden-db-url -n {{ vaultwarden_namespace }}
-      register: vaultwarden_db_url_check
+          apply -f /tmp/vaultwarden-credentials-externalsecret.yml
+      register: vaultwarden_credentials_es_result
+      changed_when: >-
+        'created' in vaultwarden_credentials_es_result.stdout or
+        'configured' in vaultwarden_credentials_es_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up vaultwarden-credentials ExternalSecret manifest
+      ansible.builtin.file:
+        path: /tmp/vaultwarden-credentials-externalsecret.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write vaultwarden-db-credentials ExternalSecret manifest
+      ansible.builtin.template:
+        src: ../cluster/templates/externalsecret.yml.j2
+        dest: /tmp/vaultwarden-db-credentials-externalsecret.yml
+        mode: '0644'
+      vars:
+        es_name: vaultwarden-db-credentials
+        es_namespace: '{{ vaultwarden_namespace }}'
+        es_target_secret_name: vaultwarden-db-credentials
+        es_data:
+          - secret_key: password
+            remote_key: '{{ vaultwarden_db_password_kv_path | regex_replace("^secret/", "") }}'
+            remote_property: value
+        es_target_template:
+          username: '{{ vaultwarden_db_username }}'
+          password: '{% raw %}{{ .password }}{% endraw %}'
+          url: >-
+            postgresql://{{ vaultwarden_db_username }}:{% raw %}{{ .password }}{% endraw
+            %}@vaultwarden-db-rw.{{ vaultwarden_namespace }}.svc:5432/{{ vaultwarden_db_name }}
+        # Opt the materialized Secret into CloudNativePG's Secret-watch
+        # predicate so that managed.roles reconciles + runs ALTER USER on
+        # password rotation without manual intervention. Without this
+        # label CNPG silently ignores Secret data changes.
+        es_target_labels:
+          cnpg.io/reload: 'true'
+      when: bootstrap_node | default(false)
+
+    - name: Apply vaultwarden-db-credentials ExternalSecret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/vaultwarden-db-credentials-externalsecret.yml
+      register: vaultwarden_db_credentials_es_result
+      changed_when: >-
+        'created' in vaultwarden_db_credentials_es_result.stdout or
+        'configured' in vaultwarden_db_credentials_es_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up vaultwarden-db-credentials ExternalSecret manifest
+      ansible.builtin.file:
+        path: /tmp/vaultwarden-db-credentials-externalsecret.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Wait for vaultwarden-credentials Secret to be materialized by ESO
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret vaultwarden-credentials -n {{ vaultwarden_namespace }}
+      register: vaultwarden_credentials_wait
       changed_when: false
-      failed_when: false
+      retries: 30
+      delay: 2
+      until: vaultwarden_credentials_wait.rc == 0
       when: bootstrap_node | default(false)
 
-    - name: Set Vaultwarden database URL fact
-      ansible.builtin.set_fact:
-        vaultwarden_db_url: >-
-          postgresql://{{ vaultwarden_db_username }}:{{ vaultwarden_db_password_b64.stdout | b64decode
-          }}@vaultwarden-db-rw.{{ vaultwarden_namespace }}.svc:5432/{{ vaultwarden_db_name }}
-      no_log: true
-      when: bootstrap_node | default(false)
-
-    - name: Create Vaultwarden database URL Secret
+    - name: Wait for vaultwarden-db-credentials Secret to be materialized by ESO
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
-          create secret generic vaultwarden-db-url
-          -n {{ vaultwarden_namespace }}
-          --from-literal=url={{ vaultwarden_db_url }}
-      register: vaultwarden_db_url_result
-      changed_when: "'created' in vaultwarden_db_url_result.stdout"
-      when:
-        - bootstrap_node | default(false)
-        - vaultwarden_db_url_check.rc != 0
-      no_log: true
+          get secret vaultwarden-db-credentials -n {{ vaultwarden_namespace }}
+          -o jsonpath={.data.url}
+      register: vaultwarden_db_credentials_wait
+      changed_when: false
+      retries: 30
+      delay: 2
+      until: vaultwarden_db_credentials_wait.stdout | length > 0
+      when: bootstrap_node | default(false)
+
+    - name: Remove orphaned vaultwarden-db-url Secret (folded into vaultwarden-db-credentials)
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          delete secret vaultwarden-db-url -n {{ vaultwarden_namespace }}
+          --ignore-not-found
+      register: vaultwarden_db_url_delete_result
+      changed_when: "'deleted' in vaultwarden_db_url_delete_result.stdout"
+      when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
     # Database
@@ -406,6 +616,21 @@
                 owner: '{{ vaultwarden_db_username }}'
                 secret:
                   name: vaultwarden-db-credentials
+            # managed.roles tells the cnpg operator to keep the named
+            # postgres role in sync with the referenced Secret. When ESO
+            # rewrites vaultwarden-db-credentials.password (e.g. after a
+            # 'bao kv put secret/vaultwarden/db_password value=<new>'),
+            # the operator runs ALTER USER vaultwarden WITH PASSWORD ... so
+            # the database itself accepts the new value. Pair with the
+            # reloader.stakater.com/auto annotation on the Vaultwarden
+            # Deployment for end-to-end rotation.
+            managed:
+              roles:
+                - name: '{{ vaultwarden_db_username }}'
+                  ensure: present
+                  login: true
+                  passwordSecret:
+                    name: vaultwarden-db-credentials
       when: bootstrap_node | default(false)
 
     - name: Apply Vaultwarden cnpg Cluster manifest
@@ -696,30 +921,228 @@
         vaultwarden_app_link_result.json.provider | string != vaultwarden_provider_id | string
       when: bootstrap_node | default(false)
 
-    - name: Check if Vaultwarden OIDC credentials Secret exists
+    # -------------------------------------------------------------------------
+    # OIDC Credentials Sourced From OpenBao via ESO
+    # -------------------------------------------------------------------------
+    # Authentik generates the OIDC client_id and client_secret when the
+    # provider is created above. This block writes those values to OpenBao
+    # under secret/vaultwarden/oidc_client_{id,secret}, applies an
+    # ExternalSecret pointing at them, and waits for ESO to materialize
+    # the vaultwarden-oidc K8s Secret. Reloader rolls Vaultwarden when the
+    # Secret changes, so rotating the OIDC client_secret is:
+    #
+    #   1. In Authentik UI/API: regenerate the client_secret on the
+    #      vaultwarden-sso provider and copy the new value.
+    #   2. Locally: 'just bao-shell; bao kv put
+    #      secret/vaultwarden/oidc_client_secret value=<new>; exit'.
+    #   3. ESO syncs within refreshInterval; Reloader rolls Vaultwarden.
+    #
+    # Migration from a pre-OpenBao install: if the vaultwarden-oidc Secret
+    # already exists, its current values are read and seeded into OpenBao
+    # before the ExternalSecret takes ownership.
+    # -------------------------------------------------------------------------
+    - name: Probe vaultwarden-oidc Secret for migration
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
           get secret vaultwarden-oidc -n {{ vaultwarden_namespace }}
-      register: vaultwarden_oidc_secret_check
+          -o jsonpath={.data.SSO_CLIENT_ID}
+      register: vaultwarden_existing_oidc_client_id_b64
       changed_when: false
       failed_when: false
+      no_log: true
       when: bootstrap_node | default(false)
 
-    - name: Create Vaultwarden OIDC credentials Secret
+    - name: Seed Vaultwarden OIDC credentials in OpenBao
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+
+          KEYCHAIN='{{ homelab_keychain }}'
+          KEYCHAIN_PWD='{{ vaultwarden_keychain_password_input.user_input }}'
+
+          # The keychain may have re-locked since the earlier seed step
+          # (idle timeout very short, etc.). Lock-then-unlock so the
+          # password is validated and the keychain is open.
+          security lock-keychain "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          unset KEYCHAIN_PWD
+
+          BAO_TOKEN="$(security find-generic-password \
+            -a root-token -s '{{ keychain_service }}' -w "$KEYCHAIN")"
+          export BAO_TOKEN
+          export BAO_ADDR='https://{{ openbao_hostname }}'
+          export BAO_SKIP_VERIFY=true
+
+          # client_id: write only if missing in OpenBao. We always have a
+          # candidate value from the Authentik provider create/lookup
+          # above (vaultwarden_oidc_client_id), so the migration path and
+          # fresh-install path collapse to the same write.
+          if ! bao kv get -format=json '{{ vaultwarden_oidc_client_id_kv_path }}' \
+              >/dev/null 2>&1; then
+            bao kv put '{{ vaultwarden_oidc_client_id_kv_path }}' \
+              value='{{ vaultwarden_oidc_client_id }}' >/dev/null
+          fi
+
+          if ! bao kv get -format=json '{{ vaultwarden_oidc_client_secret_kv_path }}' \
+              >/dev/null 2>&1; then
+            bao kv put '{{ vaultwarden_oidc_client_secret_kv_path }}' \
+              value='{{ vaultwarden_oidc_client_secret }}' >/dev/null
+          fi
+
+          unset BAO_TOKEN
+        executable: /bin/sh
+      delegate_to: localhost
+      become: false
+      changed_when: true
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Write vaultwarden-oidc ExternalSecret manifest
+      ansible.builtin.template:
+        src: ../cluster/templates/externalsecret.yml.j2
+        dest: /tmp/vaultwarden-oidc-externalsecret.yml
+        mode: '0644'
+      vars:
+        es_name: vaultwarden-oidc
+        es_namespace: '{{ vaultwarden_namespace }}'
+        es_target_secret_name: vaultwarden-oidc
+        es_data:
+          - secret_key: SSO_CLIENT_ID
+            remote_key: '{{ vaultwarden_oidc_client_id_kv_path | regex_replace("^secret/", "") }}'
+            remote_property: value
+          - secret_key: SSO_CLIENT_SECRET
+            remote_key: '{{ vaultwarden_oidc_client_secret_kv_path | regex_replace("^secret/", "") }}'
+            remote_property: value
+      when: bootstrap_node | default(false)
+
+    - name: Apply vaultwarden-oidc ExternalSecret
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
-          create secret generic vaultwarden-oidc
-          -n {{ vaultwarden_namespace }}
-          --from-literal=SSO_CLIENT_ID={{ vaultwarden_oidc_client_id }}
-          --from-literal=SSO_CLIENT_SECRET={{ vaultwarden_oidc_client_secret }}
-      register: vaultwarden_oidc_secret_result
-      changed_when: "'created' in vaultwarden_oidc_secret_result.stdout"
-      when:
-        - bootstrap_node | default(false)
-        - vaultwarden_oidc_secret_check.rc != 0
+          apply -f /tmp/vaultwarden-oidc-externalsecret.yml
+      register: vaultwarden_oidc_es_result
+      changed_when: >-
+        'created' in vaultwarden_oidc_es_result.stdout or
+        'configured' in vaultwarden_oidc_es_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up vaultwarden-oidc ExternalSecret manifest
+      ansible.builtin.file:
+        path: /tmp/vaultwarden-oidc-externalsecret.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Wait for vaultwarden-oidc Secret to be materialized by ESO
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret vaultwarden-oidc -n {{ vaultwarden_namespace }}
+      register: vaultwarden_oidc_wait
+      changed_when: false
+      retries: 30
+      delay: 2
+      until: vaultwarden_oidc_wait.rc == 0
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # OpenBao -> Authentik OIDC client_secret Reconciler
+    # -------------------------------------------------------------------------
+    # The OIDC client_secret is special among Vaultwarden's credentials
+    # because Authentik also stores it (in its postgres DB) and the
+    # Vaultwarden side and the Authentik side must match for OIDC to work.
+    # ESO can pull values OUT of OpenBao but cannot push them INTO
+    # Authentik, so by default a 'bao kv put secret/vaultwarden/
+    # oidc_client_secret value=<new>' updates Vaultwarden's view but
+    # leaves Authentik's stored secret stale, breaking SSO.
+    #
+    # This block deploys a CronJob that periodically reads the OpenBao
+    # value, compares it to Authentik's current client_secret on the
+    # vaultwarden-sso provider, and PATCHes Authentik when they differ.
+    # End result: rotation by 'bao kv put' alone is sufficient — the
+    # reconciler closes the loop within a few minutes.
+    #
+    # The OpenBao policy + auth role provisioned here grant the
+    # reconciler SA read-only access to ONLY this one KV path. The Role +
+    # RoleBinding emitted in the manifest template grant the reconciler
+    # SA read access to ONLY the Authentik bootstrap-token Secret in the
+    # authentik namespace. Both scopes are the minimum the reconciler
+    # needs.
+    #
+    # The pattern (template + this OpenBao policy/role pair) is reusable
+    # for any (OpenBao path, Authentik OAuth2 provider) tuple — see
+    # service/templates/openbao-authentik-oidc-reconciler.yml.j2.
+    # -------------------------------------------------------------------------
+    - name: Configure OpenBao policy and auth role for the OIDC reconciler
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+
+          KEYCHAIN='{{ homelab_keychain }}'
+          KEYCHAIN_PWD='{{ vaultwarden_keychain_password_input.user_input }}'
+
+          security lock-keychain "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          unset KEYCHAIN_PWD
+
+          BAO_TOKEN="$(security find-generic-password \
+            -a root-token -s '{{ keychain_service }}' -w "$KEYCHAIN")"
+          export BAO_TOKEN
+          export BAO_ADDR='https://{{ openbao_hostname }}'
+          export BAO_SKIP_VERIFY=true
+
+          bao policy write {{ vaultwarden_oidc_reconciler_policy }} - <<'POLICY' >/dev/null
+          {% for field in vaultwarden_oidc_reconciler_fields %}{# noqa #}
+          path "{{ field.openbao_path | trim }}" {
+            capabilities = ["read"]
+          }
+          {% endfor %}{# noqa #}
+          POLICY
+
+          bao write auth/kubernetes/role/{{ vaultwarden_oidc_reconciler_role }} \
+            bound_service_account_names={{ vaultwarden_oidc_reconciler_name }} \
+            bound_service_account_namespaces={{ vaultwarden_namespace }} \
+            policies={{ vaultwarden_oidc_reconciler_policy }} \
+            ttl=10m >/dev/null
+
+          unset BAO_TOKEN
+        executable: /bin/sh
+      delegate_to: localhost
+      become: false
+      changed_when: true
       no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Write OIDC reconciler manifest
+      ansible.builtin.template:
+        src: templates/openbao-authentik-oidc-reconciler.yml.j2
+        dest: /tmp/vaultwarden-oidc-reconciler.yml
+        mode: '0644'
+      vars:
+        reconciler_name: '{{ vaultwarden_oidc_reconciler_name }}'
+        reconciler_namespace: '{{ vaultwarden_namespace }}'
+        reconciler_schedule: '{{ vaultwarden_oidc_reconciler_schedule }}'
+        openbao_kubernetes_role: '{{ vaultwarden_oidc_reconciler_role }}'
+        reconciler_fields: '{{ vaultwarden_oidc_reconciler_fields }}'
+        authentik_provider_name: vaultwarden-sso
+      when: bootstrap_node | default(false)
+
+    - name: Apply OIDC reconciler manifest
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/vaultwarden-oidc-reconciler.yml
+      register: vaultwarden_oidc_reconciler_apply
+      changed_when: >-
+        'created' in vaultwarden_oidc_reconciler_apply.stdout or
+        'configured' in vaultwarden_oidc_reconciler_apply.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up OIDC reconciler manifest
+      ansible.builtin.file:
+        path: /tmp/vaultwarden-oidc-reconciler.yml
+        state: absent
+      when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
     # Homelab CA Certificate

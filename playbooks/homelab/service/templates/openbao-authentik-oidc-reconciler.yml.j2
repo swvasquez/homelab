@@ -1,0 +1,353 @@
+{#
+  Generic CronJob that pushes one or more fields from OpenBao into an
+  Authentik OAuth2 provider. Closes the asymmetry of the OpenBao + ESO
+  pipeline for credentials that ALSO live inside a third-party system
+  (Authentik, here): ESO can pull values OUT of OpenBao into K8s
+  Secrets, but it cannot push values INTO Authentik's database. This
+  CronJob fills that gap by polling on a schedule, reading the canonical
+  values from OpenBao, and PATCHing Authentik when any side has drifted.
+
+  Reusable per (Authentik OAuth2 provider, list of fields) tuple.
+  Override the variables below to point a new instance at a different
+  provider. The reconciler holds no state; it is safe to roll out as
+  many CronJob instances as needed.
+
+  The CronJob authenticates to OpenBao via the Kubernetes auth method
+  using the ServiceAccount that this template provisions. The OpenBao
+  policy + auth role for that SA must be created separately by the caller
+  (see the corresponding tasks in the consuming service playbook). It
+  authenticates to Authentik using the bootstrap token stored in the
+  authentik-credentials Secret in the authentik namespace, accessed via
+  the cross-namespace Role+RoleBinding this template also provisions.
+
+  Variables:
+    reconciler_name:                  Resource name prefix used for
+                                      everything this template emits
+                                      (SA, ConfigMap, CronJob, etc.).
+    reconciler_namespace:             Namespace where the SA, CronJob,
+                                      and ConfigMap live (usually the
+                                      same as the consuming service).
+    reconciler_schedule:              CronJob schedule expression
+                                      (default: '*/5 * * * *', every
+                                      five minutes).
+    reconciler_image:                 Container image. Anything with
+                                      Python 3 stdlib works; the script
+                                      uses urllib + json + base64 only
+                                      (default: python:3.12-alpine).
+    nonroot_uid:                      Non-root UID/GID for the pod
+                                      securityContext (read from
+                                      group_vars).
+    openbao_addr:                     In-cluster OpenBao endpoint
+                                      (default:
+                                      http://openbao.openbao.svc:8200).
+    openbao_kubernetes_role:          OpenBao kubernetes auth-method
+                                      role name the reconciler logs in
+                                      with. Caller-defined.
+    reconciler_fields:                List of dicts, each with keys:
+                                        openbao_path     — OpenBao API
+                                                           path to GET.
+                                                           KV v2 paths
+                                                           include the
+                                                           '/data/'
+                                                           segment.
+                                        authentik_field  — JSON field
+                                                           name on the
+                                                           Authentik
+                                                           OAuth2
+                                                           provider
+                                                           resource to
+                                                           reconcile to
+                                                           (e.g.
+                                                           'client_id',
+                                                           'client_secret').
+                                      The reconciler reads each path
+                                      from OpenBao, compares to the
+                                      named field on the Authentik
+                                      provider, and PATCHes Authentik
+                                      with everything that drifted in a
+                                      single API call.
+    authentik_namespace:              Namespace where Authentik runs and
+                                      where authentik-credentials lives
+                                      (default: authentik).
+    authentik_token_secret_name:      Name of the Secret holding the
+                                      Authentik bootstrap token
+                                      (default: authentik-credentials).
+    authentik_token_secret_key:       Key within that Secret holding the
+                                      token (default: bootstrap-token).
+    authentik_api_url:                Base URL of the Authentik API as
+                                      reachable from this namespace
+                                      (default:
+                                      http://authentik-server.authentik.svc/api/v3).
+    authentik_provider_name:          The 'name' field on the Authentik
+                                      OAuth2 provider resource that this
+                                      reconciler keeps in sync. The
+                                      provider must already exist
+                                      (typically created by the
+                                      consuming service playbook).
+#}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: '{{ reconciler_name }}'
+  namespace: '{{ reconciler_namespace }}'
+---
+# Role + RoleBinding live in the AUTHENTIK namespace so the reconciler
+# SA (in {{ reconciler_namespace }}) can read the Authentik bootstrap
+# token. Scoped to a single Secret name; nothing else in the authentik
+# namespace is reachable from this token.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: '{{ reconciler_name }}-authentik-token-reader'
+  namespace: '{{ authentik_namespace | default("authentik") }}'
+rules:
+  - apiGroups: ['']
+    resources: ['secrets']
+    resourceNames:
+      - '{{ authentik_token_secret_name | default("authentik-credentials") }}'
+    verbs: ['get']
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: '{{ reconciler_name }}-authentik-token-reader'
+  namespace: '{{ authentik_namespace | default("authentik") }}'
+subjects:
+  - kind: ServiceAccount
+    name: '{{ reconciler_name }}'
+    namespace: '{{ reconciler_namespace }}'
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: '{{ reconciler_name }}-authentik-token-reader'
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: '{{ reconciler_name }}'
+  namespace: '{{ reconciler_namespace }}'
+data:
+  reconcile.py: |
+{% raw %}
+    """OpenBao -> Authentik OIDC OAuth2-provider field reconciler.
+
+    Reads one or more values from OpenBao via the kubernetes auth method
+    using the pod's mounted ServiceAccount token. Reads the Authentik
+    bootstrap token from a cross-namespace Kubernetes Secret using the
+    same SA token. Compares each configured (openbao_path,
+    authentik_field) pair to Authentik's current provider state; PATCHes
+    Authentik with everything that drifted in a single API call.
+
+    No external dependencies (urllib + json + base64 only).
+    """
+    import base64
+    import json
+    import os
+    import ssl
+    import sys
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+
+    K8S_API_CA = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+    K8S_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    K8S_API = "https://kubernetes.default.svc"
+
+
+    def http(method, url, headers=None, payload=None, ca=None):
+        """Tiny urllib wrapper. Returns parsed JSON; raises on HTTP errors."""
+        data = None
+        merged_headers = dict(headers or {})
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            merged_headers.setdefault("Content-Type", "application/json")
+        req = urllib.request.Request(url, method=method, data=data, headers=merged_headers)
+        ctx = ssl.create_default_context(cafile=ca) if ca else None
+        with urllib.request.urlopen(req, context=ctx) as resp:
+            body = resp.read()
+            return json.loads(body) if body else None
+
+
+    def must_env(name):
+        value = os.environ.get(name)
+        if not value:
+            print(f"ERROR: required env {name} is unset", flush=True)
+            sys.exit(1)
+        return value
+
+
+    def main():
+        bao_addr = must_env("OPENBAO_ADDR")
+        bao_role = must_env("OPENBAO_KUBERNETES_ROLE")
+        ak_ns = must_env("AUTHENTIK_NAMESPACE")
+        ak_secret = must_env("AUTHENTIK_TOKEN_SECRET_NAME")
+        ak_secret_key = must_env("AUTHENTIK_TOKEN_SECRET_KEY")
+        ak_api = must_env("AUTHENTIK_API_URL").rstrip("/")
+        ak_provider = must_env("AUTHENTIK_PROVIDER_NAME")
+        fields = json.loads(must_env("RECONCILER_FIELDS"))
+        if not isinstance(fields, list) or not fields:
+            print("ERROR: RECONCILER_FIELDS must be a non-empty JSON list", flush=True)
+            sys.exit(1)
+
+        # 1. Read SA token (mounted by the kubelet).
+        with open(K8S_TOKEN_PATH) as fh:
+            sa_token = fh.read().strip()
+
+        # 2. Login to OpenBao with the SA token via the kubernetes auth method.
+        login = http(
+            "POST",
+            f"{bao_addr}/v1/auth/kubernetes/login",
+            payload={"role": bao_role, "jwt": sa_token},
+        )
+        bao_token = login["auth"]["client_token"]
+
+        # 3. Read the Authentik bootstrap token from a Secret in the
+        #    authentik namespace (RBAC granted via Role+RoleBinding).
+        k8s_resp = http(
+            "GET",
+            f"{K8S_API}/api/v1/namespaces/{ak_ns}/secrets/{ak_secret}",
+            headers={"Authorization": f"Bearer {sa_token}"},
+            ca=K8S_API_CA,
+        )
+        encoded = k8s_resp["data"][ak_secret_key]
+        ak_token = base64.b64decode(encoded).decode("utf-8")
+
+        # 4. Look up the Authentik OAuth2 provider by name.
+        query = urllib.parse.urlencode({"name": ak_provider})
+        providers = http(
+            "GET",
+            f"{ak_api}/providers/oauth2/?{query}",
+            headers={"Authorization": f"Bearer {ak_token}"},
+        )
+        results = providers.get("results", [])
+        if not results:
+            print(f"ERROR: Authentik provider {ak_provider!r} not found", flush=True)
+            sys.exit(1)
+        provider = results[0]
+        provider_id = provider["pk"]
+
+        # 5. For each configured (openbao_path, authentik_field) pair,
+        #    fetch the OpenBao value and compare to Authentik's current
+        #    state. Build a single PATCH payload of everything that
+        #    drifted; values themselves are never logged.
+        patch = {}
+        for entry in fields:
+            path = entry["openbao_path"]
+            ak_field = entry["authentik_field"]
+            bao_resp = http(
+                "GET",
+                f"{bao_addr}/v1/{path}",
+                headers={"X-Vault-Token": bao_token},
+            )
+            desired = bao_resp["data"]["data"]["value"]
+            current = provider.get(ak_field, "")
+            if desired == current:
+                print(
+                    f"{ak_provider!r}.{ak_field}: matches OpenBao at {path}; no-op",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"{ak_provider!r}.{ak_field}: differs from OpenBao at {path}; queueing update",
+                    flush=True,
+                )
+                patch[ak_field] = desired
+
+        if not patch:
+            return
+
+        http(
+            "PATCH",
+            f"{ak_api}/providers/oauth2/{provider_id}/",
+            headers={"Authorization": f"Bearer {ak_token}"},
+            payload=patch,
+        )
+        print(
+            f"{ak_provider!r} updated: {sorted(patch.keys())}",
+            flush=True,
+        )
+
+
+    if __name__ == "__main__":
+        try:
+            main()
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            print(f"HTTP {exc.code} from {exc.url}: {body}", flush=True)
+            sys.exit(1)
+{% endraw %}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: '{{ reconciler_name }}'
+  namespace: '{{ reconciler_namespace }}'
+spec:
+  schedule: '{{ reconciler_schedule | default("*/5 * * * *") }}'
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: '{{ reconciler_name }}'
+        spec:
+          serviceAccountName: '{{ reconciler_name }}'
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: {{ nonroot_uid }}
+            runAsGroup: {{ nonroot_uid }}
+            fsGroup: {{ nonroot_uid }}
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: reconcile
+              image: '{{ reconciler_image | default("python:3.12-alpine") }}'
+              imagePullPolicy: IfNotPresent
+              command: ['python3', '/scripts/reconcile.py']
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ['ALL']
+                readOnlyRootFilesystem: true
+              env:
+                - name: OPENBAO_ADDR
+                  value: '{{ openbao_addr | default("http://openbao.openbao.svc:8200") }}'
+                - name: OPENBAO_KUBERNETES_ROLE
+                  value: '{{ openbao_kubernetes_role }}'
+                - name: RECONCILER_FIELDS
+                  value: '{{ reconciler_fields | to_json }}'
+                - name: AUTHENTIK_NAMESPACE
+                  value: '{{ authentik_namespace | default("authentik") }}'
+                - name: AUTHENTIK_TOKEN_SECRET_NAME
+                  value: '{{ authentik_token_secret_name | default("authentik-credentials") }}'
+                - name: AUTHENTIK_TOKEN_SECRET_KEY
+                  value: '{{ authentik_token_secret_key | default("bootstrap-token") }}'
+                - name: AUTHENTIK_API_URL
+                  value: '{{ authentik_api_url | default("http://authentik-server.authentik.svc/api/v3") }}'
+                - name: AUTHENTIK_PROVIDER_NAME
+                  value: '{{ authentik_provider_name }}'
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  memory: 128Mi
+              volumeMounts:
+                - name: script
+                  mountPath: /scripts
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: script
+              configMap:
+                name: '{{ reconciler_name }}'
+                defaultMode: 0o555
+            - name: tmp
+              emptyDir: {}

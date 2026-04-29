@@ -82,6 +82,13 @@ metadata:
   namespace: '{{ vaultwarden_namespace }}'
   labels:
     app.kubernetes.io/name: vaultwarden
+  annotations:
+    # Tell Stakater Reloader to roll this Deployment whenever any Secret
+    # or ConfigMap referenced via env / envFrom / volume changes. Pairs
+    # with the ExternalSecret resources in cluster/secrets.yml +
+    # service/vaultwarden.yml so 'bao kv put secret/vaultwarden/...'
+    # propagates end-to-end without manual rollouts.
+    reloader.stakater.com/auto: 'true'
 spec:
   replicas: 1
   selector:
@@ -132,7 +139,7 @@ spec:
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: vaultwarden-db-url
+                  name: vaultwarden-db-credentials
                   key: url
             - name: SSO_CLIENT_ID
               valueFrom:

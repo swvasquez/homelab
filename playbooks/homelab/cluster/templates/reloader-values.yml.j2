@@ -1,0 +1,41 @@
+{#
+  Helm values for Stakater Reloader.
+
+  Reloader watches Secrets and ConfigMaps cluster-wide and rolls any
+  Deployment / StatefulSet / DaemonSet annotated with
+  'reloader.stakater.com/auto: "true"' (or one of its targeted variants)
+  when the watched resource changes. The intended pairing in this
+  homelab is: ESO updates a K8s Secret from OpenBao on rotation, Reloader
+  notices, the consumer pod restarts, the new env value takes effect.
+
+  Variables:
+    nonroot_uid: Shared non-root UID for the reloader pod, matched against
+                 the cluster's nonroot identity convention. Read from
+                 group_vars.
+
+  No PVC is needed — Reloader is stateless. The pod runs under the
+  cluster's restricted PSA profile by default; the security context is
+  pinned here so an upstream chart change cannot silently regress.
+#}
+reloader:
+  watchGlobally: true
+  deployment:
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        memory: 128Mi
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: {{ nonroot_uid }}
+      runAsGroup: {{ nonroot_uid }}
+      fsGroup: {{ nonroot_uid }}
+      seccompProfile:
+        type: RuntimeDefault
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+          - ALL
+      readOnlyRootFilesystem: true

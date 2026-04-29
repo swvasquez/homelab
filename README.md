@@ -304,7 +304,10 @@ kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock
   plugin is required. The HTTPRoute and ForwardAuth Middleware are applied by the Jellyfin playbook
   itself.
 - **OpenBao secrets engine**: `cluster/secrets.yml` installs OpenBao (single-replica StatefulSet),
-  the External Secrets Operator, and a cluster-scoped `openbao` SecretStore. The five unseal keys
+  the External Secrets Operator, Stakater Reloader, and a cluster-scoped `openbao` SecretStore.
+  Reloader rolls any workload annotated with `reloader.stakater.com/auto: "true"` whenever an
+  ESO-materialized Secret changes, completing the OpenBao -> ESO -> K8s Secret -> running pod
+  rotation pipeline. The five unseal keys
   plus the initial root token are persisted to `homelab.keychain` on the Ansible host (see
   *Cluster master credentials* above) — nothing is written to `group_vars` or rendered Helm
   values. The keychain prompt fires only when OpenBao is sealed or `openbao_force_reconfigure=true`
