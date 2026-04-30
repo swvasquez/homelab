@@ -90,18 +90,19 @@ destroy-cluster subset="homelab":
         -e ansible_become_exe=sudo.ws \
         -B 1 -P 0
 
-# Print the OpenBao root token from the dedicated homelab macOS keychain (paste into the UI Token method)
-bao-token homelab_keychain="homelab.keychain":
-    @security find-generic-password -a root-token -s openbao -w "{{ homelab_keychain }}"
+# Print the OpenBao root token from the pass store (paste into the UI Token method)
+# Reads PASS_NAMESPACE from the environment; override with: just bao-token pass_namespace=<name>
+bao-token pass_namespace=env_var('PASS_NAMESPACE'):
+    @pass show {{ pass_namespace }}/openbao/root-token
 
 # Drop into a subshell with BAO_ADDR + BAO_SKIP_VERIFY + BAO_TOKEN set for ad-hoc bao CLI work
-bao-shell openbao_hostname="openbao.homelab.internal" homelab_keychain="homelab.keychain":
+# Reads PASS_NAMESPACE from the environment; override with: just bao-shell pass_namespace=<name>
+bao-shell openbao_hostname="openbao.homelab.internal" pass_namespace=env_var('PASS_NAMESPACE'):
     #!/usr/bin/env sh
     set -euo pipefail
-    security unlock-keychain "{{ homelab_keychain }}"
     export BAO_ADDR="https://{{ openbao_hostname }}"
     export BAO_SKIP_VERIFY=true
-    BAO_TOKEN="$(security find-generic-password -a root-token -s openbao -w "{{ homelab_keychain }}")"
+    BAO_TOKEN="$(pass show {{ pass_namespace }}/openbao/root-token)"
     export BAO_TOKEN
     exec "${SHELL:-sh}"
 

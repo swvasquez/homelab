@@ -18,15 +18,14 @@
 #     allow it to also schedule workloads (when `worker_node: true` is set on
 #     the control plane host in inventory).
 #   - Configures etcd encryption-at-rest for Kubernetes Secrets. On first
-#     install the play prompts for the homelab macOS keychain password
-#     (creating the keychain if it does not yet exist), generates a 32-byte
-#     AES key, stores it under the 'etcd-encryption-key' account in that
-#     keychain, then renders an EncryptionConfiguration file under
+#     install the play generates a 32-byte AES key, stores it in the pass
+#     store under '<pass_namespace>/kubernetes/etcd-encryption-key', then
+#     renders an EncryptionConfiguration file under
 #     /etc/kubernetes/encryption on the control plane and patches the
 #     kube-apiserver static pod manifest to consume it via
 #     --encryption-provider-config. After the apiserver picks the config
 #     up, every existing Secret is re-encrypted with a 'kubectl get | kubectl
-#     replace' pass so no cleartext copies survive in etcd. The keychain
+#     replace' pass so no cleartext copies survive in etcd. The pass store
 #     is the canonical home for the key (same store the OpenBao unseal
 #     keys + root token end up in via cluster/secrets.yml), and the
 #     control-plane file is regeneratable from it.
@@ -98,29 +97,11 @@
 #                            (default: 60).
 #   apiserver_health_delay:  Seconds between apiserver health polls
 #                            (default: 2).
-#   homelab_keychain:        Filename of the dedicated macOS keychain on
-#                            the Ansible host that stores the etcd
-#                            encryption-at-rest key (and, after
-#                            cluster/secrets.yml runs, the OpenBao unseal
-#                            keys + root token). Created on first install
-#                            here; reused by secrets.yml later. Read from
-#                            group_vars and derived from keychain_prefix.
-#   keychain_prefix:         Prefix for the dedicated macOS keychain
-#                            filename. Read from group_vars
-#                            ('<keychain_prefix>.keychain' is the full
-#                            filename).
-#   homelab_keychain_idle_lock_seconds:
-#                            Idle-timeout in seconds after which the
-#                            dedicated keychain re-locks automatically
-#                            (default: 7200, two hours).
-#   keychain_service:        'service' field on every keychain entry this
-#                            playbook reads or writes. Different from
-#                            secrets.yml's value ('openbao') so etcd-side
-#                            cluster keys live under their own subsystem
-#                            namespace (default: kubernetes).
-#   encryption_key_account:  'account' field on the keychain entry that
-#                            holds the AES-256 etcd encryption key
-#                            (default: etcd-encryption-key).
+#   pass_namespace:          Top-level folder in the pass store under which
+#                            all cluster credentials are stored. The etcd
+#                            key lives at
+#                            '<pass_namespace>/kubernetes/etcd-encryption-key'.
+#                            Read from group_vars.
 
 - name: Initialize Kubernetes control plane
   hosts: homelab
@@ -142,10 +123,6 @@
     apiserver_reload_wait_seconds: 30
     apiserver_health_retries: 60
     apiserver_health_delay: 2
-    homelab_keychain: '{{ keychain_prefix }}.keychain'
-    homelab_keychain_idle_lock_seconds: 7200
-    keychain_service: kubernetes
-    encryption_key_account: etcd-encryption-key
 
   tasks:
     # -------------------------------------------------------------------------
@@ -257,29 +234,23 @@
     # re-encryption pass at the end of this section rewrites them through
     # the apiserver.
     #
-    # The dedicated homelab macOS keychain on the Ansible host (the same
-    # one that holds the OpenBao unseal keys + root token, created here on
-    # first install if missing) is the canonical home for the AES key.
-    # cluster/secrets.yml later adds the unseal keys + root token to the
-    # same keychain, so a single backup of homelab.keychain-db restores
-    # every cluster master credential.
+    # The pass store on the Ansible host (which also holds the OpenBao
+    # unseal keys + root token after cluster/secrets.yml runs) is the
+    # canonical home for the AES key at 'kubernetes/etcd-encryption-key'.
     #
-    # On first install, this section prompts for the keychain password,
-    # creates the keychain if it does not exist, generates a 32-byte AES
-    # key from /dev/urandom and stores it under the 'etcd-encryption-key'
-    # account, then renders the EncryptionConfiguration file on the
-    # control plane with the key inlined. On every subsequent run this
-    # section is skipped entirely as long as the EncryptionConfiguration
-    # file exists on disk — no keychain prompt, no re-render, no apiserver
-    # restart. If the control-plane file is ever lost (e.g. node
-    # reprovisioned), re-running this playbook reads the existing key
-    # from the keychain and restores the file without rotating the
-    # ciphertext on disk.
+    # On first install, this section generates a 32-byte AES key from
+    # /dev/urandom, stores it in the pass store, then renders the
+    # EncryptionConfiguration file on the control plane with the key
+    # inlined. On every subsequent run this section is skipped entirely as
+    # long as the EncryptionConfiguration file exists on disk — no re-render,
+    # no apiserver restart. If the control-plane file is ever lost (e.g.
+    # node reprovisioned), re-running this playbook reads the existing key
+    # from the pass store and restores the file without rotating ciphertext.
     #
     # To rotate, edit the file on the control plane by hand: add a new
     # entry as the FIRST item under 'keys:', leave the old one as the
-    # second, then update the corresponding keychain entry by hand or via
-    # 'security add-generic-password -U' so the values stay in sync.
+    # second, then update the pass store entry ('pass edit
+    # kubernetes/etcd-encryption-key') so the values stay in sync.
     # Re-run the playbook to push the apiserver restart and the
     # re-encryption pass.
     #
@@ -318,59 +289,19 @@
       register: encryption_config_existing
       when: bootstrap_node | default(false)
 
-    - name: Prompt for homelab macOS keychain password (encryption key)
-      ansible.builtin.pause:
-        prompt: |
-          Enter the password for the homelab macOS keychain.
-          (Created on first run; same password used by cluster/secrets.yml.
-          Needed to read or generate the etcd encryption-at-rest key.)
-        echo: false
-      register: encryption_keychain_password_input
-      delegate_to: localhost
-      no_log: true
-      when:
-        - bootstrap_node | default(false)
-        - not encryption_config_existing.stat.exists
-
-    - name: Ensure homelab keychain holds etcd-encryption-key and emit it
+    - name: Ensure pass store holds etcd-encryption-key and emit it
       ansible.builtin.shell:
         cmd: |
           set -euo pipefail
 
-          KEYCHAIN='{{ homelab_keychain }}'
-          KEYCHAIN_FILE="$HOME/Library/Keychains/${KEYCHAIN}-db"
-          KEYCHAIN_PWD='{{ encryption_keychain_password_input.user_input }}'
-
-          if [ ! -f "$KEYCHAIN_FILE" ]; then
-            security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
-            security set-keychain-settings \
-              -lut {{ homelab_keychain_idle_lock_seconds }} "$KEYCHAIN"
-          else
-            # 'unlock-keychain' is a no-op on an already-unlocked keychain
-            # and skips password validation, so lock first to force the
-            # password through.
-            security lock-keychain "$KEYCHAIN"
-          fi
-          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
-          unset KEYCHAIN_PWD
-
-          if ! security find-generic-password \
-                 -a '{{ encryption_key_account }}' \
-                 -s '{{ keychain_service }}' \
-                 -w "$KEYCHAIN" >/dev/null 2>&1; then
+          if ! pass show '{{ pass_namespace }}/kubernetes/etcd-encryption-key' >/dev/null 2>&1; then
             KEY="$(head -c 32 /dev/urandom | base64)"
-            security add-generic-password -U \
-              -a '{{ encryption_key_account }}' \
-              -s '{{ keychain_service }}' \
-              -w "$KEY" \
-              "$KEYCHAIN"
+            printf '%s\n' "$KEY" | pass insert --echo --force '{{ pass_namespace }}/kubernetes/etcd-encryption-key' \
+              >/dev/null
             unset KEY
           fi
 
-          security find-generic-password \
-            -a '{{ encryption_key_account }}' \
-            -s '{{ keychain_service }}' \
-            -w "$KEYCHAIN"
+          pass show '{{ pass_namespace }}/kubernetes/etcd-encryption-key'
         executable: /bin/sh
       delegate_to: localhost
       become: false
@@ -381,7 +312,7 @@
         - bootstrap_node | default(false)
         - not encryption_config_existing.stat.exists
 
-    - name: Render encryption-config.yaml on control plane from keychain key
+    - name: Render encryption-config.yaml on control plane from pass store key
       ansible.builtin.template:
         src: encryption-config.yml.j2
         dest: '{{ encryption_config_path }}'

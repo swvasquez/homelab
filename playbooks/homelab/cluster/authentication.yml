@@ -80,22 +80,10 @@
 #                                the Ansible host. Used by 'bao kv put' to
 #                                write the bootstrap password
 #                                (default: openbao.<dns_zone>).
-#   homelab_keychain:            Filename of the dedicated macOS keychain
-#                                on the Ansible host that holds cluster
-#                                master credentials. Created by
-#                                cluster/bootstrap.yml on first install,
-#                                populated with OpenBao unseal keys +
-#                                root token by cluster/secrets.yml, and
-#                                read here for the root token used to
-#                                write to OpenBao. Read from group_vars
-#                                and derived from keychain_prefix.
-#   keychain_prefix:             Prefix for the dedicated macOS keychain
-#                                filename. Read from group_vars
-#                                ('<keychain_prefix>.keychain' is the
-#                                full filename).
-#   keychain_service:            'service' field used to look up the OpenBao
-#                                root token in the keychain (default:
-#                                openbao).
+#   pass_namespace:              Top-level folder in the pass store. The root
+#                                token is read from
+#                                '<pass_namespace>/openbao/root-token'. Read
+#                                from group_vars.
 #   authentik_db_name:           PostgreSQL database name for Authentik
 #                                (default: authentik).
 #   authentik_db_username:       PostgreSQL username for Authentik
@@ -121,9 +109,7 @@
     authentik_storage_class: longhorn
     authentik_bootstrap_secret_name: authentik-eso-bootstrap
     openbao_hostname: 'openbao.{{ dns_zone }}'
-    homelab_keychain: '{{ keychain_prefix }}.keychain'
     openbao_authentik_bootstrap_path: secret/authentik/bootstrap_password
-    keychain_service: openbao
     kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
 
   tasks:
@@ -395,7 +381,7 @@
     # Idempotency:
     #   The K8s Secret 'authentik-eso-bootstrap' is probed first. If it
     #   already exists, the entire OpenBao+ESO setup is skipped on this
-    #   run — no keychain prompt, no bao writes, no ExternalSecret
+    #   run — no pass store access, no bao writes, no ExternalSecret
     #   re-render. ESO continues syncing the value on its own
     #   refreshInterval. To rotate manually, run
     #   'just bao-shell; bao kv put secret/authentik/bootstrap_password
@@ -422,33 +408,12 @@
         authentik_bootstrap_secret_present: "{{ authentik_bootstrap_secret_probe.rc == 0 }}"
       when: bootstrap_node | default(false)
 
-    - name: Prompt for homelab macOS keychain password
-      ansible.builtin.pause:
-        prompt: |
-          Enter the password for the homelab macOS keychain.
-          (Needed to write the Authentik bootstrap password to OpenBao.)
-        echo: false
-      register: authentik_keychain_password_input
-      delegate_to: localhost
-      no_log: true
-      when:
-        - bootstrap_node | default(false)
-        - not authentik_bootstrap_secret_present | default(false)
-
     - name: Generate random Authentik bootstrap password and store in OpenBao
       ansible.builtin.shell:
         cmd: |
           set -euo pipefail
 
-          KEYCHAIN='{{ homelab_keychain }}'
-          KEYCHAIN_PWD='{{ authentik_keychain_password_input.user_input }}'
-
-          security lock-keychain "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
-          unset KEYCHAIN_PWD
-
-          BAO_TOKEN="$(security find-generic-password \
-            -a root-token -s '{{ keychain_service }}' -w "$KEYCHAIN")"
+          BAO_TOKEN="$(pass show '{{ pass_namespace }}/openbao/root-token')"
           export BAO_TOKEN
           export BAO_ADDR='https://{{ openbao_hostname }}'
           export BAO_SKIP_VERIFY=true

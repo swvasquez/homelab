@@ -136,13 +136,10 @@
 #                                 the Ansible host. Used by 'bao kv put' to
 #                                 seed credentials
 #                                 (default: openbao.<dns_zone>).
-#   homelab_keychain:             Filename of the dedicated macOS keychain
-#                                 holding cluster master credentials. Read
-#                                 from group_vars and derived from
-#                                 keychain_prefix.
-#   keychain_service:             'service' field used to look up the OpenBao
-#                                 root token in the keychain (default:
-#                                 openbao).
+#   pass_namespace:               Top-level folder in the pass store. The root
+#                                 token is read from
+#                                 '<pass_namespace>/openbao/root-token'. Read
+#                                 from group_vars.
 #   vaultwarden_admin_token_kv_path:
 #                                 OpenBao KV path holding the Vaultwarden
 #                                 admin token (default:
@@ -221,8 +218,6 @@
     gitea_gitops_repo: gitops
     argocd_namespace: argocd
     openbao_hostname: 'openbao.{{ dns_zone }}'
-    homelab_keychain: '{{ keychain_prefix }}.keychain'
-    keychain_service: openbao
     vaultwarden_admin_token_kv_path: secret/vaultwarden/admin_token
     vaultwarden_db_password_kv_path: secret/vaultwarden/db_password
     vaultwarden_oidc_client_id_kv_path: secret/vaultwarden/oidc_client_id
@@ -412,31 +407,12 @@
       no_log: true
       when: bootstrap_node | default(false)
 
-    - name: Prompt for homelab macOS keychain password
-      ansible.builtin.pause:
-        prompt: |
-          Enter the password for the homelab macOS keychain.
-          (Needed to seed Vaultwarden credentials in OpenBao.)
-        echo: false
-      register: vaultwarden_keychain_password_input
-      delegate_to: localhost
-      no_log: true
-      when: bootstrap_node | default(false)
-
     - name: Seed Vaultwarden credentials in OpenBao
       ansible.builtin.shell:
         cmd: |
           set -euo pipefail
 
-          KEYCHAIN='{{ homelab_keychain }}'
-          KEYCHAIN_PWD='{{ vaultwarden_keychain_password_input.user_input }}'
-
-          security lock-keychain "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
-          unset KEYCHAIN_PWD
-
-          BAO_TOKEN="$(security find-generic-password \
-            -a root-token -s '{{ keychain_service }}' -w "$KEYCHAIN")"
+          BAO_TOKEN="$(pass show '{{ pass_namespace }}/openbao/root-token')"
           export BAO_TOKEN
           export BAO_ADDR='https://{{ openbao_hostname }}'
           export BAO_SKIP_VERIFY=true
@@ -958,18 +934,7 @@
         cmd: |
           set -euo pipefail
 
-          KEYCHAIN='{{ homelab_keychain }}'
-          KEYCHAIN_PWD='{{ vaultwarden_keychain_password_input.user_input }}'
-
-          # The keychain may have re-locked since the earlier seed step
-          # (idle timeout very short, etc.). Lock-then-unlock so the
-          # password is validated and the keychain is open.
-          security lock-keychain "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
-          unset KEYCHAIN_PWD
-
-          BAO_TOKEN="$(security find-generic-password \
-            -a root-token -s '{{ keychain_service }}' -w "$KEYCHAIN")"
+          BAO_TOKEN="$(pass show '{{ pass_namespace }}/openbao/root-token')"
           export BAO_TOKEN
           export BAO_ADDR='https://{{ openbao_hostname }}'
           export BAO_SKIP_VERIFY=true
@@ -1078,15 +1043,7 @@
         cmd: |
           set -euo pipefail
 
-          KEYCHAIN='{{ homelab_keychain }}'
-          KEYCHAIN_PWD='{{ vaultwarden_keychain_password_input.user_input }}'
-
-          security lock-keychain "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
-          unset KEYCHAIN_PWD
-
-          BAO_TOKEN="$(security find-generic-password \
-            -a root-token -s '{{ keychain_service }}' -w "$KEYCHAIN")"
+          BAO_TOKEN="$(pass show '{{ pass_namespace }}/openbao/root-token')"
           export BAO_TOKEN
           export BAO_ADDR='https://{{ openbao_hostname }}'
           export BAO_SKIP_VERIFY=true

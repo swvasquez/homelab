@@ -8,26 +8,24 @@
 
   cluster/bootstrap.yml renders this file only when it does not already
   exist on the control plane, pulling the key value out of the
-  'etcd-encryption-key' entry in the dedicated homelab macOS keychain on
-  the Ansible host. The keychain is the canonical home for the key; the
-  control-plane file is a regeneratable cache. To rotate keys, edit this
-  file by hand on the control plane (and update the keychain entry to
-  match): add a new entry as the FIRST item under 'keys:' so it becomes
-  the new write key, leave the previous one as the second so existing
-  ciphertext can still be decrypted, then re-run cluster/bootstrap.yml.
-  The play will detect the content change via its SHA-256 annotation,
-  force a kubelet recreate of the apiserver pod, wait for /livez, and
-  re-encrypt every existing Secret with the new key. Once the
-  re-encryption pass completes, the old key can be removed from both
-  the file and the keychain.
+  'kubernetes/etcd-encryption-key' entry in the pass store on the Ansible
+  host. The pass store is the canonical home for the key; the control-plane
+  file is a regeneratable cache. To rotate keys, edit this file by hand on
+  the control plane (and update the pass entry to match): add a new entry
+  as the FIRST item under 'keys:' so it becomes the new write key, leave
+  the previous one as the second so existing ciphertext can still be
+  decrypted, then re-run cluster/bootstrap.yml. The play will detect the
+  content change via its SHA-256 annotation, force a kubelet recreate of
+  the apiserver pod, wait for /livez, and re-encrypt every existing Secret
+  with the new key. Once the re-encryption pass completes, the old key can
+  be removed from both the file and the pass store.
 
   Variables:
     encryption_key: 32-byte AES key, base64-encoded. Read out of the
-                    operator's homelab macOS keychain by bootstrap.yml
-                    (and generated there on first install). The rendered
-                    file and the keychain entry are the only two places
-                    this value lives — it never goes to git, group_vars,
-                    or Ansible logs.
+                    operator's pass store by bootstrap.yml (and generated
+                    there on first install). The rendered file and the pass
+                    entry are the only two places this value lives — it
+                    never goes to git, group_vars, or Ansible logs.
 #}
 apiVersion: apiserver.config.k8s.io/v1
 kind: EncryptionConfiguration
