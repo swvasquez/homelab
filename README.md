@@ -52,7 +52,13 @@ Ansible playbooks to configure Ubuntu x86_64 compute nodes, Arch Linux-based IP 
               private_ip: <IP>
     ```
 
-3.  Create a `group_vars/homelab.yml` file for group-level variables:
+3.  Create a `group_vars/all.yml` file for variables shared across all inventory groups:
+
+    ```yaml
+    pass_namespace: <PASS_NAMESPACE>
+    ```
+
+4.  Create a `group_vars/homelab.yml` file for homelab group variables:
 
     ```yaml
     ssh_users:
@@ -70,7 +76,6 @@ Ansible playbooks to configure Ubuntu x86_64 compute nodes, Arch Linux-based IP 
     router_private_ip: <ROUTER_IP>
     shutdown_schedule: <SHUTDOWN_SCHEDULE>
     admin_email: <ADMIN_EMAIL>
-    pass_namespace: <PASS_NAMESPACE>
     falco_sensitive_file_container_only: <true|false>
     ufw_allowed_ports:
       ssh:
@@ -147,6 +152,18 @@ Ansible playbooks to configure Ubuntu x86_64 compute nodes, Arch Linux-based IP 
       syncthing_discovery:
         port: <PORT>
         protocol: udp
+    ```
+
+5.  Create a `group_vars/ipkvm.yml` file for IP KVM group variables:
+
+    ```yaml
+    tailscale_packages:
+      - tailscale
+    tailscale_port: <TAILSCALE_PORT>
+    tailscale_subnet_routes: <SUBNET_ROUTES>
+    tailscale_advertise_exit_node: <true|false>
+    tailscale_ssh: <true|false>
+    tailscale_hostname: <TAILSCALE_HOSTNAME>
     ```
 
 ## Directory Structure

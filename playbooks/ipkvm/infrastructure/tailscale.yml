@@ -3,39 +3,78 @@
 # Playbook: Install and Configure Tailscale on IP KVM
 # ==============================================================================
 # Installs and configures the Tailscale mesh VPN client on Arch Linux-based
-# IP KVM devices (e.g., PiKVM).
+# IP KVM devices (e.g., PiKVM), advertising the host as a Tailscale exit node
+# and subnet router for remote LAN access.
 #
 # This playbook performs the following actions:
+#   - Reads the Tailscale auth key from the pass store on the Ansible control
+#     node.
 #   - Remounts the root filesystem as read-write (PiKVM is read-only by default).
 #   - Enables IP forwarding to allow the host to act as a subnet router or
 #     exit node.
 #   - Installs the Tailscale package from the official Arch Linux repository.
 #   - Enables and starts the tailscaled service.
-#   - Attempts to connect the machine to the Tailscale network using
-#     'tailscale up'.
+#   - Connects the host to the Tailscale network, advertising it as an exit node
+#     and advertising the specified subnet routes.
 #   - Remounts the root filesystem as read-only regardless of task outcome.
 #
-# Note: The 'tailscale up' command may require interactive browser-based
-# authentication. For a non-interactive setup, an auth key must be provided
-# as a command-line argument.
+# Before running, add the Tailscale auth key to the pass store:
+#   just tailscale-set-auth-key
 #
-# Variables:
-#   tailscale_packages:  List of packages to install for Tailscale
-#                        (default: [tailscale]).
-#   tailscale_port:      UDP port the tailscaled daemon binds for WireGuard peer
-#                        connections. Written to /etc/default/tailscaled as
-#                        FLAGS="--port=<value>".
+# After running this playbook, approve the advertised routes and exit node in
+# the Tailscale admin console under Machines → <hostname> → Edit route settings.
+#
+# Variables (set in group_vars/ipkvm.yml unless noted):
+#   tailscale_packages:            List of packages to install for Tailscale.
+#   tailscale_port:                UDP port the tailscaled daemon binds for WireGuard
+#                                  peer connections.
+#   tailscale_subnet_routes:       Subnet routes to advertise, as a comma-separated
+#                                  string. For 4via6 remote LAN access this is the
+#                                  IPv6 prefix that maps to your LAN subnet.
+#   tailscale_hostname:            Hostname to register in the Tailscale admin console.
+#   tailscale_advertise_exit_node: Whether to advertise this host as a Tailscale
+#                                  exit node.
+#   tailscale_ssh:                 Whether to enable Tailscale SSH on this host,
+#                                  allowing SSH access via the tailnet without a
+#                                  separate SSH key.
+#   pass_namespace:                Top-level folder in the pass store. The auth key
+#                                  is read from '<pass_namespace>/tailscale/auth-key'.
+#                                  Set in group_vars/all.yml.
 
 - name: Install and configure Tailscale on IP KVM
   hosts: ipkvm
   become: true
   become_exe: sudo
   vars:
-    tailscale_packages:
-      - tailscale
-    tailscale_port: '0'
+    tailscale_up_args: >-
+      --reset
+      --accept-dns=false
+      --hostname={{ tailscale_hostname }}
+      {{ '--advertise-exit-node' if tailscale_advertise_exit_node else '' }}
+      --advertise-routes={{ tailscale_subnet_routes }}
+      {{ '--ssh' if tailscale_ssh else '' }}
+      --authkey={{ tailscale_auth_key }}
 
   tasks:
+    # -------------------------------------------------------------------------
+    # Auth Key
+    # Reads the Tailscale auth key from the pass store on the Ansible control
+    # node so it can be passed non-interactively to 'tailscale up'.
+    # -------------------------------------------------------------------------
+    - name: Read Tailscale auth key from pass store
+      ansible.builtin.command:
+        cmd: pass show '{{ pass_namespace }}/tailscale/auth-key'
+      delegate_to: localhost
+      become: false
+      register: tailscale_auth_key_result
+      changed_when: false
+      no_log: true
+
+    - name: Set Tailscale auth key fact
+      ansible.builtin.set_fact:
+        tailscale_auth_key: '{{ tailscale_auth_key_result.stdout | trim }}'
+      no_log: true
+
     # -------------------------------------------------------------------------
     # Filesystem
     # PiKVM mounts the root filesystem read-only by default. All write
@@ -72,13 +111,14 @@
         - name: Install Tailscale package
           community.general.pacman:
             name: '{{ tailscale_packages }}'
-            state: present
+            state: latest
             update_cache: true
 
         # -----------------------------------------------------------------------
         # Service Configuration and Network Connection
         # Configures the tailscaled daemon port, enables the service, and
-        # connects the host to the Tailscale network.
+        # connects the host to the Tailscale network as an exit node and
+        # subnet router.
         # -----------------------------------------------------------------------
         - name: Set Tailscale WireGuard listen port in daemon configuration
           ansible.builtin.lineinfile:
@@ -97,8 +137,44 @@
 
         - name: Connect to Tailscale network
           ansible.builtin.command:
-            cmd: tailscale up
+            cmd: 'tailscale up {{ tailscale_up_args }}'
           changed_when: false
+          no_log: true
+
+        - name: Check Tailscale approval status
+          ansible.builtin.command:
+            cmd: tailscale status --json
+          register: tailscale_status_raw
+          changed_when: false
+
+        - name: Determine if Tailscale routes or exit node require approval
+          ansible.builtin.set_fact:
+            tailscale_needs_approval: >-
+              {{ not (tailscale_status_raw.stdout | from_json).Self.ExitNodeOption | default(false)
+                 or tailscale_subnet_routes not in
+                 ((tailscale_status_raw.stdout | from_json).Self.AllowedIPs | default([])) }}
+
+        - name: Prompt to approve routes and exit node in Tailscale admin console
+          ansible.builtin.pause:
+            prompt: |
+              Approve the subnet route and exit node for {{ tailscale_hostname }} in the Tailscale admin console:
+                https://login.tailscale.com/admin/machines
+              Navigate to {{ tailscale_hostname }} → Edit route settings, approve '{{ tailscale_subnet_routes }}'
+              and 'Use as exit node', then press Enter to continue.
+          when: tailscale_needs_approval
+
+        - name: Wait for user to approve Tailscale routes and exit node in admin console
+          ansible.builtin.command:
+            cmd: tailscale status --json
+          register: tailscale_status_wait
+          changed_when: false
+          until: >-
+            (tailscale_status_wait.stdout | from_json).Self.ExitNodeOption | default(false)
+            and tailscale_subnet_routes in
+            ((tailscale_status_wait.stdout | from_json).Self.AllowedIPs | default([]))
+          retries: 30
+          delay: 10
+          when: tailscale_needs_approval
 
         - name: Flush handlers before remounting read-only
           ansible.builtin.meta: flush_handlers
@@ -108,6 +184,7 @@
           ansible.builtin.command: # noqa: command-instead-of-module
             cmd: mount -o remount,ro /
           changed_when: false
+          failed_when: false
 
   handlers:
     - name: Restart tailscaled
