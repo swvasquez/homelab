@@ -10,7 +10,8 @@
 #   - Validates that exactly one bootstrap node is defined in inventory.
 #   - Initializes the control plane node using kubeadm init (idempotent via
 #     a cluster-ready check).
-#   - Configures kubectl access for the ansible user on the control plane.
+#   - Configures kubectl access for the ansible user on every cluster node
+#     by distributing the admin kubeconfig from the bootstrap node.
 #   - Optionally fetches the kubeconfig to the machine running the playbook.
 #   - Retrieves the kubeadm join command from the control plane.
 #   - Joins all worker nodes to the cluster using the retrieved join command.
@@ -97,6 +98,16 @@
 #                            (default: 60).
 #   apiserver_health_delay:  Seconds between apiserver health polls
 #                            (default: 2).
+#   apiserver_cert_path:     Full path to the kube-apiserver serving
+#                            certificate on the control plane node
+#                            (default: /etc/kubernetes/pki/apiserver.crt).
+#   apiserver_key_path:      Full path to the kube-apiserver serving
+#                            certificate private key on the control plane
+#                            node (default: /etc/kubernetes/pki/apiserver.key).
+#   kubernetes_api_hostname: DNS hostname registered as a Subject Alternative
+#                            Name on the kube-apiserver serving certificate.
+#                            Derived from dns_zone (default: k8s.<dns_zone>).
+#   dns_zone:                DNS zone served by Bind9. Read from group_vars.
 #   pass_namespace:          Top-level folder in the pass store under which
 #                            all cluster credentials are stored. The etcd
 #                            key lives at
@@ -114,7 +125,7 @@
     kubectl_config_dir: "/home/{{ ansible_user }}/.kube"
     kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
     fetch_kubeconfig: true
-    local_kubeconfig_path: ~/.kube/config
+    local_kubeconfig_path: "{{ lookup('env', 'HOME') }}/.kube/config"
     encryption_config_dir: /etc/kubernetes/encryption
     encryption_config_path: /etc/kubernetes/encryption/encryption-config.yaml
     apiserver_manifest_path: /etc/kubernetes/manifests/kube-apiserver.yaml
@@ -123,6 +134,15 @@
     apiserver_reload_wait_seconds: 30
     apiserver_health_retries: 60
     apiserver_health_delay: 2
+    apiserver_cert_path: /etc/kubernetes/pki/apiserver.crt
+    apiserver_key_path: /etc/kubernetes/pki/apiserver.key
+    kubernetes_api_hostname: 'k8s.{{ dns_zone }}'
+    bootstrap_control_plane: >-
+      {{ groups['homelab']
+         | map('extract', hostvars)
+         | selectattr('bootstrap_node', 'equalto', true)
+         | map(attribute='inventory_hostname')
+         | first }}
 
   tasks:
     # -------------------------------------------------------------------------
@@ -183,11 +203,17 @@
 
     # -------------------------------------------------------------------------
     # kubectl Configuration
-    # Copies the cluster admin kubeconfig to the ansible user's home directory
-    # to enable kubectl access on the control plane. Optionally fetches the
-    # kubeconfig to the local machine running the playbook when
-    # `fetch_kubeconfig` is true. Also retrieves the kubeadm join command for
-    # use by worker nodes in the next play.
+    # Distributes the cluster admin kubeconfig to the ansible user's home
+    # directory on every cluster node so kubectl works uniformly across the
+    # fleet. The file is read once from /etc/kubernetes/admin.conf on the
+    # bootstrap node (the only node where kubeadm init places it) and then
+    # written to each host. Optionally fetches the kubeconfig to the local
+    # machine running the playbook when `fetch_kubeconfig` is true. Also
+    # retrieves the kubeadm join command for use by worker nodes in the next
+    # play. The distributed kubeconfig keeps the API server URL as the
+    # control plane IP so that kubectl on a node works without depending on
+    # in-cluster DNS or Bind9 reachability; the local kubeconfig is rewritten
+    # separately by network.yml to use the API hostname.
     # -------------------------------------------------------------------------
     - name: Ensure kubectl config directory exists for ansible user
       ansible.builtin.file:
@@ -196,17 +222,23 @@
         owner: "{{ ansible_user }}"
         group: "{{ ansible_user }}"
         mode: "0700"
-      when: bootstrap_node | default(false)
 
-    - name: Copy admin kubeconfig to ansible user home directory
-      ansible.builtin.copy:
+    - name: Read admin kubeconfig from the bootstrap control plane node
+      ansible.builtin.slurp:
         src: /etc/kubernetes/admin.conf
+      register: admin_kubeconfig_slurp
+      delegate_to: '{{ bootstrap_control_plane }}'
+      run_once: true # noqa: run-once[task]
+      no_log: true
+
+    - name: Install admin kubeconfig for ansible user on every cluster node
+      ansible.builtin.copy:
+        content: '{{ admin_kubeconfig_slurp.content | b64decode }}'
         dest: "{{ kubectl_config_path }}"
         owner: "{{ ansible_user }}"
         group: "{{ ansible_user }}"
         mode: "0600"
-        remote_src: true
-      when: bootstrap_node | default(false)
+      no_log: true
 
     - name: Copy kubeconfig to local machine
       ansible.builtin.fetch:
@@ -435,6 +467,102 @@
         - bootstrap_node | default(false)
         - (encryption_config_create.changed | default(false))
             or (encryption_apiserver_manifest_promote.changed | default(false))
+
+    # -------------------------------------------------------------------------
+    # API Server Certificate SANs
+    # Ensures the kube-apiserver serving certificate carries the cluster's
+    # DNS hostname (kubernetes_api_hostname) as a Subject Alternative Name so
+    # kubectl clients can address the API by name in addition to the node IP
+    # and pass TLS verification. On a fresh cluster the hostname is included
+    # via the kubeadm InitConfiguration and no extra work is needed. On an
+    # existing cluster whose certificate predates this change, the kubeadm
+    # ClusterConfiguration is uploaded to the cluster, the apiserver cert and
+    # key are removed, kubeadm regenerates them with the new SAN list, and
+    # the static pod is recreated so the apiserver loads the new cert. The
+    # block is fully idempotent — it short-circuits when the cert already
+    # contains kubernetes_api_hostname.
+    # -------------------------------------------------------------------------
+    - name: Read existing kube-apiserver certificate SANs
+      ansible.builtin.command:
+        cmd: openssl x509 -in {{ apiserver_cert_path }} -noout -ext subjectAltName
+      register: apiserver_cert_sans
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set apiserver cert SAN regeneration requirement
+      ansible.builtin.set_fact:
+        apiserver_cert_san_regen_needed: >-
+          {{ (apiserver_cert_sans.rc | default(1)) == 0
+             and kubernetes_api_hostname not in (apiserver_cert_sans.stdout | default('')) }}
+      when: bootstrap_node | default(false)
+
+    - name: Render kubeadm config for cert SAN regeneration
+      ansible.builtin.template:
+        src: kubeadm-init.yml.j2
+        dest: /tmp/kubeadm-init.yml
+        mode: '0600'
+      when:
+        - bootstrap_node | default(false)
+        - apiserver_cert_san_regen_needed | default(false)
+
+    - name: Upload kubeadm ClusterConfiguration to the cluster
+      ansible.builtin.command:
+        cmd: kubeadm init phase upload-config kubeadm --config /tmp/kubeadm-init.yml
+      when:
+        - bootstrap_node | default(false)
+        - apiserver_cert_san_regen_needed | default(false)
+      changed_when: true
+
+    - name: Remove existing kube-apiserver certificate to force regeneration
+      ansible.builtin.file:
+        path: '{{ item }}'
+        state: absent
+      loop:
+        - '{{ apiserver_cert_path }}'
+        - '{{ apiserver_key_path }}'
+      when:
+        - bootstrap_node | default(false)
+        - apiserver_cert_san_regen_needed | default(false)
+
+    - name: Regenerate kube-apiserver certificate with updated SAN list
+      ansible.builtin.command:
+        cmd: kubeadm init phase certs apiserver --config /tmp/kubeadm-init.yml
+      when:
+        - bootstrap_node | default(false)
+        - apiserver_cert_san_regen_needed | default(false)
+      changed_when: true
+
+    - name: Clean up rendered kubeadm config used for cert regeneration
+      ansible.builtin.file:
+        path: /tmp/kubeadm-init.yml
+        state: absent
+      when:
+        - bootstrap_node | default(false)
+        - apiserver_cert_san_regen_needed | default(false)
+
+    - name: Restart kube-apiserver static pod to load regenerated certificate
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          delete pods -n kube-system -l component=kube-apiserver
+      when:
+        - bootstrap_node | default(false)
+        - apiserver_cert_san_regen_needed | default(false)
+      changed_when: true
+
+    - name: Wait for kube-apiserver /livez to report healthy after SAN cert regen
+      ansible.builtin.uri:
+        url: '{{ apiserver_health_url }}'
+        validate_certs: false
+        status_code: 200
+      register: apiserver_san_livez
+      until: apiserver_san_livez.status == 200
+      retries: '{{ apiserver_health_retries }}'
+      delay: '{{ apiserver_health_delay }}'
+      when:
+        - bootstrap_node | default(false)
+        - apiserver_cert_san_regen_needed | default(false)
 
     # -------------------------------------------------------------------------
     # Control Plane Taint Removal (Optional)

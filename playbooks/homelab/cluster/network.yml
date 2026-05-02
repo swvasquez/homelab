@@ -102,6 +102,19 @@
 #                            without relying on ClusterIP routing. Read from
 #                            inventory host vars (private_ip on the bootstrap
 #                            node).
+#   kubernetes_api_hostname: DNS hostname clients use to address the cluster's
+#                            kube-apiserver. Registered as an A record in
+#                            Bind9 pointing at control_plane_ip and used to
+#                            rewrite the local kubeconfig server entry so
+#                            kubectl resolves the API by name. Derived from
+#                            dns_zone (default: k8s.<dns_zone>).
+#   cluster_name:            Name of the Kubernetes cluster, used as the
+#                            cluster identifier in the local kubeconfig
+#                            when rewriting the API server URL
+#                            (default: homelab-0).
+#   local_kubeconfig_path:   Destination path for the kubeconfig on the local
+#                            machine. Rewritten in place to point at
+#                            kubernetes_api_hostname (default: ~/.kube/config).
 
 - name: Install cluster networking and DNS
   hosts: homelab
@@ -136,6 +149,9 @@
     externaldns_chart_version: 1.19.0
     upstream_dns: 8.8.8.8 1.1.1.1
     authentik_namespace: authentik
+    kubernetes_api_hostname: 'k8s.{{ dns_zone }}'
+    cluster_name: homelab-0
+    local_kubeconfig_path: "{{ lookup('env', 'HOME') }}/.kube/config"
 
   tasks:
     # -------------------------------------------------------------------------
@@ -742,6 +758,65 @@
       delay: 5
       when: bootstrap_node | default(false)
       changed_when: false
+
+    # -------------------------------------------------------------------------
+    # Kubernetes API DNS Record
+    # Writes an A record for the cluster's API hostname into Bind9 so kubectl
+    # can resolve kubernetes_api_hostname to the control plane IP. The record
+    # is added via nsupdate executed inside the Bind9 pod (the bind9 image
+    # ships nsupdate, avoiding a tooling dependency on the control plane
+    # node) and authenticated with the same TSIG key ExternalDNS uses for
+    # RFC 2136 updates. ExternalDNS leaves manually-managed records alone
+    # because they lack its TXT-registry ownership marker. The record is
+    # static rather than ExternalDNS-managed because the API server is not
+    # exposed via a Gateway API HTTPRoute. The local kubeconfig fetched by
+    # bootstrap.yml is then rewritten to address the API server by hostname,
+    # matching the SAN added to the apiserver serving certificate.
+    # -------------------------------------------------------------------------
+    - name: Add A record for Kubernetes API hostname via nsupdate
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          kubectl --kubeconfig={{ kubectl_config_path }} \
+            exec -n {{ bind9_namespace }} deploy/bind9 -i -- nsupdate <<EOF
+          server 127.0.0.1
+          key hmac-sha256:externaldns-key {{ bind9_tsig_secret }}
+          zone {{ dns_zone }}.
+          update delete {{ kubernetes_api_hostname }}. A
+          update add {{ kubernetes_api_hostname }}. 60 A {{ control_plane_ip }}
+          send
+          EOF
+      when: bootstrap_node | default(false)
+      changed_when: true
+      no_log: true
+
+    - name: Read current server URL from local kubeconfig
+      ansible.builtin.command:
+        cmd: >-
+          kubectl config view --raw
+          --kubeconfig={{ local_kubeconfig_path }}
+          -o jsonpath={.clusters[?(@.name=="{{ cluster_name }}")].cluster.server}
+      register: local_kubeconfig_server
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Update local kubeconfig server to address API by hostname
+      ansible.builtin.command:
+        cmd: >-
+          kubectl config set-cluster {{ cluster_name }}
+          --server=https://{{ kubernetes_api_hostname }}:{{ ufw_allowed_ports.kubernetes_api.port }}
+          --kubeconfig={{ local_kubeconfig_path }}
+      delegate_to: localhost
+      become: false
+      when:
+        - bootstrap_node | default(false)
+        - local_kubeconfig_server.stdout | default('') !=
+            'https://' + kubernetes_api_hostname + ':' +
+            (ufw_allowed_ports.kubernetes_api.port | string)
+      changed_when: true
 
     # -------------------------------------------------------------------------
     # ExternalDNS

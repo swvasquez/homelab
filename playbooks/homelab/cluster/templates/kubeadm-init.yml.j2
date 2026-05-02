@@ -4,9 +4,12 @@
   and passed to `kubeadm init --config`.
 
   Variables:
-    kubeadm_cri_socket: CRI socket path (e.g. unix:///var/run/cri-dockerd.sock).
-    cluster_name:       Name of the Kubernetes cluster (e.g. homelab-0).
-    pod_network_cidr:   CIDR range for pod networking (e.g. 10.244.0.0/16).
+    kubeadm_cri_socket:      CRI socket path (e.g. unix:///var/run/cri-dockerd.sock).
+    cluster_name:            Name of the Kubernetes cluster (e.g. homelab-0).
+    pod_network_cidr:        CIDR range for pod networking (e.g. 10.244.0.0/16).
+    kubernetes_api_hostname: DNS hostname registered as a Subject Alternative Name
+                             on the kube-apiserver serving certificate so kubectl
+                             can address the API by name in addition to node IP.
 #}
 apiVersion: kubeadm.k8s.io/v1beta4
 kind: InitConfiguration
@@ -18,3 +21,6 @@ kind: ClusterConfiguration
 clusterName: '{{ cluster_name }}'
 networking:
   podSubnet: '{{ pod_network_cidr }}'
+apiServer:
+  certSANs:
+    - '{{ kubernetes_api_hostname }}'
