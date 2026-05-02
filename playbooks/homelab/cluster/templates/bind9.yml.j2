@@ -14,10 +14,12 @@
     bind9_pvc_size:    Size of the PersistentVolumeClaim for zone data (e.g. 128Mi).
     bind9_tsig_secret: TSIG shared secret for RFC 2136 dynamic updates. Auto-generated
                        on first run and stored in the bind9-tsig Kubernetes Secret.
+    bind9_lb_ip:       Fixed LoadBalancer IP for the Bind9 Service. Pinned so every
+                       client (cluster nodes, IP KVM, laptops) can hardcode the same
+                       address. Read from group_vars.
     bind9_dns_port:    Port Bind9 listens on for DNS queries (TCP and UDP).
                        Derived from ufw_allowed_ports.bind9_dns_tcp.port in group_vars.
-    dns_zone:          DNS zone served by Bind9 (e.g. homelab.internal).
-                       Read from group_vars.
+    dns_zone:          DNS zone served by Bind9. Read from group_vars.
 #}
 apiVersion: v1
 kind: ConfigMap
@@ -146,6 +148,7 @@ metadata:
   namespace: '{{ bind9_namespace }}'
 spec:
   type: LoadBalancer
+  loadBalancerIP: '{{ bind9_lb_ip }}'
   selector:
     app: bind9
   ports:

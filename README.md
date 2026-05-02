@@ -349,11 +349,19 @@ kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock
 - **Local DNS Resolution**: To resolve homelab services (e.g., `*.homelab.internal`) from your
   local machine, configure your OS to use the cluster's Bind9 LoadBalancer IP as its nameserver.
   Note that Syncthing sync traffic uses a **dedicated LoadBalancer IP** (separate from the web GUI)
-  to ensure high-performance data transfer.
+  to ensure high-performance data transfer. Cluster nodes are configured automatically by
+  `cluster/network.yml`; the snippets below are for additional client machines.
   - **macOS Setup**:
     ```sh
     sudo mkdir -p /etc/resolver
     echo "nameserver <BIND9_LB_IP>" | sudo tee /etc/resolver/<DNS_ZONE>
+    ```
+  - **Linux Setup (systemd-resolved)**:
+    ```sh
+    sudo mkdir -p /etc/systemd/resolved.conf.d
+    printf '[Resolve]\nDNS=<BIND9_LB_IP>\nDomains=~<DNS_ZONE>\n' \
+      | sudo tee /etc/systemd/resolved.conf.d/<DNS_ZONE>.conf
+    sudo systemctl restart systemd-resolved
     ```
 - **Flushing the local DNS cache**: If a service is unreachable or resolves to a stale IP after a
   cluster change, flush the local DNS cache. Common triggers include deploying a new service,

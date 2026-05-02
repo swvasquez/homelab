@@ -6,9 +6,10 @@
   never deleted automatically.
 
   Variables:
-    bind9_service_ip:  External IP of the Bind9 LoadBalancer service. Resolved at
-                       runtime after Bind9 is deployed.
-    dns_zone:          DNS zone to manage (e.g. homelab.internal). Read from group_vars.
+    bind9_service_ip:  External IP of the Bind9 LoadBalancer service. Pinned to
+                       bind9_lb_ip in bind9.yml.j2's Service spec, so this value
+                       is read from group_vars rather than fetched at runtime.
+    dns_zone:          DNS zone to manage. Read from group_vars.
     bind9_tsig_secret: TSIG shared secret matching the key in Bind9's named.conf.
                        Read from the bind9-tsig Kubernetes Secret at runtime.
 #}

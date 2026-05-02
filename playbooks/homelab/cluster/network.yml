@@ -32,6 +32,8 @@
 #   - Patches CoreDNS to forward homelab zone queries to Bind9's ClusterIP so
 #     that pods can resolve homelab hostnames without relying on the Bind9
 #     LoadBalancer IP, which is unreachable from inside pods via Cilium.
+#   - Configures systemd-resolved on every cluster node with a split-DNS
+#     drop-in so node-level queries for the homelab zone resolve via Bind9.
 #   - Installs the Cilium CLI on all nodes for inspecting and troubleshooting.
 #
 # Node roles are determined by host variables in inventory.yml:
@@ -71,6 +73,10 @@
 #   hubble_hostname:         Fully qualified hostname for the Hubble UI,
 #                            derived from dns_zone
 #                            (default: hubble.<dns_zone>).
+#   bind9_lb_ip:             Fixed LoadBalancer IP assigned to the Bind9 Service
+#                            so every consumer (cluster nodes, IP KVM, laptops,
+#                            ExternalDNS) can hardcode the same address. Read
+#                            from group_vars.
 #   bind9_image:             Container image for the Bind9 DNS server
 #                            (default: internetsystemsconsortium/bind9:9.20).
 #   bind9_namespace:         Kubernetes namespace for Bind9 and ExternalDNS
@@ -672,15 +678,10 @@
     # To find the Bind9 LAN IP after deployment, run:
     #   kubectl get svc -n kube-system bind9
     #
-    # To route DNS queries for the zone to Bind9 on client machines:
-    #   macOS:
-    #     sudo mkdir -p /etc/resolver
-    #     echo 'nameserver <BIND9_IP>' | sudo tee /etc/resolver/<dns_zone>
-    #   Linux (systemd-resolved):
-    #     sudo mkdir -p /etc/systemd/resolved.conf.d
-    #     printf '[Resolve]\nDNS=<BIND9_IP>\nDomains=~<dns_zone>\n' \
-    #       | sudo tee /etc/systemd/resolved.conf.d/<dns_zone>.conf
-    #     sudo systemctl restart systemd-resolved
+    # Cluster nodes are configured to resolve the homelab zone via Bind9
+    # later in this playbook. For setting up additional client machines
+    # (laptops, workstations), see the Local DNS Resolution section in
+    # README.md.
     # -------------------------------------------------------------------------
     - name: Check if Bind9 TSIG secret already exists
       ansible.builtin.command:
@@ -746,14 +747,14 @@
         state: absent
       when: bootstrap_node | default(false)
 
-    - name: Wait for Bind9 LoadBalancer IP to be assigned
+    - name: Wait for Bind9 Service to be assigned its pinned LoadBalancer IP
       ansible.builtin.command:
         cmd: >-
           kubectl --kubeconfig={{ kubectl_config_path }}
           get service bind9 -n {{ bind9_namespace }}
           -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
       register: bind9_service_ip_result
-      until: bind9_service_ip_result.stdout != ""
+      until: bind9_service_ip_result.stdout == bind9_lb_ip
       retries: 20
       delay: 5
       when: bootstrap_node | default(false)
@@ -819,6 +820,37 @@
       changed_when: true
 
     # -------------------------------------------------------------------------
+    # Node DNS Resolver
+    # Configures systemd-resolved on every cluster node so queries for the
+    # homelab DNS zone are sent to Bind9 while all other DNS queries remain
+    # on the node's existing upstream resolvers. The drop-in uses the
+    # split-DNS routing-domain syntax (Domains=~<zone>), so a Bind9 outage
+    # only affects homelab zone resolution and never strands the node's
+    # general DNS. The Bind9 LoadBalancer IP is read from group_vars and
+    # is guaranteed to match the live Service IP because bind9.yml.j2 pins
+    # the Service's loadBalancerIP to the same value.
+    # -------------------------------------------------------------------------
+    - name: Ensure systemd-resolved drop-in directory exists
+      ansible.builtin.file:
+        path: /etc/systemd/resolved.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Configure systemd-resolved to forward homelab zone to Bind9
+      ansible.builtin.copy:
+        content: |
+          [Resolve]
+          DNS={{ bind9_lb_ip }}
+          Domains=~{{ dns_zone }}
+        dest: '/etc/systemd/resolved.conf.d/{{ dns_zone }}.conf'
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart systemd-resolved
+
+    # -------------------------------------------------------------------------
     # ExternalDNS
     # Deploys ExternalDNS via the kubernetes-sigs Helm chart to automatically
     # sync DNS records from Gateway API HTTPRoute resources into Bind9 using
@@ -844,7 +876,7 @@
         dest: /tmp/externaldns-values.yml
         mode: "0644"
       vars:
-        bind9_service_ip: '{{ bind9_service_ip_result.stdout }}'
+        bind9_service_ip: '{{ bind9_lb_ip }}'
       when: bootstrap_node | default(false)
 
     - name: Install or upgrade ExternalDNS via Helm
@@ -990,3 +1022,9 @@
       ansible.builtin.file:
         path: /tmp/cilium-cli.tar.gz
         state: absent
+
+  handlers:
+    - name: Restart systemd-resolved
+      ansible.builtin.service:
+        name: systemd-resolved
+        state: restarted
