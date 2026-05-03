@@ -3,63 +3,109 @@
 # Playbook: Install and Configure Tailscale on IP KVM
 # ==============================================================================
 # Installs and configures the Tailscale mesh VPN client on Arch Linux-based
-# IP KVM devices (e.g., PiKVM), advertising the host as a Tailscale exit node
-# and subnet router for remote LAN access.
+# IP KVM devices (e.g., PiKVM). When tailscale_exit_node is true the host is
+# advertised as a Tailscale exit node so a tailnet member that selects it
+# routes all traffic through the IP KVM and out the home WAN; LAN services
+# are reached by IP via the same tunnel. When false the host is a plain
+# tailnet member (still useful for Tailscale SSH-based access).
+#
+# Exit-node operation is the only routing mode this playbook supports.
+# Subnet routing and 4via6 advertising were considered and rejected: they
+# add DNS-record bookkeeping (AAAA seeding, stale-record cleanup) that has
+# to stay in sync with mode changes, and a drift while remote turns into
+# "kubectl falls back to a stale A record and times out." Sticking to a
+# single optional mode keeps remote recovery limited to one client toggle.
 #
 # This playbook performs the following actions:
-#   - Reads the Tailscale auth key from the pass store on the Ansible control
-#     node.
+#   - Reads the Tailscale auth and API keys from the pass store on the
+#     Ansible control node.
 #   - Remounts the root filesystem as read-write (PiKVM is read-only by default).
-#   - Enables IP forwarding to allow the host to act as a subnet router or
-#     exit node.
+#   - Enables IP forwarding so the host can route exit-node traffic.
 #   - Installs the Tailscale package from the official Arch Linux repository.
 #   - Enables and starts the tailscaled service.
-#   - Connects the host to the Tailscale network, advertising it as an exit node
-#     and advertising the specified subnet routes.
+#   - Connects the host to the Tailscale network, advertising it as an exit
+#     node when tailscale_exit_node is true.
+#   - Configures Tailscale Split DNS via the REST API to point the homelab
+#     zone at Bind9 and pushes Cloudflare as the global resolvers (with
+#     useWithExitNode set to work around the macOS exit-node DNS bug).
+#   - Pushes the tailnet ACL via the REST API so that only nodes carrying
+#     the homelab-client tag can route through the homelab-exit-tagged exit
+#     node, and so the exit node is auto-approved on tag.
 #   - Remounts the root filesystem as read-only regardless of task outcome.
 #
-# Before running, add the Tailscale auth key to the pass store:
-#   just tailscale-set-auth-key
+# Before running, store the Tailscale auth and API keys in pass:
+#   just tailscale-set-keys
 #
-# After running this playbook, approve the advertised routes and exit node in
-# the Tailscale admin console under Machines → <hostname> → Edit route settings.
+# After running this playbook, approve the exit node in the Tailscale admin
+# console under Machines → <hostname> → Edit route settings.
 #
 # Variables (set in group_vars/ipkvm.yml unless noted):
-#   tailscale_packages:            List of packages to install for Tailscale.
-#   tailscale_port:                UDP port the tailscaled daemon binds for WireGuard
-#                                  peer connections.
-#   tailscale_subnet_routes:       Subnet routes to advertise, as a comma-separated
-#                                  string. For 4via6 remote LAN access this is the
-#                                  IPv6 prefix that maps to your LAN subnet.
-#   tailscale_hostname:            Hostname to register in the Tailscale admin console.
-#   tailscale_advertise_exit_node: Whether to advertise this host as a Tailscale
-#                                  exit node.
-#   tailscale_ssh:                 Whether to enable Tailscale SSH on this host,
-#                                  allowing SSH access via the tailnet without a
-#                                  separate SSH key.
-#   pass_namespace:                Top-level folder in the pass store. The auth key
-#                                  is read from '<pass_namespace>/tailscale/auth-key'.
-#                                  Set in group_vars/all.yml.
+#   tailscale_port:      UDP port the tailscaled daemon binds for WireGuard
+#                        peer connections.
+#   tailscale_hostname:  Hostname to register in the Tailscale admin console.
+#   tailscale_exit_node: Whether to advertise this host as a Tailscale exit
+#                        node. When false, the host is a plain tailnet member
+#                        (still reachable for SSH if tailscale_ssh is true).
+#   tailscale_key_expiry_disabled:
+#                        Whether to disable node-key expiry on this host via
+#                        the Tailscale API. When true (recommended for an
+#                        unattended exit node) the node never auto-expires
+#                        and lock-outs while remote are avoided. When false
+#                        the tailnet's default expiry policy applies.
+#   tailscale_ssh:       Whether to enable Tailscale SSH on this host,
+#                        allowing SSH access via the tailnet without a
+#                        separate SSH key.
+#   pass_namespace:     Top-level folder in the pass store. The auth and
+#                       API keys are read from
+#                       '<pass_namespace>/tailscale/auth-key' and
+#                       '<pass_namespace>/tailscale/api-key'. Set in
+#                       group_vars/all.yml.
+#   tailscale_tailnet:  Tailnet name targeted by the API. Use '-' for the
+#                       default tailnet. Set in group_vars/all.yml.
+#   bind9_lb_ip:        Bind9 LoadBalancer IP, registered as the Split DNS
+#                       nameserver for the homelab zone. Set in
+#                       group_vars/all.yml.
+#   dns_zone:           DNS zone served by Bind9. Set in group_vars/all.yml.
 
 - name: Install and configure Tailscale on IP KVM
   hosts: ipkvm
   become: true
   become_exe: sudo
   vars:
+    # Cloudflare public DNS pushed as the tailnet's global resolvers. Keep
+    # useWithExitNode true so clients keep using these resolvers when routing
+    # through a Tailscale exit node (works around the macOS exit-node DNS bug).
+    tailscale_global_nameservers:
+      - address: 1.1.1.1
+        useWithExitNode: true
+      - address: 1.0.0.1
+        useWithExitNode: true
+      - address: 2606:4700:4700::1111
+        useWithExitNode: true
+      - address: 2606:4700:4700::1001
+        useWithExitNode: true
+    # Tags used to scope tailnet ACLs. The exit-node tag is auto-approved as
+    # an exit node (no manual click in the admin console), and only nodes
+    # carrying the client tag are permitted to route through it. Nodes other
+    # than pikvm (e.g. laptops, phones) must be tagged manually in the admin
+    # console under Machines → <node> → Edit ACL tags.
+    tailscale_exit_node_tag: 'tag:homelab-exit'
+    tailscale_client_tag: 'tag:homelab-client'
     tailscale_up_args: >-
       --reset
       --accept-dns=false
       --hostname={{ tailscale_hostname }}
-      {{ '--advertise-exit-node' if tailscale_advertise_exit_node else '' }}
-      --advertise-routes={{ tailscale_subnet_routes }}
+      {{ '--advertise-exit-node' if tailscale_exit_node else '' }}
+      {{ '--advertise-tags=' + tailscale_exit_node_tag if tailscale_exit_node else '' }}
       {{ '--ssh' if tailscale_ssh else '' }}
       --authkey={{ tailscale_auth_key }}
 
   tasks:
     # -------------------------------------------------------------------------
     # Auth Key
-    # Reads the Tailscale auth key from the pass store on the Ansible control
-    # node so it can be passed non-interactively to 'tailscale up'.
+    # Reads the Tailscale auth and API keys from the pass store on the
+    # Ansible control node so they can be passed non-interactively to
+    # 'tailscale up' and the Tailscale REST API.
     # -------------------------------------------------------------------------
     - name: Read Tailscale auth key from pass store
       ansible.builtin.command:
@@ -75,6 +121,20 @@
         tailscale_auth_key: '{{ tailscale_auth_key_result.stdout | trim }}'
       no_log: true
 
+    - name: Read Tailscale API key from pass store
+      ansible.builtin.command:
+        cmd: pass show '{{ pass_namespace }}/tailscale/api-key'
+      delegate_to: localhost
+      become: false
+      register: tailscale_api_key_result
+      changed_when: false
+      no_log: true
+
+    - name: Set Tailscale API key fact
+      ansible.builtin.set_fact:
+        tailscale_api_key: '{{ tailscale_api_key_result.stdout | trim }}'
+      no_log: true
+
     # -------------------------------------------------------------------------
     # Filesystem
     # PiKVM mounts the root filesystem read-only by default. All write
@@ -88,12 +148,12 @@
 
     - name: Install and configure Tailscale
       block:
-        # -----------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         # System Configuration
-        # Enables IPv4 and IPv6 forwarding so this host can act as a Tailscale
-        # subnet router or exit node.
-        # -----------------------------------------------------------------------
-        - name: Enable IP forwarding for subnet routing or exit node
+        # Enables IPv4 and IPv6 forwarding so this host can route exit-node
+        # traffic between the tunnel and the local network.
+        # ---------------------------------------------------------------------
+        - name: Enable IP forwarding for exit node
           ansible.posix.sysctl:
             name: '{{ item }}'
             value: '1'
@@ -104,22 +164,43 @@
             - net.ipv4.ip_forward
             - net.ipv6.conf.all.forwarding
 
-        # -----------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         # Installation
-        # Installs Tailscale from the official Arch Linux repository.
-        # -----------------------------------------------------------------------
+        # Installs Tailscale from the official Arch Linux ARM repository.
+        # Removes leftover state from a prior upstream-tarball install path
+        # (a tailscaled.service drop-in under /etc/systemd/system and
+        # binaries under /usr/local/bin) so the package-manager unit at
+        # /usr/lib/systemd/system/tailscaled.service is what systemd
+        # actually loads.
+        # ---------------------------------------------------------------------
+        - name: Remove leftover upstream-tarball Tailscale binaries
+          ansible.builtin.file:
+            path: '/usr/local/bin/{{ item }}'
+            state: absent
+          loop:
+            - tailscale
+            - tailscaled
+
+        - name: Remove leftover upstream tailscaled systemd unit override
+          ansible.builtin.file:
+            path: /etc/systemd/system/tailscaled.service
+            state: absent
+          notify:
+            - Reload systemd
+            - Restart tailscaled
+
         - name: Install Tailscale package
           community.general.pacman:
-            name: '{{ tailscale_packages }}'
+            name: tailscale
             state: latest
             update_cache: true
+          notify: Restart tailscaled
 
-        # -----------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         # Service Configuration and Network Connection
         # Configures the tailscaled daemon port, enables the service, and
-        # connects the host to the Tailscale network as an exit node and
-        # subnet router.
-        # -----------------------------------------------------------------------
+        # connects the host to the Tailscale network as an exit node.
+        # ---------------------------------------------------------------------
         - name: Set Tailscale WireGuard listen port in daemon configuration
           ansible.builtin.lineinfile:
             path: /etc/default/tailscaled
@@ -135,46 +216,180 @@
             enabled: true
             state: started
 
+        # Flush so any pending Restart tailscaled fires before 'tailscale up'.
+        # Otherwise the package upgrade leaves the new binary on disk while
+        # the running daemon stays the old version, and 'tailscale up' talks
+        # to a stale tailscaled (caught us with the 1.92.3 routing regression).
+        - name: Flush handlers so tailscaled restart precedes tailscale up
+          ansible.builtin.meta: flush_handlers
+
+        # ---------------------------------------------------------------------
+        # Tailnet ACL
+        # Pushes the access-control policy to the tailnet via the Tailscale
+        # REST API. Defines the homelab-exit / homelab-client tags, marks
+        # homelab-exit as auto-approved as an exit node, and restricts
+        # exit-node use to nodes carrying the homelab-client tag. POSTed
+        # before 'tailscale up' so that --advertise-tags is recognized on
+        # first run (the tagOwners must exist for the tag to be advertised)
+        # and so the auto-approver kicks in immediately. POST replaces the
+        # entire ACL document — add custom rules in the set_fact below
+        # rather than the admin console, otherwise the next playbook run
+        # will overwrite them. The body is built via set_fact rather than
+        # play vars because Ansible does not template dictionary keys
+        # declared at the vars level, which the tagOwners block requires.
+        # ---------------------------------------------------------------------
+        - name: Build Tailscale ACL body
+          ansible.builtin.set_fact:
+            tailscale_acl_body:
+              tagOwners: >-
+                {{ {tailscale_exit_node_tag: ['autogroup:admin'],
+                    tailscale_client_tag: ['autogroup:admin']} }}
+              autoApprovers:
+                exitNode:
+                  - '{{ tailscale_exit_node_tag }}'
+              acls:
+                - action: accept
+                  src:
+                    - '{{ tailscale_client_tag }}'
+                  dst:
+                    - '{{ tailscale_exit_node_tag }}:*'
+                    - 'autogroup:internet:*'
+              ssh:
+                - action: accept
+                  src:
+                    - '{{ tailscale_client_tag }}'
+                  dst:
+                    - '{{ tailscale_exit_node_tag }}'
+                  users:
+                    - autogroup:nonroot
+                    - root
+
+        - name: Configure Tailscale ACL for the tailnet
+          ansible.builtin.uri:
+            url: 'https://api.tailscale.com/api/v2/tailnet/{{ tailscale_tailnet }}/acl'
+            method: POST
+            headers:
+              Authorization: 'Bearer {{ tailscale_api_key }}'
+              Content-Type: application/json
+            body: '{{ tailscale_acl_body | to_json }}'
+            status_code: 200
+          delegate_to: localhost
+          become: false
+
         - name: Connect to Tailscale network
           ansible.builtin.command:
             cmd: 'tailscale up {{ tailscale_up_args }}'
           changed_when: false
           no_log: true
 
-        - name: Check Tailscale approval status
+        - name: Check Tailscale exit-node approval status
           ansible.builtin.command:
             cmd: tailscale status --json
           register: tailscale_status_raw
           changed_when: false
+          when: tailscale_exit_node
 
-        - name: Determine if Tailscale routes or exit node require approval
+        - name: Set Tailscale exit-node approval requirement
           ansible.builtin.set_fact:
             tailscale_needs_approval: >-
-              {{ not (tailscale_status_raw.stdout | from_json).Self.ExitNodeOption | default(false)
-                 or tailscale_subnet_routes not in
-                 ((tailscale_status_raw.stdout | from_json).Self.AllowedIPs | default([])) }}
+              {{ tailscale_exit_node
+                 and not ((tailscale_status_raw.stdout | default('{}') | from_json)
+                          .Self.ExitNodeOption | default(false)) }}
 
-        - name: Prompt to approve routes and exit node in Tailscale admin console
+        - name: Prompt to approve exit node in Tailscale admin console
           ansible.builtin.pause:
             prompt: |
-              Approve the subnet route and exit node for {{ tailscale_hostname }} in the Tailscale admin console:
+              Approve {{ tailscale_hostname }} in the Tailscale admin console:
                 https://login.tailscale.com/admin/machines
-              Navigate to {{ tailscale_hostname }} → Edit route settings, approve '{{ tailscale_subnet_routes }}'
-              and 'Use as exit node', then press Enter to continue.
+              Navigate to {{ tailscale_hostname }} → Edit route settings and
+              approve 'Use as exit node'.
+              Press Enter to continue.
           when: tailscale_needs_approval
 
-        - name: Wait for user to approve Tailscale routes and exit node in admin console
+        - name: Wait for user to approve Tailscale exit node in admin console
           ansible.builtin.command:
             cmd: tailscale status --json
           register: tailscale_status_wait
           changed_when: false
           until: >-
-            (tailscale_status_wait.stdout | from_json).Self.ExitNodeOption | default(false)
-            and tailscale_subnet_routes in
-            ((tailscale_status_wait.stdout | from_json).Self.AllowedIPs | default([]))
+            (tailscale_status_wait.stdout | from_json).Self.ExitNodeOption
+            | default(false)
           retries: 30
           delay: 10
           when: tailscale_needs_approval
+
+        # ---------------------------------------------------------------------
+        # Split DNS Configuration
+        # Configures Tailscale Split DNS via the Tailscale REST API to point
+        # the homelab DNS zone at Bind9 and pushes Cloudflare as the global
+        # resolvers. useWithExitNode keeps the resolvers active for clients
+        # routing through the exit node, which works around the macOS
+        # exit-node DNS bug.
+        # ---------------------------------------------------------------------
+        - name: Build Tailscale DNS configuration body
+          ansible.builtin.set_fact:
+            tailscale_dns_body:
+              nameservers: '{{ tailscale_global_nameservers }}'
+              splitDNS:
+                '{{ dns_zone }}':
+                  - address: '{{ bind9_lb_ip }}'
+                    useWithExitNode: true
+              preferences:
+                overrideLocalDNS: true
+                magicDNS: true
+
+        - name: Configure Tailscale DNS for the tailnet
+          ansible.builtin.uri:
+            url: 'https://api.tailscale.com/api/v2/tailnet/{{ tailscale_tailnet }}/dns/configuration'
+            method: POST
+            headers:
+              Authorization: 'Bearer {{ tailscale_api_key }}'
+              Content-Type: application/json
+            body: '{{ tailscale_dns_body | to_json }}'
+            status_code: 200
+          delegate_to: localhost
+          become: false
+          no_log: true
+
+        # ---------------------------------------------------------------------
+        # Node Key Expiry
+        # Toggles node-key expiry on this host via the Tailscale API. The
+        # device ID is resolved by hostname from the tailnet device list
+        # because the public REST API does not expose the local node ID.
+        # Setting keyExpiryDisabled: true on an unattended exit node avoids
+        # the failure mode where the key ages out while the operator is off
+        # the LAN and remote access depends on the same node staying online.
+        # ---------------------------------------------------------------------
+        - name: List Tailscale devices in the tailnet
+          ansible.builtin.uri:
+            url: 'https://api.tailscale.com/api/v2/tailnet/{{ tailscale_tailnet }}/devices'
+            method: GET
+            headers:
+              Authorization: 'Bearer {{ tailscale_api_key }}'
+            return_content: true
+          register: tailscale_devices_result
+          delegate_to: localhost
+          become: false
+          no_log: true
+
+        - name: Resolve this host's Tailscale device ID by hostname
+          ansible.builtin.set_fact:
+            tailscale_device_id: >-
+              {{ (tailscale_devices_result.json.devices
+                  | selectattr('hostname', 'equalto', tailscale_hostname)
+                  | first).id }}
+
+        - name: Configure node-key expiry for this host
+          ansible.builtin.uri:
+            url: 'https://api.tailscale.com/api/v2/device/{{ tailscale_device_id }}/key'
+            method: POST
+            headers:
+              Authorization: 'Bearer {{ tailscale_api_key }}'
+              Content-Type: application/json
+            body: '{"keyExpiryDisabled": {{ tailscale_key_expiry_disabled | bool | to_json }}}'
+            status_code: 200
+          delegate_to: localhost
+          become: false
 
         - name: Flush handlers before remounting read-only
           ansible.builtin.meta: flush_handlers
@@ -187,6 +402,10 @@
           failed_when: false
 
   handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
     - name: Restart tailscaled
       ansible.builtin.service:
         name: tailscaled

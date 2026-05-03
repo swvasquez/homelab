@@ -90,14 +90,27 @@ destroy-cluster subset="homelab":
         -e ansible_become_exe=sudo.ws \
         -B 1 -P 0
 
-# Store the Tailscale auth key in the pass store
-tailscale-set-auth-key pass_namespace=env_var('PASS_NAMESPACE'):
+# Store the Tailscale auth key and API key in the pass store
+# (press Enter without typing to keep existing values)
+tailscale-set-keys pass_namespace=env_var('PASS_NAMESPACE'):
     #!/usr/bin/env sh
     set -euo pipefail
-    printf 'Tailscale auth key: '
-    read -rs auth_key
-    printf '\n'
-    printf '%s\n' "$auth_key" | pass insert --echo --force '{{ pass_namespace }}/tailscale/auth-key'
+    update_key() {
+        name="$1"
+        path="$2"
+        if pass show "$path" >/dev/null 2>&1; then
+            printf '%s (Enter to keep existing): ' "$name"
+        else
+            printf '%s: ' "$name"
+        fi
+        read -rs value
+        printf '\n'
+        if [ -n "$value" ]; then
+            printf '%s\n' "$value" | pass insert --echo --force "$path"
+        fi
+    }
+    update_key 'Tailscale auth key (tskey-auth-...)' '{{ pass_namespace }}/tailscale/auth-key'
+    update_key 'Tailscale API key (tskey-api-...)' '{{ pass_namespace }}/tailscale/api-key'
 
 # Print the OpenBao root token from the pass store (paste into the UI Token method)
 # Reads PASS_NAMESPACE from the environment; override with: just bao-token pass_namespace=<name>

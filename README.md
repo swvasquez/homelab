@@ -56,6 +56,9 @@ Ansible playbooks to configure Ubuntu x86_64 compute nodes, Arch Linux-based IP 
 
     ```yaml
     pass_namespace: <PASS_NAMESPACE>
+    dns_zone: <DNS_ZONE>
+    bind9_lb_ip: <BIND9_LB_IP>
+    tailscale_tailnet: <TAILSCALE_TAILNET>
     ```
 
 4.  Create a `group_vars/homelab.yml` file for homelab group variables:
@@ -64,7 +67,6 @@ Ansible playbooks to configure Ubuntu x86_64 compute nodes, Arch Linux-based IP 
     ssh_users:
       - <USER>
       - <ANSIBLE_USER>
-    dns_zone: <DNS_ZONE>
     nfs_export_path: <NFS_EXPORT_PATH>
     nfs_mount_point: <NFS_MOUNT_POINT>
     nfs_k8s_path: <NFS_K8S_PATH>
@@ -157,11 +159,9 @@ Ansible playbooks to configure Ubuntu x86_64 compute nodes, Arch Linux-based IP 
 5.  Create a `group_vars/ipkvm.yml` file for IP KVM group variables:
 
     ```yaml
-    tailscale_packages:
-      - tailscale
     tailscale_port: <TAILSCALE_PORT>
-    tailscale_subnet_routes: <SUBNET_ROUTES>
-    tailscale_advertise_exit_node: <true|false>
+    tailscale_exit_node: <true|false>
+    tailscale_key_expiry_disabled: <true|false>
     tailscale_ssh: <true|false>
     tailscale_hostname: <TAILSCALE_HOSTNAME>
     ```
