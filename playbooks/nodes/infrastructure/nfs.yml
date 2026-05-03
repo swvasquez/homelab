@@ -1,0 +1,402 @@
+---
+# ==============================================================================
+# Playbook: Install and Configure NFS
+# ==============================================================================
+# Installs and configures an NFS server and client mount.
+#
+# This playbook performs the following actions:
+#
+#   Group play (all hosts):
+#     - Creates the nfs_users group with a consistent GID across all nodes.
+#     - Adds the ansible user to the nfs_users group.
+#
+#   Server play (host where nfs_server: true in inventory):
+#     - Installs nfs-kernel-server.
+#     - Mounts the LVM Logical Volume to the NFS export directory.
+#     - Optionally creates and formats a new Logical Volume if nfs_create_lvm is true.
+#     - Creates the export directory owned by root:nfs_users with mode 2775 (SGID).
+#       The SGID bit ensures new files and subdirectories inherit the group of the parent
+#       directory rather than the creating user's primary group, and subdirectories also
+#       inherit the SGID bit — keeping group ownership consistent throughout the tree.
+#     - Creates the Kubernetes NFS subdirectory (nfs_k8s_path) with the same
+#       ownership and permissions, providing a dedicated area for Kubernetes
+#       workload volumes separate from other NFS consumers.
+#     - Explicitly enables NFSv3 and NFSv4 in /etc/nfs.conf.
+#       Both versions are served simultaneously. Linux clients default to NFSv4;
+#       macOS clients should mount with nfsvers=3 for better compatibility.
+#     - Adds the export to /etc/exports with no_root_squash to allow root-running
+#       Kubernetes pods to write to NFS-backed PersistentVolumes.
+#     - Starts and enables the NFS server service.
+#
+#   Client play (all hosts, including the NFS server node):
+#     - Installs nfs-common.
+#     - Creates the mount point directory.
+#     - The server address is resolved dynamically from hostvars.
+#     - On all nodes: deploys explicit .mount and .automount unit files instead of
+#       fstab. fstab-generator incorrectly places automount units in local-fs.target
+#       even when _netdev is set (systemd bugs #17657, #34164). On the server node
+#       this creates a cycle that prevents nfs-server from starting. On client nodes
+#       a drop-in adding After=network-online.target conflicts with the implicit
+#       Before=local-fs.target from DefaultDependencies=yes, causing systemd to drop
+#       iscsid.socket and preventing Longhorn volumes from attaching. Explicit unit
+#       files with DefaultDependencies=no and WantedBy=remote-fs.target bypass both
+#       cycles entirely.
+#     - Writes a systemd drop-in on all nodes to order kubelet.service after the NFS
+#       mount unit. kubelet restores previously active NFS PersistentVolumes at startup
+#       by mounting them directly; if the server is unreachable, kubelet hangs in
+#       uninterruptible D state. Ordering after the NFS mount unit ensures the share is
+#       actually mounted before kubelet attempts to re-attach volumes. If the NFS server
+#       is unavailable, the mount times out after 15 s and kubelet starts without NFS PVs;
+#       the automount unit retries on next access once the server comes online.
+#     - Masks nfs-blkmap.service on all nodes. It implements pNFS block layout support,
+#       which requires the kernel pNFS interface to be initialized by an active NFS
+#       session. With automount, no session exists at boot so nfs-blkmap hangs
+#       indefinitely. pNFS block layouts are not used in this environment, so it is
+#       masked consistently across all nodes.
+#     - Writes a systemd drop-in on the server node to order rpc-statd-notify
+#       after nfs-kernel-server.service, preventing it from notifying peers
+#       before exports are ready.
+#
+# Inventory variables:
+#   nfs_server:       Boolean, set to true on the node that should run the NFS server.
+#
+# Playbook variables (group_vars):
+#   nfs_group:        Group name for NFS access. Read from group_vars.
+#   nfs_group_gid:    GID for the NFS group, must be consistent across nodes.
+#                     Read from group_vars.
+#   nfs_export_path:  Directory to export from the server (e.g. /srv/nfs/data).
+#                     Read from group_vars.
+#   nfs_k8s_path:     Path for Kubernetes workload volumes on the NFS server.
+#                     Read from group_vars.
+#
+# Playbook variables (defaults):
+#   nfs_export_opts:  Export options (default: "*(rw,sync,no_subtree_check,no_root_squash)").
+#   nfs_mount_point:  Local directory to mount the NFS share on clients (e.g. /mnt/nfs).
+#   nfs_lvm_vg_name:  The name of the LVM Volume Group to use (required).
+#   nfs_lvm_lv_name:  The name of the LVM Logical Volume to mount for the export (required).
+#   nfs_create_lvm:   Boolean, whether to create and format a new LV (default: false).
+#                     Set to false when the LV already exists and only needs to be mounted.
+#   nfs_lvm_lv_size:  Size of the new Logical Volume, required when nfs_create_lvm is true (e.g., "50g").
+#
+
+# ------------------------------------------------------------------------------
+# GROUP PLAY: NFS Users Group Configuration
+# ------------------------------------------------------------------------------
+- name: Create NFS user group on all nodes
+  hosts: nodes
+  become: true
+  become_exe: sudo.ws
+  tasks:
+    - name: Create NFS group with consistent GID
+      ansible.builtin.group:
+        name: '{{ nfs_group }}'
+        gid: '{{ nfs_group_gid }}'
+        state: present
+
+    - name: Add ansible user to NFS group
+      ansible.builtin.user:
+        name: '{{ ansible_user }}'
+        groups: '{{ nfs_group }}'
+        append: true
+
+# ------------------------------------------------------------------------------
+# SERVER PLAY: NFS Server Configuration
+# ------------------------------------------------------------------------------
+- name: Configure NFS server
+  hosts: nodes
+  become: true
+  become_exe: sudo.ws
+  vars:
+    nfs_export_opts: '*(rw,sync,no_subtree_check,no_root_squash)'
+    nfs_lvm_vg_name: ubuntu-vg
+    nfs_lvm_lv_name: nfs_lv
+    nfs_create_lvm: false
+    nfs_lvm_lv_size: 100g
+  tasks:
+    - name: Configure NFS server
+      when: nfs_server | default(false)
+      block:
+        - name: Install nfs-kernel-server
+          ansible.builtin.apt:
+            name: nfs-kernel-server
+            state: present
+            update_cache: true
+
+        - name: Ensure LVM packages are installed
+          ansible.builtin.apt:
+            name: lvm2
+            state: present
+            update_cache: true
+          when: nfs_create_lvm | default(false)
+
+        - name: Check if Logical Volume already exists
+          ansible.builtin.command:
+            cmd: 'lvs /dev/{{ nfs_lvm_vg_name }}/{{ nfs_lvm_lv_name }}'
+          register: lv_check
+          failed_when: false
+          changed_when: false
+          when: nfs_create_lvm | default(false)
+
+        - name: Assert enough unallocated space in Volume Group
+          ansible.builtin.shell:
+            cmd: >-
+              set -o pipefail &&
+              vgs "{{ nfs_lvm_vg_name }}" -o vg_free --units g --noheadings --nosuffix |
+              awk -v need="{{ nfs_lvm_lv_size | regex_replace('[^0-9.]', '') }}"
+                  '{ if ($1 < need) { print "Need "need"g, only "$1"g free in VG {{ nfs_lvm_vg_name }}"; exit 1 } }'
+            executable: /bin/bash
+          changed_when: false
+          when:
+            - nfs_create_lvm | default(false)
+            - lv_check.rc != 0
+
+        - name: Create Logical Volume for NFS
+          community.general.lvol:
+            vg: '{{ nfs_lvm_vg_name }}'
+            lv: '{{ nfs_lvm_lv_name }}'
+            size: '{{ nfs_lvm_lv_size }}'
+            resizefs: true
+            state: present
+          when: nfs_create_lvm | default(false)
+
+        - name: Format the Logical Volume with ext4
+          community.general.filesystem:
+            fstype: ext4
+            dev: '/dev/{{ nfs_lvm_vg_name }}/{{ nfs_lvm_lv_name }}'
+          when: nfs_create_lvm | default(false)
+
+        - name: Mount the Logical Volume to the NFS export directory
+          ansible.posix.mount:
+            path: '{{ nfs_export_path }}'
+            src: '/dev/{{ nfs_lvm_vg_name }}/{{ nfs_lvm_lv_name }}'
+            fstype: ext4
+            opts: defaults
+            state: mounted
+
+        - name: Create NFS export directory
+          ansible.builtin.file:
+            path: '{{ nfs_export_path }}'
+            state: directory
+            owner: root
+            group: '{{ nfs_group }}'
+            mode: '2775'
+
+        - name: Create Kubernetes NFS directory
+          ansible.builtin.file:
+            path: '{{ nfs_k8s_path }}'
+            state: directory
+            owner: root
+            group: '{{ nfs_group }}'
+            mode: '2775'
+
+        - name: Enable NFSv3 in /etc/nfs.conf
+          community.general.ini_file:
+            path: /etc/nfs.conf
+            section: nfsd
+            option: vers3
+            value: 'y'
+            mode: '0644'
+            state: present
+          notify: Restart NFS server
+
+        - name: Enable NFSv4 in /etc/nfs.conf
+          community.general.ini_file:
+            path: /etc/nfs.conf
+            section: nfsd
+            option: vers4
+            value: 'y'
+            mode: '0644'
+            state: present
+          notify: Restart NFS server
+
+        - name: Add export to /etc/exports
+          ansible.builtin.lineinfile:
+            path: /etc/exports
+            regexp: '^{{ nfs_export_path | regex_escape }}\s'
+            line: '{{ nfs_export_path }} {{ nfs_export_opts }}'
+            state: present
+          notify: Re-export NFS shares
+
+        - name: Start and enable NFS server
+          ansible.builtin.systemd:
+            name: nfs-kernel-server
+            state: started
+            enabled: true
+
+        # -------------------------------------------------------------------------
+        # Suspend Resume Hook
+        # On resume from S3 suspend, re-exports all NFS shares so clients can
+        # reconnect cleanly within the soft-mount timeout window. Only deployed
+        # when shutdown_mode is 'suspend'; removed otherwise.
+        # -------------------------------------------------------------------------
+        - name: Deploy NFS resume sleep hook
+          ansible.builtin.template:
+            src: nfs-resume.sh.j2
+            dest: /lib/systemd/system-sleep/nfs-resume
+            mode: '0755'
+            owner: root
+            group: root
+          when: shutdown_mode | default('shutdown') == 'suspend'
+
+        - name: Remove NFS resume sleep hook
+          ansible.builtin.file:
+            path: /lib/systemd/system-sleep/nfs-resume
+            state: absent
+          when: shutdown_mode | default('shutdown') != 'suspend'
+
+  handlers:
+    - name: Restart NFS server
+      ansible.builtin.systemd:
+        name: nfs-kernel-server
+        state: restarted
+
+    - name: Re-export NFS shares
+      ansible.builtin.command:
+        cmd: exportfs -ra
+      changed_when: false
+
+# ------------------------------------------------------------------------------
+# CLIENT PLAY: NFS Client Mount Configuration
+# ------------------------------------------------------------------------------
+- name: Configure NFS client mount
+  hosts: nodes
+  become: true
+  become_exe: sudo.ws
+  vars:
+    _nfs_server_host: >-
+      {{ hostvars | dict2items
+         | selectattr('value.nfs_server', 'defined')
+         | selectattr('value.nfs_server', 'equalto', true)
+         | map(attribute='value.private_ip')
+         | first }}
+  tasks:
+    - name: Install nfs-common
+      ansible.builtin.apt:
+        name: nfs-common
+        state: present
+        update_cache: true
+
+    - name: Create NFS mount point  # noqa: risky-file-permissions
+      ansible.builtin.file:
+        path: '{{ nfs_mount_point }}'
+        state: directory
+        # mode is intentionally omitted: chmod on a live mount point returns
+        # EPERM, and mount point permissions are superseded by the server anyway.
+
+    # -------------------------------------------------------------------------
+    # Boot Ordering — All Nodes
+    # Fstab-based mounts with x-systemd.automount create ordering cycles on both
+    # server and client nodes. See playbook header for a full explanation.
+    # Explicit unit files with DefaultDependencies=no bypass both cycles.
+    #
+    # Any existing fstab entry and automount drop-in from previous runs are
+    # removed to prevent conflicts with the explicit unit files.
+    # -------------------------------------------------------------------------
+    - name: Remove NFS fstab entry
+      ansible.posix.mount:
+        path: '{{ nfs_mount_point }}'
+        state: absent_from_fstab
+      notify: Reload systemd daemon
+
+    - name: Remove NFS automount drop-in directory
+      ansible.builtin.file:
+        path: '/etc/systemd/system/{{ nfs_mount_point | regex_replace("^/", "") | replace("/", "-") }}.automount.d'
+        state: absent
+      notify: Reload systemd daemon
+
+    - name: Deploy explicit NFS mount unit
+      ansible.builtin.template:
+        src: mnt-nfs.mount.j2
+        dest: '/etc/systemd/system/{{ nfs_mount_point | regex_replace("^/", "") | replace("/", "-") }}.mount'
+        mode: '0644'
+        owner: root
+        group: root
+      notify: Reload systemd daemon
+
+    - name: Deploy explicit NFS automount unit
+      ansible.builtin.template:
+        src: mnt-nfs.automount.j2
+        dest: '/etc/systemd/system/{{ nfs_mount_point | regex_replace("^/", "") | replace("/", "-") }}.automount'
+        mode: '0644'
+        owner: root
+        group: root
+      notify: Enable and start NFS automount
+
+    - name: Create systemd drop-in directory for rpc-statd-notify ordering
+      ansible.builtin.file:
+        path: /etc/systemd/system/rpc-statd-notify.service.d
+        state: directory
+        mode: '0755'
+      when: nfs_server | default(false)
+
+    - name: Write systemd drop-in to order rpc-statd-notify after NFS server
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/rpc-statd-notify.service.d/after-nfs-server.conf
+        mode: '0644'
+        content: |
+          [Unit]
+          After=nfs-kernel-server.service
+      notify: Reload systemd daemon
+      when: nfs_server | default(false)
+
+    # -------------------------------------------------------------------------
+    # Kubelet Boot Ordering
+    # kubelet restores previously active NFS PersistentVolumes at startup by
+    # mounting them directly from the NFS server. If the server is unreachable
+    # at boot, kubelet hangs in uninterruptible D state indefinitely.
+    #
+    # A drop-in orders kubelet after the NFS mount unit (Wants=, not Requires=).
+    # If the mount fails, kubelet starts after the 15 s TimeoutSec delay without
+    # NFS PVs. Once the server comes online, the automount unit retries on next
+    # access to the mount point and PVs recover via kubelet's volume retry loop.
+    # -------------------------------------------------------------------------
+    - name: Create systemd drop-in directory for kubelet boot ordering
+      ansible.builtin.file:
+        path: /etc/systemd/system/kubelet.service.d
+        state: directory
+        mode: '0755'
+
+    - name: Remove old kubelet drop-ins
+      ansible.builtin.file:
+        path: '{{ item }}'
+        state: absent
+      loop:
+        - /etc/systemd/system/kubelet.service.d/after-nfs-automount.conf
+        - /etc/systemd/system/kubelet.service.d/after-multi-user.conf
+      notify: Reload systemd daemon
+
+    - name: Write systemd drop-in to order kubelet after NFS mount
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/kubelet.service.d/after-nfs-mount.conf
+        mode: '0644'
+        content: |
+          [Unit]
+          After={{ nfs_mount_point | regex_replace("^/", "") | replace("/", "-") }}.mount
+          Wants={{ nfs_mount_point | regex_replace("^/", "") | replace("/", "-") }}.mount
+      notify: Reload systemd daemon
+
+    - name: Mask nfs-blkmap service to prevent boot hang
+      ansible.builtin.systemd:
+        name: nfs-blkmap
+        masked: true
+
+    - name: Deploy NFS status MOTD fragment
+      ansible.builtin.template:
+        src: motd-nfs-status.sh.j2
+        dest: /etc/update-motd.d/98-nfs-status
+        mode: '0755'
+        owner: root
+        group: root
+
+
+  handlers:
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable and start NFS automount
+      ansible.builtin.systemd:
+        name: '{{ nfs_mount_point | regex_replace("^/", "") | replace("/", "-") }}.automount'
+        enabled: true
+        state: started
+        daemon_reload: true

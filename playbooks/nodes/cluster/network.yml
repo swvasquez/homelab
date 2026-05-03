@@ -1,0 +1,1030 @@
+---
+# ==============================================================================
+# Playbook: Install Cluster Networking and DNS
+# ==============================================================================
+# Installs cluster networking, ingress, TLS, and DNS components onto a Kubernetes
+# cluster that has already been bootstrapped by bootstrap.yml.
+#
+# This playbook assumes that bootstrap.yml has already been run and the cluster is
+# fully operational. It performs the following actions:
+#   - Installs the Kubernetes Gateway API CRDs required by Cilium.
+#   - Removes kube-proxy and installs Cilium as the CNI plugin via Helm, with
+#     Cilium's eBPF kube-proxy replacement, Gateway API support, Hubble
+#     observability, and node initialization tainting enabled. The nodeinit
+#     DaemonSet applies a node.cilium.io/agent-not-ready:NoExecute taint on
+#     every Cilium agent start, preventing application pods from scheduling
+#     before the eBPF dataplane is fully programmed.
+#   - Configures a Cilium LoadBalancer IP pool for LAN-accessible services.
+#   - Configures L2 announcement so LoadBalancer IPs are reachable on the LAN.
+#   - Installs Traefik as the L7 Gateway API controller via Helm and creates the
+#     traefik-gateway Gateway resource.
+#   - Exposes the Traefik dashboard via an HTTPRoute.
+#   - Installs cert-manager and creates a self-signed ClusterIssuer for
+#     automatic TLS certificate provisioning.
+#   - Issues a wildcard TLS Certificate for *.{{ dns_zone }}.
+#   - Exposes the Hubble UI over the LAN via an HTTPRoute attached to the
+#     traefik-gateway with self-signed HTTPS support.
+#   - Deploys Bind9 as an authoritative DNS server for the homelab zone with
+#     its own LoadBalancer IP. Bind9 is configured with a TSIG key for
+#     RFC 2136 dynamic updates.
+#   - Deploys ExternalDNS (kubernetes-sigs Helm chart) to automatically sync DNS
+#     records from Gateway API route resources into Bind9 via RFC 2136.
+#   - Patches CoreDNS to forward homelab zone queries to Bind9's ClusterIP so
+#     that pods can resolve homelab hostnames without relying on the Bind9
+#     LoadBalancer IP, which is unreachable from inside pods via Cilium.
+#   - Configures systemd-resolved on every cluster node with a split-DNS
+#     drop-in so node-level queries for the homelab zone resolve via Bind9.
+#   - Installs the Cilium CLI on all nodes for inspecting and troubleshooting.
+#
+# Node roles are determined by host variables in inventory.yml:
+#   bootstrap_node: true — node runs cluster management commands (kubectl,
+#                          helm). Exactly one control plane node should have
+#                          this set.
+#
+# Variables:
+#   kubectl_config_path:     Full path to the kubectl config file
+#                            (default: /home/<ansible_user>/.kube/config).
+#   cilium_version:          Version of Cilium to install via Helm
+#                            (default: 1.19.1).
+#   cilium_namespace:        Kubernetes namespace for the Cilium installation
+#                            (default: kube-system).
+#   cilium_cli_version:      Version of the Cilium CLI to install
+#                            (default: 0.19.1).
+#   gateway_api_version:     Version of the Gateway API CRDs to install.
+#                            Must be compatible with the Cilium version in use
+#                            (default: 1.4.1).
+#   traefik_chart_version:   Version of the Traefik Helm chart (default: 34.4.1).
+#   traefik_namespace:       Kubernetes namespace where Traefik is deployed
+#                            (default: traefik).
+#   traefik_hostname:        Fully qualified hostname for the Traefik dashboard,
+#                            derived from dns_zone
+#                            (default: traefik.<dns_zone>).
+#   traefik_http_port:       External LoadBalancer port for HTTP traffic. Derived
+#                            from ufw_allowed_ports.traefik_http.port.
+#   traefik_https_port:      External LoadBalancer port for HTTPS traffic. Derived
+#                            from ufw_allowed_ports.traefik_https.port.
+#   nonroot_uid:             Shared non-root UID for the Traefik pod, injected
+#                            into the chart's podSecurityContext. Read from
+#                            group_vars.
+#   cert_manager_chart_version:   Version of the cert-manager Helm chart
+#                            (default: 1.20.0).
+#   cert_manager_namespace:  Kubernetes namespace for cert-manager
+#                            (default: cert-manager).
+#   hubble_hostname:         Fully qualified hostname for the Hubble UI,
+#                            derived from dns_zone
+#                            (default: hubble.<dns_zone>).
+#   bind9_lb_ip:             Fixed LoadBalancer IP assigned to the Bind9 Service
+#                            so every consumer (cluster nodes, IP KVM, laptops,
+#                            ExternalDNS) can hardcode the same address. Read
+#                            from group_vars.
+#   bind9_image:             Container image for the Bind9 DNS server
+#                            (default: internetsystemsconsortium/bind9:9.20).
+#   bind9_namespace:         Kubernetes namespace for Bind9 and ExternalDNS
+#                            (default: kube-system).
+#   bind9_pvc_size:          Size of the PersistentVolumeClaim used to store
+#                            Bind9 zone data across pod restarts
+#                            (default: 128Mi).
+#   bind9_dns_port:          Port Bind9 listens on for DNS queries (TCP and UDP).
+#                            Derived from ufw_allowed_ports.bind9_dns_tcp.port.
+#   externaldns_chart_version:    Version of the kubernetes-sigs ExternalDNS
+#                            Helm chart (default: 1.19.0).
+#   upstream_dns:            Space-separated list of upstream DNS servers used
+#                            by CoreDNS to resolve non-cluster, non-homelab
+#                            queries. Must be IPs directly reachable from pod
+#                            network (not 127.0.0.53 or LoadBalancer IPs).
+#                            (default: 8.8.8.8 1.1.1.1).
+#   dns_zone:                DNS zone served by Bind9 (e.g. homelab.internal).
+#                            Read from group_vars.
+#   lb_ip_pool_cidr:         CIDR block allocated for Cilium LoadBalancer IP
+#                            assignments. Should be a reserved range on the LAN
+#                            that does not overlap with DHCP or static addresses.
+#                            Read from group_vars.
+#   network_interface:       Primary network interface on each node used for
+#                            L2 announcement of LoadBalancer IPs (e.g. eth0).
+#                            Read from inventory host vars.
+#   control_plane_ip:        IP address of the control plane node. Used to
+#                            configure Cilium's k8sServiceHost so the Cilium
+#                            init container can reach the API server directly
+#                            without relying on ClusterIP routing. Read from
+#                            inventory host vars (private_ip on the bootstrap
+#                            node).
+#   kubernetes_api_hostname: DNS hostname clients use to address the cluster's
+#                            kube-apiserver. Registered as an A record in
+#                            Bind9 pointing at control_plane_ip and used to
+#                            rewrite the local kubeconfig server entry so
+#                            kubectl resolves the API by name. Derived from
+#                            dns_zone (default: k8s.<dns_zone>).
+#   cluster_name:            Name of the Kubernetes cluster, used as the
+#                            cluster identifier in the local kubeconfig
+#                            when rewriting the API server URL
+#                            (default: homelab-0).
+#   local_kubeconfig_path:   Destination path for the kubeconfig on the local
+#                            machine. Rewritten in place to point at
+#                            kubernetes_api_hostname (default: ~/.kube/config).
+
+- name: Install cluster networking and DNS
+  hosts: nodes
+  become: true
+  become_exe: sudo.ws
+  vars:
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    hubble_hostname: 'hubble.{{ dns_zone }}'
+    control_plane_ip: >-
+      {{ groups["nodes"] | map("extract", hostvars)
+         | selectattr("bootstrap_node", "equalto", true)
+         | map(attribute="private_ip") | first }}
+    cilium_version: 1.19.1
+    cilium_namespace: kube-system
+    cilium_cli_version: 0.19.1
+    # NOTE: Cilium 1.19.1 requires Gateway API v1.4.1. In v1.5.0, TLSRoute was
+    # promoted from v1alpha2 to v1 and v1alpha2 is no longer served. Cilium
+    # 1.19.1's operator expects TLSRoute at v1alpha2 and crashes on startup if
+    # it is absent or unserved. Use v1.4.1 until Cilium adds v1.5.0 support.
+    gateway_api_version: 1.4.1
+    traefik_chart_version: 34.4.1
+    traefik_namespace: traefik
+    traefik_hostname: 'traefik.{{ dns_zone }}'
+    traefik_http_port: '{{ ufw_allowed_ports.traefik_http.port }}'
+    traefik_https_port: '{{ ufw_allowed_ports.traefik_https.port }}'
+    cert_manager_chart_version: 1.20.0
+    cert_manager_namespace: cert-manager
+    bind9_image: "internetsystemsconsortium/bind9:9.20"
+    bind9_namespace: kube-system
+    bind9_pvc_size: 128Mi
+    bind9_dns_port: '{{ ufw_allowed_ports.bind9_dns_tcp.port }}'
+    externaldns_chart_version: 1.19.0
+    upstream_dns: 8.8.8.8 1.1.1.1
+    authentik_namespace: authentik
+    kubernetes_api_hostname: 'k8s.{{ dns_zone }}'
+    cluster_name: homelab-0
+    local_kubeconfig_path: "{{ lookup('env', 'HOME') }}/.kube/config"
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Gateway API CRDs
+    # Installs the Kubernetes Gateway API Custom Resource Definitions required
+    # by Cilium's Gateway API implementation. These CRDs define GatewayClass,
+    # Gateway, HTTPRoute, GRPCRoute, and ReferenceGrant resources that enable
+    # advanced traffic routing. They must be present before Cilium starts, as
+    # Cilium validates their existence on startup when Gateway API is enabled.
+    # The standard install manifest is downloaded, applied, and then removed.
+    # -------------------------------------------------------------------------
+    - name: Check if Gateway API CRDs are already installed
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get crd gatewayclasses.gateway.networking.k8s.io
+      register: gateway_crd_check
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Download Gateway API CRD manifest
+      ansible.builtin.get_url:
+        url: https://github.com/kubernetes-sigs/gateway-api/releases/download/v{{ gateway_api_version }}/standard-install.yaml # noqa: yaml[line-length]
+        dest: /tmp/gateway-api-install.yaml
+        mode: "0644"
+      when:
+        - bootstrap_node | default(false)
+        - (gateway_crd_check.rc | default(1)) != 0
+
+    - name: Apply Gateway API CRDs
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/gateway-api-install.yaml
+      when:
+        - bootstrap_node | default(false)
+        - (gateway_crd_check.rc | default(1)) != 0
+      changed_when: true
+
+    - name: Clean up Gateway API CRD manifest
+      ansible.builtin.file:
+        path: /tmp/gateway-api-install.yaml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Cilium Installation
+    # Installs Cilium as the cluster CNI plugin via Helm. Cilium provides
+    # eBPF-based networking, security, and observability for Kubernetes.
+    # kube-proxy is removed and replaced by Cilium's eBPF-based implementation,
+    # which handles ClusterIP and NodePort routing without iptables. The following
+    # features are enabled: Gateway API controller, Hubble observability (relay
+    # and UI), and L2 announcement for LAN-reachable LoadBalancer IPs. The
+    # Cilium Helm repository is registered before installation.
+    # -------------------------------------------------------------------------
+    - name: Remove kube-proxy DaemonSet
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          delete daemonset kube-proxy -n kube-system
+      register: kube_proxy_delete
+      changed_when: "'deleted' in kube_proxy_delete.stdout"
+      failed_when:
+        - kube_proxy_delete.rc != 0
+        - "'not found' not in kube_proxy_delete.stderr"
+      when: bootstrap_node | default(false)
+
+    - name: Add Cilium Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add cilium https://helm.cilium.io/
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Update Helm repositories
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Install or upgrade Cilium via Helm
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade --install cilium cilium/cilium
+          --version {{ cilium_version }}
+          --namespace {{ cilium_namespace }}
+          --kubeconfig {{ kubectl_config_path }}
+          --set kubeProxyReplacement=true
+          --set k8sServiceHost={{ control_plane_ip }}
+          --set k8sServicePort={{ ufw_allowed_ports.kubernetes_api.port }}
+          --set gatewayAPI.enabled=true
+          --set hubble.enabled=true
+          --set hubble.relay.enabled=true
+          --set hubble.ui.enabled=true
+          --set hubble.ui.ingress.enabled=false
+          --set l2announcements.enabled=true
+          --set nodeinit.enabled=true
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # LoadBalancer IP Pool
+    # Configures a CiliumLoadBalancerIPPool, which gives Cilium a reserved CIDR
+    # on the LAN to assign external IPs to LoadBalancer services. This enables
+    # Gateway resources to receive a stable LAN IP without requiring MetalLB or
+    # a cloud provider. The pool CIDR is defined in group_vars and should not
+    # overlap with DHCP or statically assigned addresses on the network.
+    # -------------------------------------------------------------------------
+    - name: Wait for Cilium DaemonSet to be ready
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          rollout status daemonset cilium
+          -n {{ cilium_namespace }}
+          --timeout=180s
+      when: bootstrap_node | default(false)
+      changed_when: false
+
+    - name: Write CiliumLoadBalancerIPPool manifest
+      ansible.builtin.template:
+        src: cilium-lb-pool.yml.j2
+        dest: /tmp/cilium-lb-pool.yml
+        mode: "0644"
+      when: bootstrap_node | default(false)
+
+    - name: Apply CiliumLoadBalancerIPPool
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/cilium-lb-pool.yml
+      register: lb_pool_result
+      changed_when: >-
+        'created' in lb_pool_result.stdout or
+        'configured' in lb_pool_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up CiliumLoadBalancerIPPool manifest
+      ansible.builtin.file:
+        path: /tmp/cilium-lb-pool.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # L2 Announcement Policy
+    # Creates a CiliumL2AnnouncementPolicy that instructs Cilium to announce
+    # LoadBalancer IPs on the LAN via ARP, making them reachable from other
+    # devices on the network without a dedicated load balancer. The policy
+    # targets all Linux nodes and announces on the primary network interface.
+    # -------------------------------------------------------------------------
+    - name: Write CiliumL2AnnouncementPolicy manifest
+      ansible.builtin.template:
+        src: cilium-l2-announcement.yml.j2
+        dest: /tmp/cilium-l2-announcement.yml
+        mode: "0644"
+      when: bootstrap_node | default(false)
+
+    - name: Apply CiliumL2AnnouncementPolicy
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/cilium-l2-announcement.yml
+      register: l2_announcement_result
+      changed_when: >-
+        'created' in l2_announcement_result.stdout or
+        'configured' in l2_announcement_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up CiliumL2AnnouncementPolicy manifest
+      ansible.builtin.file:
+        path: /tmp/cilium-l2-announcement.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Traefik Installation
+    # Installs Traefik via Helm as the L7 Gateway API controller. The Traefik
+    # Helm repository is registered and updated before installation. A values
+    # file is rendered from the traefik-values.yml.j2 template, which enables
+    # the kubernetesGateway and kubernetesCRD providers, disables the legacy
+    # kubernetesIngress provider, configures a LoadBalancer service, sets up
+    # HTTP-to-HTTPS redirect, and disables the default ingressRoute dashboard.
+    # After Helm install, a JSON patch (traefik-readiness-patch.json.j2) replaces
+    # the default httpGet readiness probe with a custom exec probe that verifies
+    # the kubernetesCRD provider has completed its initial sync before the pod
+    # accepts traffic. The Traefik chart hardcodes httpGet in its template, so
+    # the probe must be replaced via kubectl patch rather than Helm values.
+    # -------------------------------------------------------------------------
+    - name: Add Traefik Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add traefik https://helm.traefik.io/traefik
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Update Helm repositories
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Write Traefik values file
+      ansible.builtin.template:
+        src: traefik-values.yml.j2
+        dest: /tmp/traefik-values.yml
+        mode: "0644"
+      when: bootstrap_node | default(false)
+
+    # --force is required to avoid a recurring Helm upgrade conflict where
+    # Kubernetes rejects patching the Traefik Deployment in-place due to
+    # readinessProbe handler type changes between chart versions. --force
+    # deletes and recreates resources that cannot be patched, causing a brief
+    # Traefik restart on each run.
+    - name: Install or upgrade Traefik via Helm
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade --install traefik traefik/traefik
+          --namespace {{ traefik_namespace }}
+          --create-namespace
+          --kubeconfig {{ kubectl_config_path }}
+          --values /tmp/traefik-values.yml
+          --version {{ traefik_chart_version }}
+          --force
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Traefik values file
+      ansible.builtin.file:
+        path: /tmp/traefik-values.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write Traefik readiness probe patch
+      ansible.builtin.template:
+        src: traefik-readiness-patch.json.j2
+        dest: /tmp/traefik-readiness-patch.json
+        mode: "0644"
+      when: bootstrap_node | default(false)
+
+    - name: Patch Traefik deployment readiness probe
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch deployment traefik
+          -n {{ traefik_namespace }}
+          --type=json
+          --patch-file /tmp/traefik-readiness-patch.json
+      when: bootstrap_node | default(false)
+      changed_when: true
+
+    - name: Clean up Traefik readiness probe patch file
+      ansible.builtin.file:
+        path: /tmp/traefik-readiness-patch.json
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Disable default ServiceAccount token automount in Traefik namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch serviceaccount default
+          -n {{ traefik_namespace }}
+          --type=merge
+          -p '{"automountServiceAccountToken": false}'
+      register: traefik_sa_automount_result
+      changed_when: "'patched' in traefik_sa_automount_result.stdout"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Gateway
+    # Creates the traefik-gateway Gateway API resource in kube-system. This
+    # Gateway uses the traefik GatewayClass and provisions a LoadBalancer
+    # service that receives a LAN IP from the Cilium IP pool. It exposes an
+    # HTTP listener on port 80 and an HTTPS listener on port 443, both scoped
+    # to wildcard hostnames in the configured DNS zone. The HTTPS listener
+    # terminates TLS using the wildcard-tls certificate. HTTPRoutes from any
+    # namespace may attach to either listener.
+    # -------------------------------------------------------------------------
+    - name: Write Traefik Gateway manifest
+      ansible.builtin.template:
+        src: traefik-gateway.yml.j2
+        dest: /tmp/traefik-gateway.yml
+        mode: "0644"
+      when: bootstrap_node | default(false)
+
+    - name: Apply Traefik Gateway
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig={{ kubectl_config_path }} apply -f /tmp/traefik-gateway.yml
+      register: traefik_gateway_result
+      changed_when: >-
+        'created' in traefik_gateway_result.stdout or
+        'configured' in traefik_gateway_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Traefik Gateway manifest
+      ansible.builtin.file:
+        path: /tmp/traefik-gateway.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ForwardAuth Middleware (kube-system)
+    # Deploys the Traefik ForwardAuth Middleware in the kube-system namespace
+    # so that the Traefik dashboard and Hubble UI HTTPRoutes (also in
+    # kube-system) can reference it. The Middleware itself just declares an
+    # outbound URL — it can be created before Authentik is installed; it only
+    # becomes functional once cluster/authentication.yml has run and the
+    # Authentik service is reachable in the cluster.
+    # -------------------------------------------------------------------------
+    - name: Write ForwardAuth Middleware manifest for kube-system
+      ansible.builtin.template:
+        src: traefik-forward-auth-middleware.yml.j2
+        dest: /tmp/traefik-forward-auth-middleware-kube-system.yml
+        mode: '0644'
+      vars:
+        middleware_namespace: kube-system
+      when: bootstrap_node | default(false)
+
+    - name: Apply ForwardAuth Middleware in kube-system
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/traefik-forward-auth-middleware-kube-system.yml
+      register: kube_system_middleware_result
+      changed_when: >-
+        'created' in kube_system_middleware_result.stdout or
+        'configured' in kube_system_middleware_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up kube-system ForwardAuth Middleware manifest
+      ansible.builtin.file:
+        path: /tmp/traefik-forward-auth-middleware-kube-system.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Dashboard Exposure
+    # Exposes the Traefik dashboard over HTTPS via a Gateway API HTTPRoute
+    # attached to the traefik-gateway. The HTTPRoute routes traffic matching
+    # the Traefik hostname to the dashboard service on port 8080. HTTP traffic
+    # is redirected to HTTPS by the Traefik entrypoint redirect configured in
+    # traefik-values.yml.j2. The route is gated by ForwardAuth and only
+    # becomes accessible once Authentik is installed by
+    # cluster/authentication.yml.
+    # -------------------------------------------------------------------------
+    - name: Write Traefik dashboard HTTPRoute manifest
+      ansible.builtin.template:
+        src: httproute.yml.j2
+        dest: /tmp/traefik-dashboard-httproute.yml
+        mode: "0644"
+      vars:
+        httproute_name: traefik-dashboard
+        httproute_namespace: kube-system
+        httproute_hostname: '{{ traefik_hostname }}'
+        httproute_backend_name: traefik
+        httproute_backend_namespace: '{{ traefik_namespace }}'
+        httproute_backend_port: 8080
+        with_forward_auth: true
+      when: bootstrap_node | default(false)
+
+    - name: Apply Traefik dashboard HTTPRoute
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/traefik-dashboard-httproute.yml
+      register: traefik_dashboard_httproute_result
+      changed_when: >-
+        'created' in traefik_dashboard_httproute_result.stdout or
+        'configured' in traefik_dashboard_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Traefik dashboard HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/traefik-dashboard-httproute.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # cert-manager
+    # Installs cert-manager via the Jetstack Helm chart. cert-manager
+    # automates TLS certificate management in Kubernetes, providing
+    # issuance and renewal. A self-signed ClusterIssuer is created
+    # along with a wildcard Certificate for *.{{ dns_zone }}. The
+    # wildcard cert is referenced by the Gateway's HTTPS listener so
+    # all services exposed via HTTPRoute get TLS automatically without
+    # per-resource annotations.
+    # -------------------------------------------------------------------------
+    - name: Add Jetstack Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add jetstack https://charts.jetstack.io
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Update Helm repositories for cert-manager
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Install or upgrade cert-manager via Helm
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade --install cert-manager jetstack/cert-manager
+          --version v{{ cert_manager_chart_version }}
+          --namespace {{ cert_manager_namespace }}
+          --create-namespace
+          --kubeconfig {{ kubectl_config_path }}
+          --set crds.enabled=true
+      when: bootstrap_node | default(false)
+      changed_when: true
+
+    - name: Wait for cert-manager webhook to be ready
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          rollout status deployment cert-manager-webhook
+          -n {{ cert_manager_namespace }}
+          --timeout=120s
+      when: bootstrap_node | default(false)
+      changed_when: false
+
+    - name: Write self-signed ClusterIssuer manifest
+      ansible.builtin.template:
+        src: cert-manager-clusterissuer.yml.j2
+        dest: /tmp/cert-manager-clusterissuer.yml
+        mode: "0644"
+      when: bootstrap_node | default(false)
+
+    - name: Apply self-signed ClusterIssuer
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/cert-manager-clusterissuer.yml
+      register: clusterissuer_result
+      changed_when: >-
+        'created' in clusterissuer_result.stdout or
+        'configured' in clusterissuer_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up ClusterIssuer manifest
+      ansible.builtin.file:
+        path: /tmp/cert-manager-clusterissuer.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write wildcard TLS Certificate manifest
+      ansible.builtin.template:
+        src: cert-manager-wildcard-cert.yml.j2
+        dest: /tmp/cert-manager-wildcard-cert.yml
+        mode: "0644"
+      when: bootstrap_node | default(false)
+
+    - name: Apply wildcard TLS Certificate
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/cert-manager-wildcard-cert.yml
+      register: wildcard_cert_result
+      changed_when: >-
+        'created' in wildcard_cert_result.stdout or
+        'configured' in wildcard_cert_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up wildcard TLS Certificate manifest
+      ansible.builtin.file:
+        path: /tmp/cert-manager-wildcard-cert.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Hubble UI Exposure
+    # Exposes the Hubble UI over the LAN via an HTTPRoute attached to the
+    # traefik-gateway. The route is gated by ForwardAuth and only becomes
+    # accessible once Authentik is installed by cluster/authentication.yml.
+    # -------------------------------------------------------------------------
+    - name: Write Hubble HTTPRoute manifest
+      ansible.builtin.template:
+        src: httproute.yml.j2
+        dest: /tmp/hubble-httproute.yml
+        mode: "0644"
+      vars:
+        httproute_name: hubble-ui
+        httproute_namespace: kube-system
+        httproute_hostname: '{{ hubble_hostname }}'
+        httproute_backend_name: hubble-ui
+        httproute_backend_namespace: kube-system
+        httproute_backend_port: 80
+        with_forward_auth: true
+      when: bootstrap_node | default(false)
+
+    - name: Apply Hubble HTTPRoute
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/hubble-httproute.yml
+      register: hubble_httproute_result
+      changed_when: >-
+        'created' in hubble_httproute_result.stdout or
+        'configured' in hubble_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Hubble HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/hubble-httproute.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Bind9 DNS Server
+    # Deploys Bind9 as an authoritative DNS server for the homelab zone using
+    # standard Kubernetes manifests (ConfigMap, Deployment, Service). Bind9 is
+    # configured with a TSIG key to allow ExternalDNS to dynamically create
+    # and update DNS records via RFC 2136. The Service is type LoadBalancer so
+    # Bind9 receives its own dedicated LAN IP from the Cilium IP pool.
+    #
+    # The TSIG secret is auto-generated on first run and stored in a
+    # Kubernetes Secret named bind9-tsig. On subsequent runs the existing
+    # secret is reused so DNS update credentials remain stable.
+    #
+    # To find the Bind9 LAN IP after deployment, run:
+    #   kubectl get svc -n kube-system bind9
+    #
+    # Cluster nodes are configured to resolve the homelab zone via Bind9
+    # later in this playbook. For setting up additional client machines
+    # (laptops, workstations), see the Local DNS Resolution section in
+    # README.md.
+    # -------------------------------------------------------------------------
+    - name: Check if Bind9 TSIG secret already exists
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret bind9-tsig -n {{ bind9_namespace }}
+          -o jsonpath='{.data.tsig-secret}'
+      register: existing_tsig_secret
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Generate TSIG secret for Bind9
+      ansible.builtin.command:
+        cmd: openssl rand -base64 32
+      register: generated_tsig_secret
+      changed_when: false
+      when:
+        - bootstrap_node | default(false)
+        - existing_tsig_secret.rc != 0
+
+    - name: Create Bind9 TSIG Kubernetes secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic bind9-tsig
+          -n {{ bind9_namespace }}
+          --from-literal=tsig-secret={{ generated_tsig_secret.stdout }}
+      when:
+        - bootstrap_node | default(false)
+        - existing_tsig_secret.rc != 0
+      changed_when: true
+
+    - name: Set TSIG secret fact from existing or newly generated value
+      ansible.builtin.set_fact:
+        bind9_tsig_secret: >-
+          {{ (existing_tsig_secret.rc == 0)
+             | ternary(existing_tsig_secret.stdout | b64decode,
+                       generated_tsig_secret.stdout | default('')) }}
+      when: bootstrap_node | default(false)
+
+    - name: Write Bind9 manifest
+      ansible.builtin.template:
+        src: bind9.yml.j2
+        dest: /tmp/bind9.yml
+        mode: "0644"
+      when: bootstrap_node | default(false)
+
+    - name: Apply Bind9 manifest
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/bind9.yml
+      register: bind9_apply_result
+      changed_when: >-
+        'created' in bind9_apply_result.stdout or
+        'configured' in bind9_apply_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Bind9 manifest
+      ansible.builtin.file:
+        path: /tmp/bind9.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Wait for Bind9 Service to be assigned its pinned LoadBalancer IP
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get service bind9 -n {{ bind9_namespace }}
+          -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+      register: bind9_service_ip_result
+      until: bind9_service_ip_result.stdout == bind9_lb_ip
+      retries: 20
+      delay: 5
+      when: bootstrap_node | default(false)
+      changed_when: false
+
+    # -------------------------------------------------------------------------
+    # Kubernetes API DNS Record
+    # Writes an A record for the cluster's API hostname into Bind9 so kubectl
+    # can resolve kubernetes_api_hostname to the control plane IP. The record
+    # is added via nsupdate executed inside the Bind9 pod (the bind9 image
+    # ships nsupdate, avoiding a tooling dependency on the control plane
+    # node) and authenticated with the same TSIG key ExternalDNS uses for
+    # RFC 2136 updates. ExternalDNS leaves manually-managed records alone
+    # because they lack its TXT-registry ownership marker. The record is
+    # static rather than ExternalDNS-managed because the API server is not
+    # exposed via a Gateway API HTTPRoute. The local kubeconfig fetched by
+    # bootstrap.yml is then rewritten to address the API server by hostname,
+    # matching the SAN added to the apiserver serving certificate.
+    # -------------------------------------------------------------------------
+    - name: Add A record for Kubernetes API hostname via nsupdate
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          kubectl --kubeconfig={{ kubectl_config_path }} \
+            exec -n {{ bind9_namespace }} deploy/bind9 -i -- nsupdate <<EOF
+          server 127.0.0.1
+          key hmac-sha256:externaldns-key {{ bind9_tsig_secret }}
+          zone {{ dns_zone }}.
+          update delete {{ kubernetes_api_hostname }}. A
+          update add {{ kubernetes_api_hostname }}. 60 A {{ control_plane_ip }}
+          send
+          EOF
+      when: bootstrap_node | default(false)
+      changed_when: true
+      no_log: true
+
+    - name: Read current server URL from local kubeconfig
+      ansible.builtin.command:
+        cmd: >-
+          kubectl config view --raw
+          --kubeconfig={{ local_kubeconfig_path }}
+          -o jsonpath={.clusters[?(@.name=="{{ cluster_name }}")].cluster.server}
+      register: local_kubeconfig_server
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Update local kubeconfig server to address API by hostname
+      ansible.builtin.command:
+        cmd: >-
+          kubectl config set-cluster {{ cluster_name }}
+          --server=https://{{ kubernetes_api_hostname }}:{{ ufw_allowed_ports.kubernetes_api.port }}
+          --kubeconfig={{ local_kubeconfig_path }}
+      delegate_to: localhost
+      become: false
+      when:
+        - bootstrap_node | default(false)
+        - local_kubeconfig_server.stdout | default('') !=
+            'https://' + kubernetes_api_hostname + ':' +
+            (ufw_allowed_ports.kubernetes_api.port | string)
+      changed_when: true
+
+    # -------------------------------------------------------------------------
+    # Node DNS Resolver
+    # Configures systemd-resolved on every cluster node so queries for the
+    # homelab DNS zone are sent to Bind9 while all other DNS queries remain
+    # on the node's existing upstream resolvers. The drop-in uses the
+    # split-DNS routing-domain syntax (Domains=~<zone>), so a Bind9 outage
+    # only affects homelab zone resolution and never strands the node's
+    # general DNS. The Bind9 LoadBalancer IP is read from group_vars and
+    # is guaranteed to match the live Service IP because bind9.yml.j2 pins
+    # the Service's loadBalancerIP to the same value.
+    # -------------------------------------------------------------------------
+    - name: Ensure systemd-resolved drop-in directory exists
+      ansible.builtin.file:
+        path: /etc/systemd/resolved.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Configure systemd-resolved to forward homelab zone to Bind9
+      ansible.builtin.copy:
+        content: |
+          [Resolve]
+          DNS={{ bind9_lb_ip }}
+          Domains=~{{ dns_zone }}
+        dest: '/etc/systemd/resolved.conf.d/{{ dns_zone }}.conf'
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart systemd-resolved
+
+    # -------------------------------------------------------------------------
+    # ExternalDNS
+    # Deploys ExternalDNS via the kubernetes-sigs Helm chart to automatically
+    # sync DNS records from Gateway API HTTPRoute resources into Bind9 using
+    # RFC 2136 dynamic updates. ExternalDNS watches for hostnames on HTTPRoute
+    # resources and creates corresponding A records in the Bind9 zone,
+    # authenticated with the same TSIG key configured in the Bind9 named.conf.
+    # -------------------------------------------------------------------------
+    - name: Add ExternalDNS Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add external-dns https://kubernetes-sigs.github.io/external-dns/
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Update Helm repositories for ExternalDNS
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Write ExternalDNS values file
+      ansible.builtin.template:
+        src: externaldns-values.yml.j2
+        dest: /tmp/externaldns-values.yml
+        mode: "0644"
+      vars:
+        bind9_service_ip: '{{ bind9_lb_ip }}'
+      when: bootstrap_node | default(false)
+
+    - name: Install or upgrade ExternalDNS via Helm
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade --install external-dns external-dns/external-dns
+          --version {{ externaldns_chart_version }}
+          --namespace {{ bind9_namespace }}
+          --kubeconfig {{ kubectl_config_path }}
+          -f /tmp/externaldns-values.yml
+      when: bootstrap_node | default(false)
+      changed_when: true
+
+    - name: Clean up ExternalDNS values file
+      ansible.builtin.file:
+        path: /tmp/externaldns-values.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # CoreDNS Configuration
+    # Patches the CoreDNS ConfigMap to add a dedicated forwarding block for the
+    # homelab DNS zone. The homelab zone includes a hosts override that resolves
+    # authentik.<dns_zone> to Traefik's ClusterIP. This is required because
+    # Cilium LB-IPAM external IPs are announced at L2 on the LAN but are not
+    # routable from within the pod network overlay, so services that need to
+    # reach Authentik internally (e.g. Vaultwarden for OIDC discovery) must
+    # route through Traefik's ClusterIP instead. Non-overridden homelab zone
+    # queries are forwarded to the Bind9 ClusterIP, which is always reachable
+    # within the cluster via Cilium's eBPF datapath. The default zone forwards
+    # to explicit upstream DNS IPs (upstream_dns) rather than /etc/resolv.conf
+    # because nodes use systemd-resolved with a stub listener at 127.0.0.53,
+    # which is not reachable from pod network IPs.
+    # -------------------------------------------------------------------------
+    - name: Fetch Bind9 ClusterIP for CoreDNS forwarding configuration
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get service bind9 -n {{ bind9_namespace }}
+          -o jsonpath='{.spec.clusterIP}'
+      register: bind9_cluster_ip_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Fetch Traefik ClusterIP for CoreDNS hosts block override
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get service traefik -n {{ traefik_namespace }}
+          -o jsonpath='{.spec.clusterIP}'
+      register: traefik_cluster_ip_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Assemble CoreDNS Corefile content with homelab zone forward block
+      ansible.builtin.set_fact:
+        coredns_corefile: |
+          {{ dns_zone }}:53 {
+              errors
+              hosts {
+                  {{ traefik_cluster_ip_result.stdout | default('') }} authentik.{{ dns_zone }}
+                  fallthrough
+              }
+              forward . {{ bind9_cluster_ip_result.stdout }}
+              cache 30
+          }
+          .:53 {
+              errors
+              health {
+                 lameduck 5s
+              }
+              ready
+              kubernetes cluster.local in-addr.arpa ip6.arpa {
+                 pods insecure
+                 fallthrough in-addr.arpa ip6.arpa
+                 ttl 30
+              }
+              prometheus :9153
+              forward . {{ upstream_dns }} {
+                 max_concurrent 1000
+              }
+              cache 30 {
+                 disable success cluster.local
+                 disable denial cluster.local
+              }
+              loop
+              reload
+              loadbalance
+          }
+      when: bootstrap_node | default(false)
+
+    - name: Write CoreDNS ConfigMap patch file
+      ansible.builtin.copy:
+        content: "{{ {'data': {'Corefile': coredns_corefile}} | to_json }}"
+        dest: /tmp/coredns-patch.json
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply CoreDNS ConfigMap patch to forward homelab zone to Bind9 ClusterIP
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch configmap coredns -n kube-system
+          --type merge
+          --patch-file /tmp/coredns-patch.json
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Clean up CoreDNS ConfigMap patch file
+      ansible.builtin.file:
+        path: /tmp/coredns-patch.json
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Cilium CLI Installation
+    # Installs the Cilium CLI on all nodes. The CLI communicates with Cilium
+    # agent pods via the Kubernetes API and provides commands for checking
+    # cluster networking status, running connectivity tests, and enabling
+    # observability features such as Hubble. The release tarball is fetched
+    # from GitHub, the binary is extracted to /usr/local/bin for system-wide
+    # access, and the tarball is removed.
+    # -------------------------------------------------------------------------
+    - name: Get CPU architecture for Cilium CLI download
+      ansible.builtin.command:
+        cmd: dpkg --print-architecture
+      register: dpkg_arch
+      changed_when: false
+
+    - name: Download Cilium CLI tarball
+      ansible.builtin.get_url:
+        url: https://github.com/cilium/cilium-cli/releases/download/v{{ cilium_cli_version }}/cilium-linux-{{ dpkg_arch.stdout }}.tar.gz # noqa: yaml[line-length]
+        dest: /tmp/cilium-cli.tar.gz
+        mode: "0644"
+
+    - name: Extract Cilium CLI binary to /usr/local/bin
+      ansible.builtin.unarchive:
+        src: /tmp/cilium-cli.tar.gz
+        dest: /usr/local/bin
+        remote_src: true
+
+    - name: Clean up temporary Cilium CLI tarball
+      ansible.builtin.file:
+        path: /tmp/cilium-cli.tar.gz
+        state: absent
+
+  handlers:
+    - name: Restart systemd-resolved
+      ansible.builtin.service:
+        name: systemd-resolved
+        state: restarted

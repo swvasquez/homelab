@@ -1,0 +1,926 @@
+---
+# ==============================================================================
+# Playbook: Deploy Immich via ArgoCD GitOps
+# ==============================================================================
+# This playbook configures and deploys Immich, a self-hosted photo and video
+# management solution, to the Kubernetes cluster via ArgoCD GitOps. The Immich
+# Helm chart is deployed by ArgoCD from the official immich-app/immich-charts
+# repository, with per-environment configuration stored as a Helm values file
+# in the Gitea gitops repository.
+#
+# Authentik is configured as the OIDC identity provider for Immich, allowing
+# users to sign in with their Authentik credentials. An OAuth2 provider and
+# application are created in Authentik via the REST API on first run. The OIDC
+# client credentials are fetched from Authentik on every run and injected into
+# the rendered values file, so they remain consistent if the provider already
+# exists.
+#
+# PostgreSQL is managed by the CloudNativePG operator using the standard cnpg
+# PostgreSQL 17 image, which includes the pgvector extension required by
+# Immich v2.0+ for machine-learning similarity search. A cnpg Cluster resource
+# is provisioned in the immich namespace before ArgoCD syncs the Helm release.
+#
+# The Immich photo library is backed by the homelab NFS share under
+# nfs_k8s_path/immich, exposed through a static PersistentVolume and
+# PersistentVolumeClaim applied before ArgoCD syncs the Helm release. The
+# server pod runs as nonroot_uid with its primary GID set to nfs_group_gid so
+# the Immich process has write access to the NFS export directory (owned by
+# root:nfs_users, mode 2775). The NFSv4 server uses sec=sys and does not honor
+# supplemental groups for permission checks, so nfs_group_gid must be the
+# process's primary GID rather than a supplemental group. The machine-learning
+# and valkey pods have no NFS dependency and run as nonroot_uid for both
+# primary UID and GID.
+#
+# Database credentials and the application secret key are generated on first
+# run and stored in a Kubernetes Secret named immich-credentials in the immich
+# namespace. The Helm values file references this Secret so that those values
+# are never committed to the gitops repository. The OIDC client credentials
+# are committed to the gitops repository (in a private Gitea repo); for
+# production use, migrate these to Sealed Secrets or an External Secrets
+# Operator.
+#
+# The ArgoCD Application uses the multi-source feature to pull the Immich Helm
+# chart from the upstream repository while reading the Helm values file from
+# the Gitea gitops repository. Ansible commits the rendered values file to the
+# gitops repository on every run, then applies the ArgoCD Application manifest
+# via kubectl. ArgoCD syncs automatically on push via the Gitea webhook
+# registered by argocd.yml.
+#
+# The Immich HTTPRoute and Authentik ForwardAuth Middleware are applied by
+# this playbook itself in the Immich namespace.
+#
+# Run order:
+#   1. infrastructure/nfs.yml (NFS server and Kubernetes NFS path)
+#   2. cluster/authentication.yml (Authentik, Traefik, cert-manager)
+#   3. cluster/git.yml
+#   4. cluster/gitops.yml
+#   5. service/immich.yml (this playbook)
+#
+# Variables:
+#   bootstrap_node:             Boolean indicating if the host is the control
+#                               plane bootstrap node where kubectl/helm commands
+#                               run. Read from inventory host vars.
+#   dns_zone:                   DNS zone (e.g. homelab.internal). Read from
+#                               group_vars.
+#   admin_email:                Email address for the homelab admin. Read from
+#                               group_vars.
+#   immich_namespace:           Kubernetes namespace for Immich
+#                               (default: immich).
+#   immich_chart_version:       Helm chart version of Immich to deploy via
+#                               ArgoCD (default: 0.10.3).
+#   immich_image_tag:           Docker image tag for the Immich server and
+#                               machine-learning components (default: v2.0.0).
+#   immich_hostname:            FQDN for the Immich web UI, derived from
+#                               dns_zone (default: immich.<dns_zone>).
+#   immich_db_name:             PostgreSQL database name (default: immich).
+#   immich_db_username:         PostgreSQL username (default: immich).
+#   immich_db_image:            Container image for the cnpg Cluster. Immich
+#                               v2.0+ uses the standard pgvector extension
+#                               which is included in the default cnpg image
+#                               (default: ghcr.io/cloudnative-pg/postgresql:17).
+#   immich_db_storage_size:     Storage size for the Immich cnpg database PVC
+#                               (default: 5Gi).
+#   immich_library_nfs_path:    Absolute path on the NFS server for the Immich
+#                               photo library, derived from nfs_k8s_path
+#                               (default: <nfs_k8s_path>/immich).
+#   immich_library_nfs_size:    Nominal size annotation for the NFS library PV
+#                               and PVC. NFS does not enforce quotas via PVC
+#                               size (default: 10Gi).
+#   immich_storage_class:       Kubernetes StorageClass used to provision the
+#                               database and Valkey PVCs (default: longhorn).
+#   immich_gitops_path:         Path within the gitops repository where the
+#                               Immich values file is stored
+#                               (default: apps/immich).
+#   nfs_k8s_path:               Base NFS path for Kubernetes workloads. Read
+#                               from group_vars.
+#   nfs_group:                  Name of the NFS users group. Read from
+#                               group_vars.
+#   nfs_group_gid:              GID of the nfs_users group. Read from
+#                               group_vars.
+#   nfs_server_ip:              IP address of the NFS server, derived from
+#                               inventory hostvars at runtime.
+#   authentik_namespace:        Kubernetes namespace where Authentik is deployed
+#                               (default: authentik).
+#   authentik_hostname:         FQDN for the Authentik UI, derived from
+#                               dns_zone (default: authentik.<dns_zone>).
+#   authentik_signing_key_name: Name of the Authentik certificate key pair used
+#                               to sign OIDC JWTs
+#                               (default: authentik Self-signed Certificate).
+#   kubectl_config_path:        Full path to the kubectl config file
+#                               (default: /home/<ansible_user>/.kube/config).
+#   gitea_namespace:            Kubernetes namespace where Gitea is deployed
+#                               (default: gitea).
+#   gitea_admin_username:       Username of the Gitea admin account used to
+#                               push to the gitops repository
+#                               (default: gitea_admin).
+#   gitea_gitops_repo:          Name of the Gitea gitops repository
+#                               (default: gitops).
+#   argocd_namespace:           Kubernetes namespace where ArgoCD is deployed
+#                               (default: argocd).
+#   nonroot_uid:                Shared non-root UID for the machine-learning
+#                               and valkey pods, and the UID for the server
+#                               pod. Read from group_vars.
+
+- name: Deploy Immich via ArgoCD GitOps
+  hosts: nodes
+  become: true
+  become_exe: sudo.ws
+  vars:
+    immich_namespace: immich
+    immich_hostname: 'immich.{{ dns_zone }}'
+    immich_chart_version: 0.10.3
+    immich_image_tag: v2.0.0
+    immich_storage_class: longhorn
+    immich_db_name: immich
+    immich_db_username: immich
+    immich_db_image: ghcr.io/cloudnative-pg/postgresql:17
+    immich_db_storage_size: 5Gi
+    immich_library_nfs_path: '{{ nfs_k8s_path }}/immich'
+    immich_library_nfs_size: 10Gi
+    nfs_server_ip: >-
+      {{ hostvars | dict2items
+         | selectattr('value.nfs_server', 'defined')
+         | selectattr('value.nfs_server', 'equalto', true)
+         | map(attribute='value.private_ip')
+         | first }}
+    immich_gitops_path: apps/immich
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    authentik_namespace: authentik
+    authentik_hostname: 'authentik.{{ dns_zone }}'
+    authentik_signing_key_name: 'authentik Self-signed Certificate'
+    gitea_namespace: gitea
+    gitea_admin_username: gitea_admin
+    gitea_gitops_repo: gitops
+    argocd_namespace: argocd
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Namespace
+    # -------------------------------------------------------------------------
+    # Creates the Immich namespace before any other resources so that the
+    # immich-credentials Secret can be stored there before ArgoCD first syncs
+    # the Helm release.
+    # -------------------------------------------------------------------------
+    - name: Create Immich namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create namespace {{ immich_namespace }}
+      register: immich_ns_result
+      changed_when: "'created' in immich_ns_result.stdout"
+      failed_when:
+        - immich_ns_result.rc != 0
+        - "'already exists' not in immich_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Default ServiceAccount Hardening
+    # -------------------------------------------------------------------------
+    # Disables the default ServiceAccount token automount in this namespace so
+    # ad-hoc pods that don't name a ServiceAccount cannot read a usable API
+    # bearer credential.
+    # -------------------------------------------------------------------------
+    - name: Disable default ServiceAccount token automount in Immich namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch serviceaccount default
+          -n {{ immich_namespace }}
+          --type=merge
+          -p '{"automountServiceAccountToken": false}'
+      register: immich_sa_automount_result
+      changed_when: "'patched' in immich_sa_automount_result.stdout"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ForwardAuth Middleware and HTTPRoute
+    # -------------------------------------------------------------------------
+    # Deploys the Traefik ForwardAuth Middleware in the Immich namespace and
+    # exposes the Immich UI over HTTPS via an HTTPRoute attached to the
+    # traefik-gateway. Authentik gates browser access on top of Immich's own
+    # OIDC login. Authentik must already be installed
+    # (cluster/authentication.yml) for the gate to function.
+    # -------------------------------------------------------------------------
+    - name: Write ForwardAuth Middleware manifest for Immich
+      ansible.builtin.template:
+        src: ../cluster/templates/traefik-forward-auth-middleware.yml.j2
+        dest: /tmp/traefik-forward-auth-middleware-immich.yml
+        mode: '0644'
+      vars:
+        middleware_namespace: '{{ immich_namespace }}'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ForwardAuth Middleware in Immich namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/traefik-forward-auth-middleware-immich.yml
+      register: immich_middleware_result
+      changed_when: >-
+        'created' in immich_middleware_result.stdout or
+        'configured' in immich_middleware_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Immich ForwardAuth Middleware manifest
+      ansible.builtin.file:
+        path: /tmp/traefik-forward-auth-middleware-immich.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write Immich HTTPRoute manifest
+      ansible.builtin.template:
+        src: ../cluster/templates/httproute.yml.j2
+        dest: /tmp/immich-httproute.yml
+        mode: '0644'
+      vars:
+        httproute_name: immich
+        httproute_namespace: '{{ immich_namespace }}'
+        httproute_hostname: '{{ immich_hostname }}'
+        httproute_backend_name: immich-server
+        httproute_backend_namespace: '{{ immich_namespace }}'
+        httproute_backend_port: 2283
+        with_forward_auth: true
+      when: bootstrap_node | default(false)
+
+    - name: Apply Immich HTTPRoute
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/immich-httproute.yml
+      register: immich_httproute_result
+      changed_when: >-
+        'created' in immich_httproute_result.stdout or
+        'configured' in immich_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Immich HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/immich-httproute.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Credentials
+    # -------------------------------------------------------------------------
+    # Generates a database password and application secret key on first run and
+    # persists them in a Kubernetes Secret named immich-credentials in the
+    # immich namespace. The Helm values file references this Secret via
+    # secretKeyRef so that these values are never committed to the gitops
+    # repository. On subsequent runs the existing Secret is reused so
+    # credentials remain stable across upgrades.
+    # -------------------------------------------------------------------------
+    - name: Check if Immich credentials secret already exists
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret immich-credentials -n {{ immich_namespace }}
+      register: existing_immich_credentials_check
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Generate Immich database password
+      ansible.builtin.command:
+        cmd: openssl rand -base64 24
+      register: generated_immich_db_password
+      changed_when: false
+      when:
+        - bootstrap_node | default(false)
+        - existing_immich_credentials_check.rc != 0
+
+    - name: Generate Immich application secret key
+      ansible.builtin.command:
+        cmd: openssl rand -hex 32
+      register: generated_immich_secret_key
+      changed_when: false
+      when:
+        - bootstrap_node | default(false)
+        - existing_immich_credentials_check.rc != 0
+
+    - name: Create Immich credentials Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic immich-credentials
+          -n {{ immich_namespace }}
+          --from-literal=db-password={{ generated_immich_db_password.stdout }}
+          --from-literal=secret-key={{ generated_immich_secret_key.stdout }}
+      changed_when: true
+      no_log: true
+      when:
+        - bootstrap_node | default(false)
+        - existing_immich_credentials_check.rc != 0
+
+    # -------------------------------------------------------------------------
+    # Database
+    # -------------------------------------------------------------------------
+    # Provisions a CloudNativePG Cluster for Immich's PostgreSQL database using
+    # the standard cnpg PostgreSQL 17 image. Immich v2.0+ uses pgvector (not
+    # pgvecto-rs), which is included in the standard image. A cnpg-formatted
+    # credentials Secret (immich-db-credentials) is created from the
+    # db-password stored in immich-credentials. The postInitSQL bootstrap
+    # creates the extensions required by Immich before ArgoCD first syncs the
+    # Helm release.
+    # -------------------------------------------------------------------------
+    - name: Read Immich database password from credentials Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret immich-credentials -n {{ immich_namespace }}
+          -o jsonpath='{.data.db-password}'
+      register: immich_db_password_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Create Immich cnpg database credentials Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic immich-db-credentials
+          -n {{ immich_namespace }}
+          --from-literal=username={{ immich_db_username }}
+          --from-literal=password={{ immich_db_password_b64.stdout | b64decode }}
+      register: immich_db_creds_result
+      changed_when: "'created' in immich_db_creds_result.stdout"
+      failed_when:
+        - immich_db_creds_result.rc != 0
+        - "'already exists' not in immich_db_creds_result.stderr"
+      when: bootstrap_node | default(false)
+
+    - name: Write Immich cnpg Cluster manifest
+      ansible.builtin.copy:
+        dest: /tmp/immich-db-cluster.yml
+        mode: '0600'
+        content: |
+          apiVersion: postgresql.cnpg.io/v1
+          kind: Cluster
+          metadata:
+            name: immich-db
+            namespace: '{{ immich_namespace }}'
+          spec:
+            instances: 1
+            imageName: '{{ immich_db_image }}'
+            storage:
+              storageClass: '{{ immich_storage_class }}'
+              size: '{{ immich_db_storage_size }}'
+            bootstrap:
+              initdb:
+                database: '{{ immich_db_name }}'
+                owner: '{{ immich_db_username }}'
+                secret:
+                  name: immich-db-credentials
+                postInitApplicationSQL:
+                  - CREATE EXTENSION IF NOT EXISTS unaccent
+                  - CREATE EXTENSION IF NOT EXISTS "uuid-ossp"
+                  - CREATE EXTENSION IF NOT EXISTS cube
+                  - CREATE EXTENSION IF NOT EXISTS earthdistance
+                  - CREATE EXTENSION IF NOT EXISTS vector
+      when: bootstrap_node | default(false)
+
+    - name: Apply Immich cnpg Cluster manifest
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/immich-db-cluster.yml
+      register: immich_db_cluster_result
+      changed_when: >-
+        'created' in immich_db_cluster_result.stdout or
+        'configured' in immich_db_cluster_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Immich cnpg Cluster manifest
+      ansible.builtin.file:
+        path: /tmp/immich-db-cluster.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Wait for Immich cnpg Cluster to become healthy
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get cluster immich-db -n {{ immich_namespace }}
+          -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: immich_db_ready
+      until: immich_db_ready.stdout == 'True'
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Authentik OIDC Configuration
+    # -------------------------------------------------------------------------
+    # Reads the Authentik bootstrap token from the existing authentik-credentials
+    # Secret, then uses the Authentik REST API to create an OAuth2 provider and
+    # application for Immich. The provider is configured for the confidential
+    # client type with redirect URIs for both the web UI login callback and the
+    # Immich mobile app deep link. A groups scope mapping is included so that
+    # Authentik returns a groups claim in the ID token.
+    #
+    # OIDC client credentials are fetched from the Authentik API on every run
+    # so they remain consistent whether the provider was just created or already
+    # existed. All API tasks are idempotent: existing resources are detected
+    # before creation.
+    #
+    # API calls are made to the Authentik server ClusterIP, which is reachable
+    # from cluster nodes via Cilium's eBPF kube-proxy replacement.
+    # -------------------------------------------------------------------------
+    - name: Read Authentik bootstrap token from Kubernetes Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret authentik-credentials -n {{ authentik_namespace }}
+          -o jsonpath='{.data.bootstrap-token}'
+      register: authentik_bootstrap_token_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Authentik bootstrap token fact
+      ansible.builtin.set_fact:
+        authentik_bootstrap_token: '{{ authentik_bootstrap_token_b64.stdout | b64decode }}'
+      when: bootstrap_node | default(false)
+
+    - name: Get Authentik server ClusterIP
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get svc authentik-server -n {{ authentik_namespace }}
+          -o jsonpath='{.spec.clusterIP}'
+      register: authentik_server_clusterip
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Authentik API base URL fact
+      ansible.builtin.set_fact:
+        authentik_api_url: 'http://{{ authentik_server_clusterip.stdout }}/api/v3'
+      when: bootstrap_node | default(false)
+
+    - name: Get default authorization flow UUID
+      ansible.builtin.uri:
+        url: >-
+          {{ authentik_api_url }}/flows/instances/?slug=default-provider-authorization-implicit-consent
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: auth_flow_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set authorization flow UUID fact
+      ansible.builtin.set_fact:
+        authentik_auth_flow_uuid: '{{ auth_flow_result.json.results[0].pk }}'
+      when: bootstrap_node | default(false)
+
+    - name: Get default invalidation flow UUID
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/flows/instances/?slug=default-provider-invalidation-flow'
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: invalidation_flow_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set invalidation flow UUID fact
+      ansible.builtin.set_fact:
+        authentik_invalidation_flow_uuid: '{{ invalidation_flow_result.json.results[0].pk }}'
+      when: bootstrap_node | default(false)
+
+    - name: Get OIDC scope property mappings from Authentik
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/propertymappings/all/?page_size=100'
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: all_property_mappings_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set OIDC scope property mapping UUID facts
+      ansible.builtin.set_fact:
+        oidc_scope_mapping_uuids: >-
+          {{
+            all_property_mappings_result.json.results
+            | selectattr('meta_model_name', 'equalto', 'authentik_providers_oauth2.scopemapping')
+            | selectattr('name', 'in', [
+                "authentik default OAuth Mapping: OpenID 'openid'",
+                "authentik default OAuth Mapping: OpenID 'email'",
+                "authentik default OAuth Mapping: OpenID 'profile'"
+              ])
+            | map(attribute='pk')
+            | list
+          }}
+      when: bootstrap_node | default(false)
+
+    - name: Check if Authentik groups scope mapping already exists
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/propertymappings/provider/scope/?scope_name=groups'
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: existing_groups_mapping_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Create Authentik groups scope mapping
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/propertymappings/provider/scope/'
+        method: POST
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+        body_format: json
+        body:
+          name: "authentik default OAuth Mapping: OpenID 'groups'"
+          scope_name: groups
+          expression: 'return [group.name for group in request.user.ak_groups.all()]'
+        status_code: 201
+      register: create_groups_mapping_result
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - existing_groups_mapping_result.json.pagination.count == 0
+
+    - name: Set groups scope mapping UUID fact from existing mapping
+      ansible.builtin.set_fact:
+        groups_scope_mapping_uuid: '{{ existing_groups_mapping_result.json.results[0].pk }}'
+      when:
+        - bootstrap_node | default(false)
+        - existing_groups_mapping_result.json.pagination.count > 0
+
+    - name: Set groups scope mapping UUID fact from newly created mapping
+      ansible.builtin.set_fact:
+        groups_scope_mapping_uuid: '{{ create_groups_mapping_result.json.pk }}'
+      when:
+        - bootstrap_node | default(false)
+        - existing_groups_mapping_result.json.pagination.count == 0
+
+    - name: Append groups scope mapping to OIDC scope mapping UUIDs
+      ansible.builtin.set_fact:
+        oidc_scope_mapping_uuids: '{{ oidc_scope_mapping_uuids + [groups_scope_mapping_uuid] }}'
+      when: bootstrap_node | default(false)
+
+    - name: Get Authentik self-signed signing key
+      ansible.builtin.uri:
+        url: >-
+          {{ authentik_api_url }}/crypto/certificatekeypairs/?has_key=true&name={{ authentik_signing_key_name | urlencode }}
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: signing_key_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set signing key UUID fact
+      ansible.builtin.set_fact:
+        authentik_signing_key_uuid: '{{ signing_key_result.json.results[0].pk }}'
+      when: bootstrap_node | default(false)
+
+    - name: Check if Immich OAuth2 provider already exists in Authentik
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/providers/oauth2/?name=Immich'
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: existing_oidc_provider_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Create Immich OAuth2 provider in Authentik
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/providers/oauth2/'
+        method: POST
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+        body_format: json
+        body:
+          name: Immich
+          authorization_flow: '{{ authentik_auth_flow_uuid }}'
+          invalidation_flow: '{{ authentik_invalidation_flow_uuid }}'
+          property_mappings: '{{ oidc_scope_mapping_uuids }}'
+          redirect_uris:
+            - matching_mode: strict
+              url: 'https://{{ immich_hostname }}/auth/login'
+            - matching_mode: regex
+              url: 'app\.immich:/'
+          client_type: confidential
+          sub_mode: user_username
+          signing_key: '{{ authentik_signing_key_uuid }}'
+        status_code: 201
+      register: create_oidc_provider_result
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - existing_oidc_provider_result.json.pagination.count == 0
+
+    - name: Set OIDC provider ID fact from existing provider
+      ansible.builtin.set_fact:
+        immich_oidc_provider_id: '{{ existing_oidc_provider_result.json.results[0].pk }}'
+      when:
+        - bootstrap_node | default(false)
+        - existing_oidc_provider_result.json.pagination.count > 0
+
+    - name: Set OIDC provider ID fact from newly created provider
+      ansible.builtin.set_fact:
+        immich_oidc_provider_id: '{{ create_oidc_provider_result.json.pk }}'
+      when:
+        - bootstrap_node | default(false)
+        - existing_oidc_provider_result.json.pagination.count == 0
+
+    - name: Update Immich OAuth2 provider redirect URIs, property mappings, and signing key in Authentik
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/providers/oauth2/{{ immich_oidc_provider_id }}/'
+        method: PATCH
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+        body_format: json
+        body:
+          property_mappings: '{{ oidc_scope_mapping_uuids }}'
+          signing_key: '{{ authentik_signing_key_uuid }}'
+          redirect_uris:
+            - matching_mode: strict
+              url: 'https://{{ immich_hostname }}/auth/login'
+            - matching_mode: regex
+              url: 'app\.immich:/'
+        status_code: 200
+      register: patch_provider_result
+      changed_when: >-
+        (existing_oidc_provider_result.json.results[0].property_mappings | sort) !=
+        (oidc_scope_mapping_uuids | sort) or
+        existing_oidc_provider_result.json.results[0].signing_key != authentik_signing_key_uuid or
+        existing_oidc_provider_result.json.results[0].redirect_uris
+        | map(attribute='url') | sort !=
+        ['app\\.immich:/', 'https://' + immich_hostname + '/auth/login']
+      when:
+        - bootstrap_node | default(false)
+        - existing_oidc_provider_result.json.pagination.count > 0
+
+    - name: Check if Immich application already exists in Authentik
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/core/applications/?slug=immich'
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: existing_immich_app_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Create Immich application in Authentik
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/core/applications/'
+        method: POST
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+        body_format: json
+        body:
+          name: Immich
+          slug: immich
+          provider: '{{ immich_oidc_provider_id }}'
+        status_code: 201
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - existing_immich_app_result.json.pagination.count == 0
+
+    - name: Get Immich OAuth2 provider details from Authentik
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/providers/oauth2/{{ immich_oidc_provider_id }}/'
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: immich_oidc_provider_details
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set OIDC client credential facts
+      ansible.builtin.set_fact:
+        immich_oidc_client_id: '{{ immich_oidc_provider_details.json.client_id }}'
+        immich_oidc_client_secret: '{{ immich_oidc_provider_details.json.client_secret }}'
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # NFS Library Directory
+    # -------------------------------------------------------------------------
+    # Creates the Immich photo library subdirectory within the Kubernetes NFS
+    # path. Runs on the NFS server node to operate directly on the server
+    # filesystem, bypassing NFS root_squash restrictions. infrastructure/nfs.yml
+    # must have been run first to create nfs_k8s_path.
+    # -------------------------------------------------------------------------
+    - name: Create Immich library directory on NFS server
+      ansible.builtin.file:
+        path: '{{ immich_library_nfs_path }}'
+        state: directory
+        owner: root
+        group: '{{ nfs_group }}'
+        mode: '2775'
+      when: nfs_server | default(false)
+
+    # -------------------------------------------------------------------------
+    # NFS Library PersistentVolume
+    # -------------------------------------------------------------------------
+    # Applies a static PersistentVolume and PersistentVolumeClaim for the
+    # Immich photo library backed by the NFS share. These are applied before
+    # ArgoCD syncs the Helm release so the PVC exists when the chart references
+    # it via existingClaim. The PV uses Retain reclaim policy so library data
+    # is not deleted if the PVC is removed.
+    # -------------------------------------------------------------------------
+    - name: Write Immich NFS library PV manifest
+      ansible.builtin.template:
+        src: templates/immich-nfs-library-pv.yml.j2
+        dest: /tmp/immich-nfs-library-pv.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Apply Immich NFS library PV and PVC
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/immich-nfs-library-pv.yml
+      register: immich_pv_result
+      changed_when: >-
+        'created' in immich_pv_result.stdout or
+        'configured' in immich_pv_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Immich NFS library PV manifest
+      ansible.builtin.file:
+        path: /tmp/immich-nfs-library-pv.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # GitOps - Helm Values Management
+    # -------------------------------------------------------------------------
+    # Renders the Immich Helm values file from a Jinja2 template and commits it
+    # to the Gitea gitops repository under apps/immich/values.yml. ArgoCD reads
+    # this file via the multi-source Application and syncs the Helm release
+    # whenever the file changes. The Gitea webhook registered by argocd.yml
+    # triggers an immediate sync on every push.
+    #
+    # Git operations run on the bootstrap node using the Gitea admin credentials
+    # from the gitea-credentials Secret. The gitops repository is cloned to
+    # /tmp/gitops-immich, the values file is written, and the commit is pushed.
+    # The temporary directory is removed on completion or if the playbook is
+    # re-run and the directory already exists (pull instead of clone).
+    # -------------------------------------------------------------------------
+    - name: Ensure git is installed
+      ansible.builtin.apt:
+        name: git
+        state: present
+      when: bootstrap_node | default(false)
+
+    - name: Get Gitea pod IP
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get pod -n {{ gitea_namespace }}
+          -l app.kubernetes.io/name=gitea,app.kubernetes.io/instance=gitea
+          -o jsonpath='{.items[0].status.podIP}'
+      register: gitea_pod_ip
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Read Gitea admin password from Kubernetes Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret gitea-credentials -n {{ gitea_namespace }}
+          -o jsonpath='{.data.admin-password}'
+      register: gitea_admin_password_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Gitea admin password fact
+      ansible.builtin.set_fact:
+        gitea_admin_password: '{{ gitea_admin_password_b64.stdout | b64decode }}'
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Clone or update gitops repository in temporary directory
+      ansible.builtin.git:
+        repo: >-
+          http://{{ gitea_admin_username }}:{{ gitea_admin_password }}@{{ gitea_pod_ip.stdout }}:3000/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}
+        dest: /tmp/gitops-immich
+        version: main
+        update: true
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Create Immich directory in gitops repository
+      ansible.builtin.file:
+        path: '/tmp/gitops-immich/{{ immich_gitops_path }}'
+        state: directory
+        mode: '0755'
+      when: bootstrap_node | default(false)
+
+    - name: Write Immich Helm values file to gitops repository
+      ansible.builtin.template:
+        src: templates/immich-values.yml.j2
+        dest: '/tmp/gitops-immich/{{ immich_gitops_path }}/values.yml'
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Configure git user email for commit  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-immich config user.email 'ansible@{{ dns_zone }}'
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Configure git user name for commit  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-immich config user.name Ansible
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set gitops repository remote URL with credentials for push  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-immich remote set-url origin
+          http://{{ gitea_admin_username }}:{{ gitea_admin_password }}@{{ gitea_pod_ip.stdout }}:3000/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}
+      no_log: true
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Stage Immich values file in gitops repository  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-immich add {{ immich_gitops_path }}/values.yml
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Check for staged changes in gitops repository  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-immich diff --cached --exit-code
+      register: gitops_diff_result
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Commit Immich values file to gitops repository  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-immich commit -m 'chore: update immich helm values'
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - gitops_diff_result.rc != 0
+
+    - name: Push Immich values commit to Gitea  # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-immich push origin main
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - gitops_diff_result.rc != 0
+
+    - name: Clean up gitops temporary directory
+      ansible.builtin.file:
+        path: /tmp/gitops-immich
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ArgoCD Application
+    # -------------------------------------------------------------------------
+    # Renders the ArgoCD Application manifest from a Jinja2 template and applies
+    # it to the cluster via kubectl. The Application uses the multi-source
+    # feature to pull the Immich Helm chart from the upstream immich-app/immich-
+    # charts repository while reading the Helm values file from the Gitea gitops
+    # repository. ArgoCD syncs automatically when the values file is pushed.
+    # -------------------------------------------------------------------------
+    - name: Write ArgoCD Application manifest for Immich
+      ansible.builtin.template:
+        src: templates/immich-app.yml.j2
+        dest: /tmp/immich-app.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ArgoCD Application manifest for Immich
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/immich-app.yml
+      register: argocd_app_result
+      changed_when: >-
+        'configured' in argocd_app_result.stdout or
+        'created' in argocd_app_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up ArgoCD Application manifest for Immich
+      ansible.builtin.file:
+        path: /tmp/immich-app.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Trigger ArgoCD hard refresh to detect new gitops commit
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch application immich -n {{ argocd_namespace }}
+          --type merge
+          -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Wait for ArgoCD to sync and deploy Immich
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get application immich -n {{ argocd_namespace }}
+          -o jsonpath='{.status.sync.status},{.status.health.status}'
+      register: argocd_status
+      until: argocd_status.stdout == 'Synced,Healthy'
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: bootstrap_node | default(false)

@@ -1,0 +1,749 @@
+---
+# ==============================================================================
+# Playbook: Cluster Security Hardening
+# ==============================================================================
+# Hardens the Kubernetes cluster in three plays: namespace-level hardening
+# (Pod Security Admission and ServiceAccount token automount), Falco
+# runtime security deployment, and Kyverno admission policy engine
+# deployment with a starter set of Enforce-mode ClusterPolicies.
+#
+# Play 1 — Pod Security Admission Defaults and Namespace Hardening:
+#   Configures the built-in Pod Security Admission controller with cluster-wide
+#   defaults so that every namespace is protected without requiring per-namespace
+#   labels. Built-in namespace behavior is permissive (privileged) unless
+#   labeled — this playbook inverts that to fail-closed: new namespaces inherit
+#   the configured default ('restricted') and can only opt down via explicit
+#   exemption in the admission config (true infra namespaces) or via a
+#   per-namespace 'pod-security.kubernetes.io/enforce' label (e.g. vLLM).
+#
+#   Actions:
+#   - Writes an AdmissionConfiguration file to /etc/kubernetes/admission/ on
+#     the control plane node. The file lists the cluster-wide default PSA
+#     level ('restricted') for enforce, warn, and audit, and the exempt
+#     namespaces that legitimately need host access (CNI, CSI, observability,
+#     Falco, Kyverno).
+#   - Idempotently patches the static kube-apiserver.yaml pod manifest to
+#     (a) pass --admission-control-config-file to the apiserver,
+#     (b) mount /etc/kubernetes/admission into the apiserver container, and
+#     (c) declare the corresponding hostPath volume.
+#   - The edits are staged in a single temporary copy of the manifest and
+#     atomically moved into /etc/kubernetes/manifests/ in one step, so the
+#     kubelet never observes a partially-updated manifest.
+#   - Waits for the kube-apiserver to return healthy on /livez before
+#     proceeding, so failures surface immediately.
+#   - Patches the 'default' ServiceAccount in the 'default' namespace to set
+#     automountServiceAccountToken: false. Kubernetes mounts this token into
+#     every pod that does not name a specific ServiceAccount, giving any
+#     process inside the container a usable API credential even when it has
+#     no need for one. Disabling automount removes the token from the pod
+#     filesystem entirely. Workloads that legitimately need API access already
+#     use named ServiceAccounts and are unaffected. Per-service namespaces
+#     are NOT touched here — each service playbook is responsible for the
+#     same patch in its own namespace, so adding a new service does not
+#     require re-running this playbook.
+#
+# Play 2 — Falco Runtime Security:
+#   Deploys Falco via Helm to every node as a DaemonSet. Falco watches kernel
+#   syscalls via the modern eBPF driver (CO-RE, no kernel module required) and
+#   evaluates events against the default ruleset plus custom homelab rules.
+#   Falcosidekick is deployed alongside Falco and forwards alerts to
+#   Alertmanager so they appear in Grafana alongside existing cluster metrics.
+#
+#   Custom homelab rules detect:
+#   - Kubeconfig file read from inside a container (credential theft)
+#   - Unexpected process spawned in a database pod (CNPG compromise)
+#   - Crypto mining heuristics (stratum protocol, mining pool ports)
+#
+#   Several default rules are disabled via override because they fire
+#   continuously on legitimate cluster components (CNPG WAL archiving,
+#   Longhorn iSCSI, longhorn-instance-manager loopback gRPC). See the
+#   header in falco-values.yml.j2 for the full list and rationale.
+#
+#   Falco requires privileged kernel access to read eBPF events and must be
+#   exempt from the cluster's restricted PSA default. The falco namespace is
+#   listed in psa_exempt_namespaces in Play 1.
+#
+# Play 3 — Kyverno Admission Policy Engine:
+#   Deploys Kyverno via Helm and applies three ClusterPolicies enforcing
+#   workload-level hygiene rules PSA cannot express on its own:
+#
+#   - disallow-latest-tag:            deny ':latest' or untagged images
+#   - disallow-sa-token-override:     deny pods using the default SA with
+#                                     automountServiceAccountToken: true
+#   - disallow-nodeport-externalname: deny NodePort and ExternalName
+#                                     Services in app namespaces — these
+#                                     bypass Traefik and ForwardAuth
+#
+#   All three policies use validationFailureAction: Enforce — Kyverno's
+#   admission webhook blocks non-compliant Pods and Services at create or
+#   update time, and PolicyReports are still emitted for visibility.
+#
+#   Each policy targets app namespaces only via a namespaceSelector that
+#   excludes the PSA-exempt system namespaces — Kyverno does not fire on
+#   workloads that legitimately need elevated permissions (Falco eBPF,
+#   Longhorn CSI, vLLM ROCm, observability node-exporter, etc.).
+#
+#   The kyverno namespace itself is exempt from PSA enforcement (added to
+#   psa_exempt_namespaces in Play 1) because the admission, reports, and
+#   cleanup controllers cannot run under the cluster's restricted default.
+#
+# Run this playbook after observability.yml (Falcosidekick requires Alertmanager).
+# It is idempotent — re-running is a no-op when the cluster is already hardened.
+# Playbook order: bootstrap.yml → network.yml → storage.yml → database.yml →
+#                 observability.yml → authentication.yml → security.yml
+#
+# Validation — PSA (after the playbook completes, from any machine with kubectl):
+#
+#   kubectl -n immich run pwn --image=alpine --restart=Never \
+#     --overrides='{"spec":{"containers":[{"name":"pwn","image":"alpine",
+#     "securityContext":{"privileged":true}}]}}' -- sleep 60
+#
+# Expected:
+#   Error from server (Forbidden): pods "pwn" is forbidden: violates
+#   PodSecurity "restricted:latest": privileged (container "pwn" must not set
+#   securityContext.privileged=true)
+#
+# Validation — SA automount (after the playbook completes):
+#
+#   kubectl get sa default -n gitea -o jsonpath='{.automountServiceAccountToken}'
+#
+# Expected: false
+#
+# Validation — Falco (trigger a detection from any machine with kubectl):
+#
+#   kubectl -n default run falco-test --image=alpine --restart=Never \
+#     --rm -it -- sh
+#
+# Expected: Falco emits an alert for "Terminal shell in container" and
+# Falcosidekick forwards it to Alertmanager within a few seconds.
+#
+# Validation — Kyverno (after the playbook completes):
+#
+#   kubectl get clusterpolicy
+#   kubectl get policyreport -A
+#   kubectl get clusterpolicyreport
+#
+# Expected: three ClusterPolicies in 'Ready' state and a populated set of
+# PolicyReport / ClusterPolicyReport objects across the app namespaces.
+# Each report lists 'pass' / 'fail' / 'warn' counts per policy. Inspect
+# any 'fail' entries with:
+#
+#   kubectl get policyreport -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.summary}{"\n"}{end}'
+#
+# Rollback — PSA: delete the --admission-control-config-file line, the
+# admission-config volumeMount, and the admission-config volume from
+# /etc/kubernetes/manifests/kube-apiserver.yaml. The kubelet reloads the
+# apiserver automatically.
+#
+# Rollback — SA automount: kubectl patch serviceaccount default -n <ns>
+# --type=merge -p '{"automountServiceAccountToken": null}' to restore the
+# Kubernetes default (inherits true from the namespace).
+#
+# Rollback — Falco: helm uninstall falco -n falco
+#
+# Rollback — Kyverno: kubectl delete -f the three ClusterPolicies (or
+# kubectl delete clusterpolicy disallow-latest-tag
+#   disallow-sa-token-override disallow-nodeport-externalname),
+# then 'helm uninstall kyverno -n kyverno' and
+# 'kubectl delete namespace kyverno'.
+#
+# Variables — Play 1 (PSA):
+#   admission_config_dir:      Directory on the control plane node where the
+#                              admission configuration file is stored
+#                              (default: /etc/kubernetes/admission).
+#   admission_config_path:     Full path to the admission configuration file
+#                              (default:
+#                              /etc/kubernetes/admission/pod-security.yaml).
+#   apiserver_manifest_path:   Full path to the kube-apiserver static pod
+#                              manifest managed by kubelet
+#                              (default:
+#                              /etc/kubernetes/manifests/kube-apiserver.yaml).
+#   apiserver_manifest_staging_path: Temporary path used to stage edits before
+#                              atomically promoting the file into the manifests
+#                              directory. Must be on the same filesystem as
+#                              apiserver_manifest_path so the final copy is
+#                              atomic and kubelet never observes a partial
+#                              write (default:
+#                              /etc/kubernetes/kube-apiserver.yaml.staging).
+#   apiserver_health_url:      URL polled on the control plane node to confirm
+#                              the apiserver has returned to a healthy state
+#                              after the static pod manifest is updated
+#                              (default: https://127.0.0.1:6443/livez).
+#   apiserver_reload_wait_seconds: Seconds to pause after the manifest is
+#                              updated before polling apiserver health, to
+#                              give the kubelet time to detect the change and
+#                              recreate the pod (default: 30).
+#   apiserver_health_retries:  Number of times to poll apiserver_health_url
+#                              before failing (default: 60).
+#   apiserver_health_delay:    Seconds between apiserver health polls
+#                              (default: 2).
+#   psa_default_level:         Pod Security Standard applied as the
+#                              cluster-wide default for enforce, warn, and
+#                              audit (default: restricted).
+#   psa_exempt_namespaces:     Namespaces exempt from PSA enforcement. These
+#                              host infrastructure workloads that require host
+#                              access (CNI, CSI, GPU, node-exporter, Falco
+#                              eBPF, Kyverno webhooks) and cannot run under
+#                              the cluster default. App service namespaces are
+#                              NOT listed here — services that need to opt out
+#                              of the cluster default must label their own
+#                              namespace from their own playbook (default:
+#                              kube-system, kube-public, kube-node-lease,
+#                              longhorn-system, cnpg-system, cert-manager,
+#                              observability, falco, kyverno).
+#   kubectl_config_path:       Full path to the kubectl config file used on
+#                              the control plane
+#                              (default: /home/<ansible_user>/.kube/config).
+#
+# Variables — Play 2 (Falco):
+#   falco_namespace:           Kubernetes namespace for Falco and Falcosidekick
+#                              (default: falco).
+#   falco_chart_version:       Helm chart version of falcosecurity/falco to
+#                              install (default: 8.0.2).
+#   falco_alertmanager_hostport: URL of the Alertmanager instance that
+#                              Falcosidekick forwards alerts to. Defaults to
+#                              the kube-prometheus-stack Alertmanager deployed
+#                              by observability.yml (default:
+#                              http://kube-prometheus-stack-alertmanager.
+#                              observability.svc.cluster.local:9093).
+#   falco_ui_hostname:         FQDN for the Falcosidekick web UI, derived from
+#                              dns_zone (default: falco.<dns_zone>).
+#   falco_sensitive_file_container_only: When true, the 'Read sensitive file
+#                              untrusted' rule only fires for container
+#                              processes, suppressing host-level noise from
+#                              tools like Ansible. Read from group_vars
+#                              (default: false).
+#   kubectl_config_path:       Full path to the kubectl config file used on
+#                              the control plane
+#                              (default: /home/<ansible_user>/.kube/config).
+#
+# Variables — Play 3 (Kyverno):
+#   kyverno_namespace:         Kubernetes namespace for the Kyverno control
+#                              plane (default: kyverno).
+#   kyverno_chart_version:     Helm chart version of kyverno/kyverno to
+#                              install (default: 3.7.2).
+#   kyverno_app_namespace_selector: Label selector that scopes every
+#                              ClusterPolicy match block to application
+#                              namespaces only. Implemented as two
+#                              expressions: a NotIn on
+#                              'kubernetes.io/metadata.name' that excludes
+#                              true infrastructure namespaces, and a
+#                              DoesNotExist on
+#                              'homelab.internal/kyverno-exempt' so any
+#                              service that legitimately needs elevated
+#                              permissions can opt itself out by labeling
+#                              its own namespace from its own playbook —
+#                              cluster/security.yml does not need to know
+#                              about it (default excludes: kube-system,
+#                              longhorn-system, cnpg-system, cert-manager,
+#                              observability, falco).
+#   kyverno_policies:          List of ClusterPolicy template basenames
+#                              applied after the chart finishes installing.
+#                              Each entry maps to
+#                              templates/kyverno-<name>.yml.j2
+#                              (default: disallow-latest-tag,
+#                              disallow-sa-token-override,
+#                              disallow-nodeport-externalname).
+#   kubectl_config_path:       Full path to the kubectl config file used on
+#                              the control plane
+#                              (default: /home/<ansible_user>/.kube/config).
+
+- name: Harden namespace defaults and Pod Security Admission
+  hosts: nodes
+  become: true
+  become_exe: sudo.ws
+  vars:
+    admission_config_dir: /etc/kubernetes/admission
+    admission_config_path: /etc/kubernetes/admission/pod-security.yaml
+    apiserver_manifest_path: /etc/kubernetes/manifests/kube-apiserver.yaml
+    apiserver_manifest_staging_path: /etc/kubernetes/kube-apiserver.yaml.staging
+    apiserver_health_url: 'https://127.0.0.1:6443/livez'
+    apiserver_reload_wait_seconds: 30
+    apiserver_health_retries: 60
+    apiserver_health_delay: 2
+    psa_default_level: restricted
+    psa_exempt_namespaces:
+      - kube-system
+      - kube-public
+      - kube-node-lease
+      - longhorn-system
+      - cnpg-system
+      - cert-manager
+      - observability
+      - falco
+      - kyverno
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Admission Configuration File
+    # -------------------------------------------------------------------------
+    # Writes the AdmissionConfiguration YAML consumed by the apiserver via
+    # --admission-control-config-file. The file declares the cluster-wide PSA
+    # default profile and the namespace exemption list. The directory is
+    # mounted read-only into the apiserver container.
+    # -------------------------------------------------------------------------
+    - name: Create admission configuration directory on control plane
+      ansible.builtin.file:
+        path: '{{ admission_config_dir }}'
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      when: control_plane | default(false)
+
+    - name: Write Pod Security Admission configuration file
+      ansible.builtin.template:
+        src: pod-security-admission.yml.j2
+        dest: '{{ admission_config_path }}'
+        owner: root
+        group: root
+        mode: '0600'
+      when: control_plane | default(false)
+
+    # -------------------------------------------------------------------------
+    # kube-apiserver Static Pod Manifest Patching
+    # -------------------------------------------------------------------------
+    # Idempotently adds four elements to the apiserver static pod manifest:
+    #   - the --admission-control-config-file command flag
+    #   - a volumeMount exposing admission_config_dir inside the container
+    #   - a hostPath volume backing the above mount
+    #   - an annotation stamping the admission config file's SHA-256 so the
+    #     manifest's pod hash changes whenever the admission config contents
+    #     change. Kubelet compares pod hashes and only recreates the apiserver
+    #     when the hash differs, so without this stamp a pure content change
+    #     in the admission config (e.g. flipping psa_default_level from
+    #     baseline to restricted) leaves the running apiserver on its stale
+    #     in-memory config until an unrelated manifest edit eventually
+    #     triggers a restart.
+    #
+    # All edits are staged in a temporary copy of the manifest and then
+    # atomically promoted into /etc/kubernetes/manifests/ in a single copy
+    # step. Because the staging path is on the same filesystem as the target,
+    # the final copy performs a rename(2) under the hood and the kubelet
+    # never observes a partially-updated manifest.
+    # -------------------------------------------------------------------------
+    - name: Read admission config file checksum for manifest annotation
+      ansible.builtin.stat:
+        path: '{{ admission_config_path }}'
+        checksum_algorithm: sha256
+      register: admission_config_stat
+      when: bootstrap_node | default(false)
+
+    - name: Stage a working copy of the kube-apiserver manifest
+      ansible.builtin.copy:
+        src: '{{ apiserver_manifest_path }}'
+        dest: '{{ apiserver_manifest_staging_path }}'
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0600'
+      when: bootstrap_node | default(false)
+      changed_when: false
+
+    - name: Ensure admission-control-config-file flag is present in staged manifest
+      ansible.builtin.lineinfile:
+        path: '{{ apiserver_manifest_staging_path }}'
+        regexp: '^    - --admission-control-config-file='
+        line: '    - --admission-control-config-file={{ admission_config_path }}'
+        insertafter: '^    - --allow-privileged=true$'
+        state: present
+      when: bootstrap_node | default(false)
+
+    - name: Ensure PSA volumeMount is present in staged manifest
+      ansible.builtin.blockinfile:
+        path: '{{ apiserver_manifest_staging_path }}'
+        marker: '    # {mark} ANSIBLE MANAGED: pod-security admission volumeMount'
+        insertafter: '^    volumeMounts:$'
+        block: |2
+              - mountPath: {{ admission_config_dir }}
+                name: admission-config
+                readOnly: true
+      when: bootstrap_node | default(false)
+
+    - name: Ensure PSA hostPath volume is present in staged manifest
+      ansible.builtin.blockinfile:
+        path: '{{ apiserver_manifest_staging_path }}'
+        marker: '  # {mark} ANSIBLE MANAGED: pod-security admission volume'
+        insertafter: '^  volumes:$'
+        block: |2
+            - hostPath:
+                path: {{ admission_config_dir }}
+                type: DirectoryOrCreate
+              name: admission-config
+      when: bootstrap_node | default(false)
+
+    - name: Stamp admission config SHA-256 annotation into staged manifest
+      ansible.builtin.lineinfile:
+        path: '{{ apiserver_manifest_staging_path }}'
+        regexp: '^    homelab\.internal/psa-admission-config-sha256: '
+        line: '    homelab.internal/psa-admission-config-sha256: "{{ admission_config_stat.stat.checksum }}"'
+        insertafter: '^  annotations:$'
+        state: present
+      when: bootstrap_node | default(false)
+
+    - name: Promote staged manifest atomically into the kubelet manifests directory
+      ansible.builtin.copy:
+        src: '{{ apiserver_manifest_staging_path }}'
+        dest: '{{ apiserver_manifest_path }}'
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0600'
+      register: apiserver_manifest_promote
+      when: bootstrap_node | default(false)
+
+    - name: Remove staged manifest
+      ansible.builtin.file:
+        path: '{{ apiserver_manifest_staging_path }}'
+        state: absent
+      when: bootstrap_node | default(false)
+      changed_when: false
+
+    # -------------------------------------------------------------------------
+    # Apiserver Health Verification
+    # -------------------------------------------------------------------------
+    # After a real manifest change, kubelet detects the modification on its
+    # next sync (default file-check-frequency is 20 seconds) and recreates
+    # the apiserver static pod. We pause long enough to guarantee the reload
+    # window has elapsed, then poll /livez on the control plane until the new
+    # apiserver reports healthy. A misconfigured admission file would
+    # crashloop the apiserver and surface here rather than silently.
+    # -------------------------------------------------------------------------
+    - name: Pause to allow kubelet to detect the updated kube-apiserver manifest
+      ansible.builtin.pause:
+        seconds: '{{ apiserver_reload_wait_seconds }}'
+      when:
+        - bootstrap_node | default(false)
+        - apiserver_manifest_promote.changed
+
+    - name: Wait for kube-apiserver /livez to report healthy
+      ansible.builtin.uri:
+        url: '{{ apiserver_health_url }}'
+        validate_certs: false
+        status_code: 200
+      register: apiserver_livez
+      until: apiserver_livez.status == 200
+      retries: '{{ apiserver_health_retries }}'
+      delay: '{{ apiserver_health_delay }}'
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Default Namespace Hardening
+    # -------------------------------------------------------------------------
+    # The 'default' namespace is created by Kubernetes itself, so no service
+    # playbook owns it. Patch its default ServiceAccount to disable token
+    # automount so ad-hoc debug pods dropped there cannot read a usable API
+    # bearer credential by accident.
+    #
+    # Per-service namespaces are NOT touched here. Each service playbook is
+    # responsible for hardening its own namespace (PSA labels and SA
+    # automount) so that adding a new service does not require re-running
+    # this playbook.
+    # -------------------------------------------------------------------------
+    - name: Disable default ServiceAccount token automount in default namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch serviceaccount default
+          -n default
+          --type=merge
+          -p '{"automountServiceAccountToken": false}'
+      register: sa_automount_default_result
+      changed_when: "'patched' in sa_automount_default_result.stdout"
+      when: bootstrap_node | default(false)
+
+- name: Deploy Falco runtime security
+  hosts: nodes
+  become: true
+  become_exe: sudo.ws
+  vars:
+    falco_namespace: falco
+    falco_chart_version: 8.0.2
+    falco_alertmanager_hostport: >-
+      http://kube-prometheus-stack-alertmanager.observability.svc.cluster.local:9093
+    falco_ui_hostname: 'falco.{{ dns_zone }}'
+    authentik_namespace: authentik
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Namespace
+    # -------------------------------------------------------------------------
+    # Creates the falco namespace before the Helm install. The namespace is
+    # intentionally exempt from the cluster's restricted PSA default (see
+    # psa_exempt_namespaces in Play 1) because Falco DaemonSet pods require
+    # CAP_SYS_ADMIN and BPF capabilities to attach eBPF programs to the host
+    # kernel.
+    # -------------------------------------------------------------------------
+    - name: Create falco namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create namespace {{ falco_namespace }}
+      register: falco_ns_result
+      changed_when: "'created' in falco_ns_result.stdout"
+      failed_when:
+        - falco_ns_result.rc != 0
+        - "'already exists' not in falco_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Falco Installation
+    # -------------------------------------------------------------------------
+    # Installs Falco via the official falcosecurity Helm chart. The modern_ebpf
+    # driver is selected so no kernel module or separate eBPF probe download is
+    # required — the driver uses CO-RE (Compile Once, Run Everywhere) and works
+    # on kernels 5.8+. Falcosidekick is deployed as a subchart and configured
+    # to forward alerts to Alertmanager.
+    # -------------------------------------------------------------------------
+    - name: Add falcosecurity Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add falcosecurity https://falcosecurity.github.io/charts
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Update Helm repositories
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Write Falco values file
+      ansible.builtin.template:
+        src: falco-values.yml.j2
+        dest: /tmp/falco-values.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Install or upgrade Falco via Helm
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade --install falco
+          falcosecurity/falco
+          --namespace {{ falco_namespace }}
+          --kubeconfig {{ kubectl_config_path }}
+          --values /tmp/falco-values.yml
+          --version {{ falco_chart_version }}
+          --timeout 10m
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Falco values file
+      ansible.builtin.file:
+        path: /tmp/falco-values.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ForwardAuth Middleware (falco)
+    # -------------------------------------------------------------------------
+    # Deploys the Traefik ForwardAuth Middleware in the falco namespace so
+    # that the Falcosidekick UI HTTPRoute can reference it. Authentik must
+    # already be installed (cluster/authentication.yml runs before this
+    # playbook) for the Middleware to be functional.
+    # -------------------------------------------------------------------------
+    - name: Write ForwardAuth Middleware manifest for falco
+      ansible.builtin.template:
+        src: traefik-forward-auth-middleware.yml.j2
+        dest: /tmp/traefik-forward-auth-middleware-falco.yml
+        mode: '0644'
+      vars:
+        middleware_namespace: '{{ falco_namespace }}'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ForwardAuth Middleware in falco namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/traefik-forward-auth-middleware-falco.yml
+      register: falco_middleware_result
+      changed_when: >-
+        'created' in falco_middleware_result.stdout or
+        'configured' in falco_middleware_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up falco ForwardAuth Middleware manifest
+      ansible.builtin.file:
+        path: /tmp/traefik-forward-auth-middleware-falco.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # UI Exposure
+    # -------------------------------------------------------------------------
+    # Exposes the Falcosidekick web UI over HTTPS via a Gateway API HTTPRoute
+    # attached to the traefik-gateway. ForwardAuth is required because
+    # Falcosidekick UI has no built-in authentication. ExternalDNS registers
+    # the hostname in Bind9 once the HTTPRoute is accepted by the Gateway.
+    # -------------------------------------------------------------------------
+    - name: Write Falcosidekick UI HTTPRoute manifest
+      ansible.builtin.template:
+        src: httproute.yml.j2
+        dest: /tmp/falco-ui-httproute.yml
+        mode: '0644'
+      vars:
+        httproute_name: falco-ui
+        httproute_namespace: '{{ falco_namespace }}'
+        httproute_hostname: '{{ falco_ui_hostname }}'
+        httproute_backend_name: falco-falcosidekick-ui
+        httproute_backend_namespace: '{{ falco_namespace }}'
+        httproute_backend_port: 2802
+        with_forward_auth: true
+      when: bootstrap_node | default(false)
+
+    - name: Apply Falcosidekick UI HTTPRoute
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/falco-ui-httproute.yml
+      register: falco_ui_httproute_result
+      changed_when: >-
+        'created' in falco_ui_httproute_result.stdout or
+        'configured' in falco_ui_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Falcosidekick UI HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/falco-ui-httproute.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+- name: Deploy Kyverno admission policy engine
+  hosts: nodes
+  become: true
+  become_exe: sudo.ws
+  vars:
+    kyverno_namespace: kyverno
+    kyverno_chart_version: 3.7.2
+    kyverno_app_namespace_selector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - kube-system
+            - longhorn-system
+            - cnpg-system
+            - cert-manager
+            - observability
+            - falco
+        - key: homelab.internal/kyverno-exempt
+          operator: DoesNotExist
+    kyverno_policies:
+      - disallow-latest-tag
+      - disallow-sa-token-override
+      - disallow-nodeport-externalname
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Namespace
+    # -------------------------------------------------------------------------
+    # Creates the kyverno namespace before the Helm install. The namespace is
+    # exempt from the cluster's restricted PSA default (see psa_exempt_namespaces
+    # in Play 1) — the admission, reports, and cleanup controllers all need
+    # to read every incoming resource and emit metrics, which is incompatible
+    # with the readOnlyRootFilesystem and capability drops required by the
+    # restricted profile.
+    # -------------------------------------------------------------------------
+    - name: Create kyverno namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create namespace {{ kyverno_namespace }}
+      register: kyverno_ns_result
+      changed_when: "'created' in kyverno_ns_result.stdout"
+      failed_when:
+        - kyverno_ns_result.rc != 0
+        - "'already exists' not in kyverno_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Kyverno Installation
+    # -------------------------------------------------------------------------
+    # Installs Kyverno via the official kyverno/kyverno Helm chart. The chart
+    # ships four controllers (admission, background, reports, cleanup) plus
+    # the Kyverno CRDs. Resource limits in the values template are tuned for
+    # the homelab cluster's modest CPU and memory headroom.
+    # -------------------------------------------------------------------------
+    - name: Add kyverno Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add kyverno https://kyverno.github.io/kyverno/
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Update Helm repositories
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Write Kyverno values file
+      ansible.builtin.template:
+        src: kyverno-values.yml.j2
+        dest: /tmp/kyverno-values.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Install or upgrade Kyverno via Helm
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade --install kyverno
+          kyverno/kyverno
+          --namespace {{ kyverno_namespace }}
+          --kubeconfig {{ kubectl_config_path }}
+          --values /tmp/kyverno-values.yml
+          --version {{ kyverno_chart_version }}
+          --timeout 10m
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Kyverno values file
+      ansible.builtin.file:
+        path: /tmp/kyverno-values.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Starter ClusterPolicies
+    # -------------------------------------------------------------------------
+    # Renders each ClusterPolicy template into /tmp, applies it via kubectl,
+    # then cleans up the rendered file. Every policy carries
+    # validationFailureAction: Enforce — Kyverno's admission webhook blocks
+    # non-compliant Pods and Services at create/update time, and
+    # PolicyReports are still emitted for visibility.
+    #
+    # Each policy's match block scopes to app namespaces only via the shared
+    # kyverno_app_namespace_selector — the PSA-exempt system namespaces
+    # (Falco eBPF, Longhorn CSI, observability node-exporter, cert-manager,
+    # CNPG operator, kube-system) plus any namespace labeled
+    # 'homelab.internal/kyverno-exempt' (e.g. vLLM, applied by the service
+    # playbook itself) are excluded because they legitimately need elevated
+    # permissions that these rules would otherwise flag.
+    # -------------------------------------------------------------------------
+    - name: Write Kyverno ClusterPolicy manifests
+      ansible.builtin.template:
+        src: 'kyverno-{{ item }}.yml.j2'
+        dest: '/tmp/kyverno-{{ item }}.yml'
+        mode: '0644'
+      loop: '{{ kyverno_policies }}'
+      when: bootstrap_node | default(false)
+
+    - name: Apply Kyverno ClusterPolicies
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/kyverno-{{ item }}.yml
+      register: kyverno_policy_apply_result
+      changed_when: >-
+        'created' in kyverno_policy_apply_result.stdout or
+        'configured' in kyverno_policy_apply_result.stdout
+      loop: '{{ kyverno_policies }}'
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Kyverno ClusterPolicy manifests
+      ansible.builtin.file:
+        path: '/tmp/kyverno-{{ item }}.yml'
+        state: absent
+      loop: '{{ kyverno_policies }}'
+      when: bootstrap_node | default(false)

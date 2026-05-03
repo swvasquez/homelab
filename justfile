@@ -21,13 +21,13 @@ install group category playbook:
         "playbooks/{{ group }}/{{ category }}/{{ playbook }}.yml"
 
 # Verify that a subset of machines are reachable via Ansible
-ping subset="homelab":
+ping subset="nodes":
     #!/usr/bin/env sh
     set -euxo pipefail
     uv run ansible {{ subset }} -m ping -i inventory.yml
 
 # Reboot all nodes in the inventory (non-blocking)
-reboot subset="homelab":
+reboot subset="nodes":
     #!/usr/bin/env sh
     set -euxo pipefail
     uv run ansible {{ subset }} \
@@ -40,7 +40,7 @@ reboot subset="homelab":
         -B 1 -P 0
 
 # Wake all nodes in a group via Wake-on-LAN magic packet (MAC addresses read from inventory.yml)
-wake subset="homelab":
+wake subset="nodes":
     #!/usr/bin/env sh
     set -euxo pipefail
     uv run ansible-inventory -i inventory.yml --list \
@@ -48,7 +48,7 @@ wake subset="homelab":
         | xargs -I{} wakeonlan {}
 
 # Suspend all nodes in the inventory to S3 (non-blocking)
-suspend subset="homelab":
+suspend subset="nodes":
     #!/usr/bin/env sh
     set -euxo pipefail
     uv run ansible {{ subset }} \
@@ -60,7 +60,7 @@ suspend subset="homelab":
         -e ansible_become_exe=sudo.ws
 
 # Shutdown all nodes in the inventory (non-blocking)
-shutdown subset="homelab":
+shutdown subset="nodes":
     #!/usr/bin/env sh
     set -euxo pipefail
     uv run ansible {{ subset }} \
@@ -73,7 +73,7 @@ shutdown subset="homelab":
         -B 1 -P 0
 
 # Destroy the Kubernetes cluster on all nodes — IRREVERSIBLE, deletes all data
-destroy-cluster subset="homelab":
+destroy-cluster subset="nodes":
     #!/usr/bin/env sh
     printf 'WARNING: This will permanently destroy the Kubernetes cluster and all data on "%s".\nType "destroy" to confirm: ' '{{ subset }}'
     read confirmation

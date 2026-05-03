@@ -1,0 +1,468 @@
+---
+# ==============================================================================
+# Playbook: Deploy Syncthing via ArgoCD GitOps
+# ==============================================================================
+# This playbook configures and deploys Syncthing to the Kubernetes cluster
+# via ArgoCD GitOps using native Kubernetes manifests (StatefulSet, Service).
+#
+# Storage is split across two volumes. Syncthing's configuration and index DB
+# are stored on a Longhorn PVC provisioned via the StatefulSet volumeClaimTemplate,
+# providing stable identity and preventing ReadWriteOnce (RWO) locking issues
+# during pod restarts. Synced folder data is stored on a pre-created NFS
+# PersistentVolume mounted at /var/syncthing/data, shared with the rest of the
+# homelab NFS export.
+#
+# Note on Configuration: Syncthing dynamically rewrites its config.xml file
+# when changes are made in the UI. Because of this, we cannot mount a read-only
+# Kubernetes ConfigMap. Instead, an initContainer is used to dynamically
+# generate the default configuration and inject Ansible-managed settings
+# (like disabling the insecure admin access warning and setting the default
+# folder path) directly into the config.xml file stored on the persistent
+# volume before the main app starts.
+#
+# The Syncthing web UI is exposed via an internal ClusterIP service (port 8384),
+# while sync traffic (port 22000) is exposed via a dedicated LoadBalancer service
+# for external peer communication.
+#
+# Note on DNS Resolution: Syncthing sync traffic uses a dedicated LoadBalancer
+# IP separate from the web ingress (Traefik). ExternalDNS will automatically
+# create an A record for syncthing-sync.<dns_zone> pointing to this dedicated IP.
+# To resolve this name from local machines, ensure the cluster's Bind9
+# LoadBalancer IP is configured in your local resolver (e.g., /etc/resolver).
+#
+# Run order:
+#   1. infrastructure/nfs.yml (NFS server and Kubernetes NFS path)
+#   2. cluster/authentication.yml
+#   3. cluster/git.yml
+#   4. cluster/gitops.yml
+#   5. service/syncthing.yml (this playbook — applies its own HTTPRoute and
+#      ForwardAuth Middleware in the Syncthing namespace)
+#
+# Input Variables:
+#   bootstrap_node:             Boolean indicating if the host is the control
+#                               plane bootstrap node. Read from inventory.
+#   dns_zone:                   DNS zone (e.g. homelab.internal). Read from
+#                               group_vars.
+#   syncthing_namespace:        Kubernetes namespace for Syncthing
+#                               (default: syncthing).
+#   syncthing_image:            Docker image for the Syncthing server
+#                               (default: syncthing/syncthing).
+#   syncthing_image_tag:        Docker image tag for the Syncthing server
+#                               (default: 2.0.16).
+#   syncthing_storage_size:     Storage size for the Syncthing config StatefulSet PVC
+#                               on Longhorn (default: 1Gi).
+#   syncthing_storage_class:    Kubernetes StorageClass used to provision the
+#                               config PVC (default: longhorn).
+#   syncthing_nfs_data_path:    Absolute path on the NFS server for Syncthing's
+#                               synced data, derived from nfs_k8s_path
+#                               (default: <nfs_k8s_path>/syncthing).
+#   syncthing_nfs_data_size:    Nominal size annotation for the NFS PV and PVC.
+#                               NFS does not enforce quotas via PVC size
+#                               (default: 10Gi).
+#   nfs_k8s_path:               Base NFS path for Kubernetes workloads.
+#                               Read from group_vars.
+#   nfs_group:                  Name of the NFS users group. Read from group_vars.
+#   nfs_group_gid:              GID of the NFS users group. Read from group_vars.
+#   nonroot_uid:                Non-root UID the Syncthing pod runs as.
+#                               Read from group_vars.
+#   nfs_server_ip:              IP address of the NFS server, derived from
+#                               inventory hostvars at runtime.
+#   syncthing_gitops_path:      Path within the gitops repository where the
+#                               Syncthing manifests are stored
+#                               (default: apps/syncthing).
+#   syncthing_allow_insecure_admin_access: Whether to allow access to the Syncthing
+#                               GUI without built-in authentication. Set to true
+#                               if using an external proxy like Authentik.
+#                               (default: true).
+#   syncthing_default_folder_path: The default absolute path where Syncthing will
+#                               suggest saving new synced folders. Points to the
+#                               NFS data volume mount inside the container
+#                               (default: /var/syncthing/data/sync).
+#   syncthing_sync_hostname:    FQDN for the Syncthing sync LoadBalancer service,
+#                               used by ExternalDNS (default: syncthing-sync.<dns_zone>).
+#   syncthing_gui_port:         Port for the Syncthing Web GUI (default: 8384).
+#   syncthing_sync_port:        Port for the Syncthing sync protocol (default: 22000).
+#   syncthing_discovery_port:   Port for the Syncthing local discovery (default: 21027).
+#   syncthing_always_local_nets: CIDR networks that Syncthing should always treat
+#                               as LAN. Must be set because the Syncthing pod runs
+#                               on a pod-CIDR interface and cannot auto-detect the
+#                               homelab LAN subnet. Read from group_vars via
+#                               lan_cidr (default: <lan_cidr>).
+#   kubectl_config_path:        Full path to the kubectl config file
+#                               (default: /home/<ansible_user>/.kube/config).
+#   gitea_namespace:            Kubernetes namespace where Gitea is deployed
+#                               (default: gitea).
+#   gitea_admin_username:       Username of the Gitea admin account used to
+#                               push to the gitops repository
+#                               (default: gitea_admin).
+#   gitea_gitops_repo:          Name of the Gitea gitops repository
+#                               (default: gitops).
+#   argocd_namespace:           Kubernetes namespace where ArgoCD is deployed
+#                               (default: argocd).
+
+- name: Deploy Syncthing via ArgoCD GitOps
+  hosts: nodes
+  become: true
+  become_exe: sudo.ws
+  vars:
+    syncthing_namespace: syncthing
+    syncthing_hostname: 'syncthing.{{ dns_zone }}'
+    syncthing_sync_hostname: 'syncthing-sync.{{ dns_zone }}'
+    syncthing_image: syncthing/syncthing
+    syncthing_image_tag: '2.0.16'
+    syncthing_storage_size: 1Gi
+    syncthing_storage_class: longhorn
+    syncthing_gui_port: 8384
+    syncthing_sync_port: '{{ ufw_allowed_ports.syncthing_sync_tcp.port }}'
+    syncthing_discovery_port: '{{ ufw_allowed_ports.syncthing_discovery.port }}'
+    syncthing_allow_insecure_admin_access: true
+    syncthing_default_folder_path: /var/syncthing/data/sync
+    syncthing_always_local_nets: '{{ lan_cidr }}'
+    syncthing_nfs_data_path: '{{ nfs_k8s_path }}/syncthing'
+    syncthing_nfs_data_size: 10Gi
+    nfs_server_ip: >-
+      {{ hostvars | dict2items
+         | selectattr('value.nfs_server', 'defined')
+         | selectattr('value.nfs_server', 'equalto', true)
+         | map(attribute='value.private_ip')
+         | first }}
+    syncthing_gitops_path: apps/syncthing
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    authentik_namespace: authentik
+    gitea_namespace: gitea
+    gitea_admin_username: gitea_admin
+    gitea_gitops_repo: gitops
+    argocd_namespace: argocd
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Namespace
+    # -------------------------------------------------------------------------
+    # Creates the Syncthing namespace before any other resources so that
+    # Secrets and the ArgoCD Application can target it on first run.
+    # -------------------------------------------------------------------------
+    - name: Create Syncthing namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create namespace {{ syncthing_namespace }}
+      register: syncthing_ns_result
+      changed_when: "'created' in syncthing_ns_result.stdout"
+      failed_when:
+        - syncthing_ns_result.rc != 0
+        - "'already exists' not in syncthing_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Default ServiceAccount Hardening
+    # -------------------------------------------------------------------------
+    # Disables the default ServiceAccount token automount in this namespace so
+    # ad-hoc pods that don't name a ServiceAccount cannot read a usable API
+    # bearer credential. Workloads that need API access use named
+    # ServiceAccounts and are unaffected.
+    # -------------------------------------------------------------------------
+    - name: Disable default ServiceAccount token automount in Syncthing namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch serviceaccount default
+          -n {{ syncthing_namespace }}
+          --type=merge
+          -p '{"automountServiceAccountToken": false}'
+      register: syncthing_sa_automount_result
+      changed_when: "'patched' in syncthing_sa_automount_result.stdout"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ForwardAuth Middleware and HTTPRoute
+    # -------------------------------------------------------------------------
+    # Deploys the Traefik ForwardAuth Middleware in the Syncthing namespace
+    # and exposes the Syncthing GUI over HTTPS via an HTTPRoute attached to
+    # the traefik-gateway. The route is gated by Authentik. Authentik must
+    # already be installed (cluster/authentication.yml) for the gate to
+    # function. ExternalDNS registers the hostname in Bind9 once the route
+    # is accepted by the Gateway.
+    # -------------------------------------------------------------------------
+    - name: Write ForwardAuth Middleware manifest for Syncthing
+      ansible.builtin.template:
+        src: ../cluster/templates/traefik-forward-auth-middleware.yml.j2
+        dest: /tmp/traefik-forward-auth-middleware-syncthing.yml
+        mode: '0644'
+      vars:
+        middleware_namespace: '{{ syncthing_namespace }}'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ForwardAuth Middleware in Syncthing namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/traefik-forward-auth-middleware-syncthing.yml
+      register: syncthing_middleware_result
+      changed_when: >-
+        'created' in syncthing_middleware_result.stdout or
+        'configured' in syncthing_middleware_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Syncthing ForwardAuth Middleware manifest
+      ansible.builtin.file:
+        path: /tmp/traefik-forward-auth-middleware-syncthing.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write Syncthing HTTPRoute manifest
+      ansible.builtin.template:
+        src: ../cluster/templates/httproute.yml.j2
+        dest: /tmp/syncthing-httproute.yml
+        mode: '0644'
+      vars:
+        httproute_name: syncthing
+        httproute_namespace: '{{ syncthing_namespace }}'
+        httproute_hostname: '{{ syncthing_hostname }}'
+        httproute_backend_name: syncthing-gui
+        httproute_backend_namespace: '{{ syncthing_namespace }}'
+        httproute_backend_port: '{{ syncthing_gui_port }}'
+        with_forward_auth: true
+      when: bootstrap_node | default(false)
+
+    - name: Apply Syncthing HTTPRoute
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/syncthing-httproute.yml
+      register: syncthing_httproute_result
+      changed_when: >-
+        'created' in syncthing_httproute_result.stdout or
+        'configured' in syncthing_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Syncthing HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/syncthing-httproute.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # NFS Data Directory
+    # -------------------------------------------------------------------------
+    # Creates the Syncthing synced data directory on the NFS server node.
+    # Runs on the NFS server to operate directly on the server filesystem,
+    # bypassing NFS root_squash restrictions. infrastructure/nfs.yml must have
+    # been run first to create nfs_k8s_path.
+    # -------------------------------------------------------------------------
+    - name: Create Syncthing data directory on NFS server
+      ansible.builtin.file:
+        path: '{{ syncthing_nfs_data_path }}'
+        state: directory
+        owner: root
+        group: '{{ nfs_group }}'
+        mode: '2775'
+      when: nfs_server | default(false)
+
+    # -------------------------------------------------------------------------
+    # NFS Data PersistentVolume
+    # -------------------------------------------------------------------------
+    # Applies a static PersistentVolume and PersistentVolumeClaim for Syncthing's
+    # synced data backed by the NFS share. These are applied before ArgoCD syncs
+    # the manifests so the PVC exists when the StatefulSet references it as a
+    # regular volume. The PV uses Retain reclaim policy so synced data is not
+    # deleted if the PVC is removed.
+    # -------------------------------------------------------------------------
+    - name: Write Syncthing NFS data PV manifest
+      ansible.builtin.template:
+        src: templates/syncthing-nfs-data-pv.yml.j2
+        dest: /tmp/syncthing-nfs-data-pv.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Apply Syncthing NFS data PV and PVC
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/syncthing-nfs-data-pv.yml
+      register: syncthing_pv_result
+      changed_when: >-
+        'configured' in syncthing_pv_result.stdout or
+        'created' in syncthing_pv_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Syncthing NFS data PV manifest
+      ansible.builtin.file:
+        path: /tmp/syncthing-nfs-data-pv.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # GitOps - Manifest Management
+    # -------------------------------------------------------------------------
+    # Renders the Syncthing native Kubernetes manifests (StatefulSet, Services)
+    # from a Jinja2 template and commits them to the Gitea gitops repository.
+    # ArgoCD watches this path and automatically syncs the manifests to the
+    # cluster.
+    # -------------------------------------------------------------------------
+    - name: Ensure git is installed
+      ansible.builtin.apt:
+        name: git
+        state: present
+      when: bootstrap_node | default(false)
+
+    - name: Get Gitea pod IP
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get pod -n {{ gitea_namespace }}
+          -l app.kubernetes.io/name=gitea,app.kubernetes.io/instance=gitea
+          -o jsonpath='{.items[0].status.podIP}'
+      register: gitea_pod_ip
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Read Gitea admin password from Kubernetes Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret gitea-credentials -n {{ gitea_namespace }}
+          -o jsonpath='{.data.admin-password}'
+      register: gitea_admin_password_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Gitea admin password fact
+      ansible.builtin.set_fact:
+        gitea_admin_password: "{{ gitea_admin_password_b64.stdout | b64decode }}"
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Clone or update gitops repository in temporary directory
+      ansible.builtin.git:
+        repo: >-
+          http://{{ gitea_admin_username }}:{{ gitea_admin_password }}@{{ gitea_pod_ip.stdout }}:3000/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}
+        dest: /tmp/gitops-syncthing
+        version: main
+        update: true
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Create Syncthing directory in gitops repository
+      ansible.builtin.file:
+        path: "/tmp/gitops-syncthing/{{ syncthing_gitops_path }}"
+        state: directory
+        mode: "0755"
+      when: bootstrap_node | default(false)
+
+    - name: Write Syncthing manifests to gitops repository
+      ansible.builtin.template:
+        src: templates/syncthing-manifests.yml.j2
+        dest: "/tmp/gitops-syncthing/{{ syncthing_gitops_path }}/manifests.yml"
+        mode: "0644"
+      when: bootstrap_node | default(false)
+
+    - name: Configure git user email for commit # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-syncthing config user.email 'ansible@{{ dns_zone | default("homelab.internal") }}'
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Configure git user name for commit # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-syncthing config user.name Ansible
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set gitops repository remote URL with credentials for push # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-syncthing remote set-url origin
+          http://{{ gitea_admin_username }}:{{ gitea_admin_password }}@{{ gitea_pod_ip.stdout }}:3000/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}
+      no_log: true
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Stage Syncthing manifests in gitops repository # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-syncthing add {{ syncthing_gitops_path }}/manifests.yml
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Check for staged changes in gitops repository # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-syncthing diff --cached --exit-code
+      register: gitops_diff_result
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Commit Syncthing manifests to gitops repository # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-syncthing commit -m 'chore: update syncthing manifests'
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - gitops_diff_result.rc != 0
+
+    - name: Push Syncthing manifests commit to Gitea # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-syncthing push origin main
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - gitops_diff_result.rc != 0
+
+    - name: Clean up gitops temporary directory
+      ansible.builtin.file:
+        path: /tmp/gitops-syncthing
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ArgoCD Application
+    # -------------------------------------------------------------------------
+    # Applies the ArgoCD Application manifest that tracks the Gitea repository.
+    # This initiates the deployment of the Syncthing resources to the cluster.
+    # -------------------------------------------------------------------------
+    - name: Write ArgoCD Application manifest for Syncthing
+      ansible.builtin.template:
+        src: templates/syncthing-app.yml.j2
+        dest: /tmp/syncthing-app.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ArgoCD Application manifest for Syncthing
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/syncthing-app.yml
+      register: argocd_app_result
+      changed_when: >-
+        'configured' in argocd_app_result.stdout or
+        'created' in argocd_app_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up ArgoCD Application manifest for Syncthing
+      ansible.builtin.file:
+        path: /tmp/syncthing-app.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Trigger ArgoCD hard refresh to detect new gitops commit
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch application syncthing -n {{ argocd_namespace }}
+          --type merge
+          -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Wait for ArgoCD to sync and deploy Syncthing
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get application syncthing -n {{ argocd_namespace }}
+          -o jsonpath='{.status.sync.status},{.status.health.status}'
+      register: argocd_status
+      until: argocd_status.stdout == 'Synced,Healthy'
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: bootstrap_node | default(false)

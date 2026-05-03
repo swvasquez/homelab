@@ -1,0 +1,59 @@
+{#
+# Managed by Ansible - do not edit manually.
+#
+# SLURM workload manager configuration file, rendered by slurm.yml.
+# Node definitions are auto-populated from Ansible inventory facts gathered
+# at play time. All tunable parameters are exposed as playbook variables.
+#
+# Variables consumed by this template:
+#   slurm_cluster_name:         Cluster identifier string.
+#   slurm_partition_name:       Default partition name.
+#   slurm_state_dir:            Local directory on the controller for StateSaveLocation.
+#   slurm_log_dir:              Directory for daemon log files.
+#   slurm_spool_dir:            Per-node local spool directory for slurmd.
+#   slurm_max_time:             MaxTime for the default partition (e.g. "INFINITE").
+#   slurm_def_mem_per_cpu:      Default memory per CPU in MB; 0 disables constraint.
+#   slurm_ctld_port:            Port slurmctld listens on.
+#   slurm_d_port:               Port slurmd listens on.
+#   _slurm_controller_hostname: Derived hostname of the slurmctld node.
+#   _slurm_controller_ip:       Derived IP address of the slurmctld node.
+#}
+ClusterName={{ slurm_cluster_name }}
+SlurmctldHost={{ _slurm_controller_hostname | trim }}({{ _slurm_controller_ip | trim }})
+
+AuthType=auth/munge
+CryptoType=crypto/munge
+MpiDefault=none
+ProctrackType=proctrack/linuxproc
+ReturnToService=1
+SlurmctldPidFile=/var/run/slurmctld.pid
+SlurmctldPort={{ slurm_ctld_port }}
+SlurmdPidFile=/var/run/slurmd.pid
+SlurmdPort={{ slurm_d_port }}
+SlurmdSpoolDir={{ slurm_spool_dir }}
+SlurmUser=slurm
+StateSaveLocation={{ slurm_state_dir }}
+SwitchType=switch/none
+TaskPlugin=task/affinity,task/cgroup
+{% if slurm_enable_job_container | bool %}
+JobContainerType=job_container/tmpfs
+{% endif %}
+
+SchedulerType=sched/backfill
+SelectType=select/cons_tres
+SelectTypeParameters=CR_Core_Memory
+{% if slurm_def_mem_per_cpu | int > 0 %}
+DefMemPerCPU={{ slurm_def_mem_per_cpu }}
+{% endif %}
+
+SlurmctldLogFile={{ slurm_log_dir }}/slurmctld.log
+SlurmdLogFile={{ slurm_log_dir }}/slurmd.log
+
+# Compute nodes
+{% for host in groups['nodes'] %}
+{% if hostvars[host].slurm_compute_node | default(false) | bool %}
+NodeName={{ hostvars[host].ansible_hostname }} NodeAddr={{ hostvars[host].private_ip }} CPUs={{ hostvars[host].ansible_processor_vcpus }} RealMemory={{ hostvars[host].ansible_memtotal_mb | default(1024) }} State=UNKNOWN
+{% endif %}
+{% endfor %}
+
+PartitionName={{ slurm_partition_name }} Nodes=ALL Default=YES MaxTime={{ slurm_max_time }} State=UP

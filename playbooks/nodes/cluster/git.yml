@@ -1,0 +1,710 @@
+---
+# ==============================================================================
+# Playbook: Install Gitea
+# ==============================================================================
+# This playbook deploys Gitea, a self-hosted Git service, to the Kubernetes
+# cluster via Helm. Gitea provides repository hosting, issue tracking, and a
+# CI/CD pipeline (Gitea Actions) for the homelab.
+#
+# Gitea exposes its own SSH server for git operations (clone, push, pull). This
+# is a purpose-built SSH server that runs independently of the system SSH daemon
+# and is unaffected by system SSH configuration. Arbitrary shell commands cannot
+# be run through it regardless of configuration, as Gitea never provides a
+# shell.
+#
+# Gitea admin and PostgreSQL credentials are auto-generated on first run and
+# persisted in two separate Secrets in the gitea namespace:
+#   - gitea-credentials holds the admin-password (consumed by the Helm chart
+#     to seed the gitea_admin user on first boot).
+#   - gitea-db-credentials holds the cnpg-formatted username + password
+#     (consumed by the CloudNativePG operator to provision the Postgres user
+#     and by the Gitea Deployment via env-var injection).
+# On subsequent runs the existing Secrets are reused so credentials remain
+# stable across upgrades.
+#
+# Authentik is configured as the OIDC identity provider for Gitea, allowing
+# users to sign in with their Authentik credentials. An OAuth2 provider and
+# application are created in Authentik via the REST API on first run. The OIDC
+# client credentials are fetched from Authentik on every run and persisted in
+# a dedicated gitea-oidc Secret (keys `key` and `secret` per the Gitea Helm
+# chart's convention). The chart references that Secret via
+# gitea.oauth[0].existingSecret, so the literal client_secret never enters the
+# rendered Helm release blob or the chart-generated init script.
+# Local account registration is disabled — all accounts must be created via
+# Authentik OIDC. The Gitea admin account is provisioned directly by Helm and
+# is not subject to this restriction.
+#
+# The Gitea web UI HTTPRoute and Authentik ForwardAuth Middleware are applied
+# by this playbook itself in the Gitea namespace.
+#
+# Variables:
+#   bootstrap_node:            Boolean indicating if the host is the control
+#                              plane bootstrap node where Helm commands run.
+#                              Read from inventory host vars.
+#   dns_zone:                  DNS zone (e.g. homelab.internal). Read from
+#                              group_vars.
+#   admin_email:               Email address for the Gitea admin account. Read
+#                              from group_vars.
+#   gitea_namespace:           Kubernetes namespace for Gitea
+#                              (default: gitea).
+#   gitea_chart_version:           Helm chart version of Gitea to install
+#                              (default: 12.5.0).
+#   gitea_hostname:            FQDN for the Gitea web UI, derived from
+#                              dns_zone (default: gitea.<dns_zone>).
+#   gitea_ssh_hostname:        FQDN for the Gitea SSH LoadBalancer service, used
+#                              by ExternalDNS and Gitea clone URLs
+#                              (default: gitea-ssh.<dns_zone>).
+#   gitea_ssh_port:            External port for the Gitea SSH LoadBalancer
+#                              service. Derived from ufw_allowed_ports.gitea_ssh.port.
+#   authentik_namespace:       Kubernetes namespace where Authentik is deployed
+#                              (default: authentik).
+#   authentik_hostname:        FQDN for the Authentik UI, derived from
+#                              dns_zone (default: authentik.<dns_zone>).
+#   kubectl_config_path:       Full path to the kubectl config file
+#                              (default: /home/<ansible_user>/.kube/config).
+#   gitea_db_name:             PostgreSQL database name for Gitea
+#                              (default: gitea).
+#   gitea_db_username:         PostgreSQL username for Gitea (default: gitea).
+#   gitea_db_storage_size:     Storage size for the Gitea cnpg database PVC
+#                              (default: 10Gi).
+#   gitea_storage_class:       Kubernetes StorageClass for the database PVC
+#                              (default: longhorn).
+#   cluster_ca_secret_name:    Name of the TLS Secret in kube-system that
+#                              holds the cluster CA certificate. Used to build
+#                              a combined CA bundle for Gitea
+#                              (default: wildcard-tls).
+#   nonroot_uid:               Non-root UID and GID under which the Gitea
+#                              Deployment, its preExtraInitContainer, and the
+#                              Valkey cluster pods run. Supplied to the Helm
+#                              chart via runAsUser/runAsGroup/fsGroup in the
+#                              Helm values. The CloudNativePG postgres image
+#                              ships with its own baked-in UID/GID (26), so the
+#                              CNPG Cluster is not remapped. Read from
+#                              group_vars.
+
+- name: Install Gitea
+  hosts: nodes
+  become: true
+  become_exe: sudo.ws
+  vars:
+    gitea_namespace: gitea
+    gitea_chart_version: 12.5.0
+    gitea_hostname: "gitea.{{ dns_zone }}"
+    gitea_ssh_hostname: "gitea-ssh.{{ dns_zone }}"
+    gitea_ssh_port: '{{ ufw_allowed_ports.gitea_ssh.port }}'
+    gitea_db_name: gitea
+    gitea_db_username: gitea
+    gitea_db_storage_size: 10Gi
+    gitea_storage_class: longhorn
+    authentik_namespace: authentik
+    authentik_hostname: "authentik.{{ dns_zone }}"
+    kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
+    cluster_ca_secret_name: wildcard-tls
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Namespace
+    # Creates the Gitea namespace before any other resources so that the
+    # credentials Secret can be stored there prior to the Helm install.
+    # -------------------------------------------------------------------------
+    - name: Create Gitea namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create namespace {{ gitea_namespace }}
+      register: gitea_ns_result
+      changed_when: "'created' in gitea_ns_result.stdout"
+      failed_when:
+        - gitea_ns_result.rc != 0
+        - "'already exists' not in gitea_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Default ServiceAccount Hardening
+    # -------------------------------------------------------------------------
+    # Disables the default ServiceAccount token automount in this namespace so
+    # ad-hoc pods that don't name a ServiceAccount cannot read a usable API
+    # bearer credential.
+    # -------------------------------------------------------------------------
+    - name: Disable default ServiceAccount token automount in Gitea namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch serviceaccount default
+          -n {{ gitea_namespace }}
+          --type=merge
+          -p '{"automountServiceAccountToken": false}'
+      register: gitea_sa_automount_result
+      changed_when: "'patched' in gitea_sa_automount_result.stdout"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ForwardAuth Middleware and HTTPRoute
+    # -------------------------------------------------------------------------
+    # Deploys the Traefik ForwardAuth Middleware in the Gitea namespace and
+    # exposes the Gitea web UI over HTTPS via an HTTPRoute attached to the
+    # traefik-gateway. Authentik gates browser access on top of Gitea's own
+    # OIDC login. Authentik must already be installed
+    # (cluster/authentication.yml) for the gate to function.
+    # -------------------------------------------------------------------------
+    - name: Write ForwardAuth Middleware manifest for Gitea
+      ansible.builtin.template:
+        src: templates/traefik-forward-auth-middleware.yml.j2
+        dest: /tmp/traefik-forward-auth-middleware-gitea.yml
+        mode: '0644'
+      vars:
+        middleware_namespace: '{{ gitea_namespace }}'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ForwardAuth Middleware in Gitea namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/traefik-forward-auth-middleware-gitea.yml
+      register: gitea_middleware_result
+      changed_when: >-
+        'created' in gitea_middleware_result.stdout or
+        'configured' in gitea_middleware_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Gitea ForwardAuth Middleware manifest
+      ansible.builtin.file:
+        path: /tmp/traefik-forward-auth-middleware-gitea.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write Gitea HTTPRoute manifest
+      ansible.builtin.template:
+        src: templates/httproute.yml.j2
+        dest: /tmp/gitea-httproute.yml
+        mode: '0644'
+      vars:
+        httproute_name: gitea
+        httproute_namespace: '{{ gitea_namespace }}'
+        httproute_hostname: '{{ gitea_hostname }}'
+        httproute_backend_name: gitea-http
+        httproute_backend_namespace: '{{ gitea_namespace }}'
+        httproute_backend_port: 3000
+        with_forward_auth: true
+      when: bootstrap_node | default(false)
+
+    - name: Apply Gitea HTTPRoute
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/gitea-httproute.yml
+      register: gitea_httproute_result
+      changed_when: >-
+        'created' in gitea_httproute_result.stdout or
+        'configured' in gitea_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Gitea HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/gitea-httproute.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Cluster CA Certificate
+    # Reads the cluster CA certificate from the wildcard-tls Secret in
+    # kube-system and creates a ConfigMap named homelab-ca in the Gitea
+    # namespace. This ConfigMap is mounted into Gitea's containers via the Helm
+    # values and combined with the Alpine system CA bundle so that Gitea trusts
+    # the self-signed wildcard certificate used by cluster services such as
+    # Authentik. Without this, the configure-gitea init container cannot fetch
+    # the Authentik OIDC discovery document over HTTPS.
+    # -------------------------------------------------------------------------
+    - name: Read cluster CA certificate from wildcard-tls secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret {{ cluster_ca_secret_name }} -n kube-system
+          -o jsonpath='{.data.ca\.crt}'
+      register: cluster_ca_cert_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Write cluster CA certificate to temporary file
+      ansible.builtin.copy:
+        content: "{{ cluster_ca_cert_b64.stdout | b64decode }}"
+        dest: /tmp/homelab-ca.crt
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Create homelab CA ConfigMap in Gitea namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create configmap homelab-ca
+          -n {{ gitea_namespace }}
+          --from-file=ca.crt=/tmp/homelab-ca.crt
+      register: homelab_ca_configmap_result
+      changed_when: "'created' in homelab_ca_configmap_result.stdout"
+      failed_when:
+        - homelab_ca_configmap_result.rc != 0
+        - "'already exists' not in homelab_ca_configmap_result.stderr"
+      when: bootstrap_node | default(false)
+
+    - name: Remove cluster CA certificate temporary file
+      ansible.builtin.file:
+        path: /tmp/homelab-ca.crt
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Gitea Credentials
+    # Generates a Gitea admin password and a PostgreSQL password on first run.
+    # Each password lives in its own canonical Secret: gitea-credentials holds
+    # admin-password only, gitea-db-credentials holds the cnpg-formatted
+    # username + password. The two Secrets are guarded independently for
+    # idempotency so they can evolve separately. A migration task strips the
+    # legacy postgresql-password key from gitea-credentials on clusters that
+    # were installed before the de-duplication.
+    # -------------------------------------------------------------------------
+    - name: Check if Gitea admin credentials secret already exists
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret gitea-credentials -n {{ gitea_namespace }}
+      register: existing_gitea_credentials_check
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Check if Gitea database credentials secret already exists
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret gitea-db-credentials -n {{ gitea_namespace }}
+      register: existing_gitea_db_credentials_check
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Generate Gitea admin password
+      ansible.builtin.command:
+        cmd: openssl rand -base64 24
+      register: generated_gitea_admin_password
+      changed_when: false
+      when:
+        - bootstrap_node | default(false)
+        - existing_gitea_credentials_check.rc != 0
+
+    - name: Generate Gitea PostgreSQL password
+      ansible.builtin.command:
+        cmd: openssl rand -base64 24
+      register: generated_gitea_postgres_password
+      changed_when: false
+      when:
+        - bootstrap_node | default(false)
+        - existing_gitea_db_credentials_check.rc != 0
+
+    - name: Create Gitea admin credentials Kubernetes secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic gitea-credentials
+          -n {{ gitea_namespace }}
+          --from-literal=admin-password={{ generated_gitea_admin_password.stdout }}
+      when:
+        - bootstrap_node | default(false)
+        - existing_gitea_credentials_check.rc != 0
+      changed_when: true
+
+    - name: Create Gitea cnpg database credentials Kubernetes secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic gitea-db-credentials
+          -n {{ gitea_namespace }}
+          --from-literal=username={{ gitea_db_username }}
+          --from-literal=password={{ generated_gitea_postgres_password.stdout }}
+      when:
+        - bootstrap_node | default(false)
+        - existing_gitea_db_credentials_check.rc != 0
+      changed_when: true
+
+    - name: Read Gitea admin password from Kubernetes secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret gitea-credentials -n {{ gitea_namespace }}
+          -o jsonpath='{.data.admin-password}'
+      register: gitea_admin_password_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Read Gitea PostgreSQL password from Kubernetes secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret gitea-db-credentials -n {{ gitea_namespace }}
+          -o jsonpath='{.data.password}'
+      register: gitea_postgres_password_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Gitea credential facts
+      ansible.builtin.set_fact:
+        gitea_admin_password: "{{ gitea_admin_password_b64.stdout | b64decode }}"
+        gitea_postgres_password: "{{ gitea_postgres_password_b64.stdout | b64decode }}"
+      when: bootstrap_node | default(false)
+
+    - name: Check for legacy postgresql-password key in gitea-credentials
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret gitea-credentials -n {{ gitea_namespace }}
+          -o jsonpath='{.data.postgresql-password}'
+      register: legacy_pg_pw_check
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Remove legacy postgresql-password key from gitea-credentials
+      ansible.builtin.shell:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch secret gitea-credentials -n {{ gitea_namespace }}
+          --type=merge
+          -p '{"data":{"postgresql-password":null}}'
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - legacy_pg_pw_check.stdout != ''
+
+    # -------------------------------------------------------------------------
+    # Authentik OIDC Configuration
+    # Reads the Authentik bootstrap token from the existing authentik-credentials
+    # Secret, then uses the Authentik REST API to create an OAuth2 provider and
+    # application for Gitea. The provider is configured for the confidential
+    # client type with a single strict redirect URI pointing to Gitea's OIDC
+    # callback endpoint. The subject mode is set to user_username so that the
+    # OIDC sub claim matches the Authentik username.
+    #
+    # The default OpenID, email, and profile scope property mappings are fetched
+    # from the Authentik API and included in the provider so that the userinfo
+    # endpoint returns the claims required by Gitea's OIDC client.
+    #
+    # OIDC client credentials are fetched from the Authentik API on every run
+    # so they remain consistent whether the provider was just created or already
+    # existed. All API tasks are idempotent: existing resources are detected
+    # before creation.
+    #
+    # API calls are made to the Authentik server ClusterIP, which is reachable
+    # from cluster nodes via Cilium's eBPF kube-proxy replacement.
+    # -------------------------------------------------------------------------
+    - name: Read Authentik bootstrap token from Kubernetes secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret authentik-credentials -n {{ authentik_namespace }}
+          -o jsonpath='{.data.bootstrap-token}'
+      register: authentik_bootstrap_token_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Authentik bootstrap token fact
+      ansible.builtin.set_fact:
+        authentik_bootstrap_token: "{{ authentik_bootstrap_token_b64.stdout | b64decode }}"
+      when: bootstrap_node | default(false)
+
+    - name: Get Authentik server ClusterIP
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get svc authentik-server -n {{ authentik_namespace }}
+          -o jsonpath='{.spec.clusterIP}'
+      register: authentik_server_clusterip
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Authentik API base URL fact
+      ansible.builtin.set_fact:
+        authentik_api_url: "http://{{ authentik_server_clusterip.stdout }}/api/v3"
+      when: bootstrap_node | default(false)
+
+    - name: Get default authorization flow UUID
+      ansible.builtin.uri:
+        url: >-
+          {{ authentik_api_url }}/flows/instances/?slug=default-provider-authorization-implicit-consent
+        headers:
+          Authorization: "Bearer {{ authentik_bootstrap_token }}"
+      register: auth_flow_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set authorization flow UUID fact
+      ansible.builtin.set_fact:
+        authentik_auth_flow_uuid: "{{ auth_flow_result.json.results[0].pk }}"
+      when: bootstrap_node | default(false)
+
+    - name: Get default invalidation flow UUID
+      ansible.builtin.uri:
+        url: "{{ authentik_api_url }}/flows/instances/?slug=default-provider-invalidation-flow"
+        headers:
+          Authorization: "Bearer {{ authentik_bootstrap_token }}"
+      register: invalidation_flow_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set invalidation flow UUID fact
+      ansible.builtin.set_fact:
+        authentik_invalidation_flow_uuid: "{{ invalidation_flow_result.json.results[0].pk }}"
+      when: bootstrap_node | default(false)
+
+    - name: Get OIDC scope property mappings from Authentik
+      ansible.builtin.uri:
+        url: "{{ authentik_api_url }}/propertymappings/all/?page_size=100"
+        headers:
+          Authorization: "Bearer {{ authentik_bootstrap_token }}"
+      register: all_property_mappings_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set OIDC scope property mapping UUID facts
+      ansible.builtin.set_fact:
+        oidc_scope_mapping_uuids: >-
+          {{
+            all_property_mappings_result.json.results
+            | selectattr('meta_model_name', 'equalto', 'authentik_providers_oauth2.scopemapping')
+            | selectattr('name', 'in', [
+                "authentik default OAuth Mapping: OpenID 'openid'",
+                "authentik default OAuth Mapping: OpenID 'email'",
+                "authentik default OAuth Mapping: OpenID 'profile'"
+              ])
+            | map(attribute='pk')
+            | list
+          }}
+      when: bootstrap_node | default(false)
+
+    - name: Check if Gitea OAuth2 provider already exists in Authentik
+      ansible.builtin.uri:
+        url: "{{ authentik_api_url }}/providers/oauth2/?name=Gitea"
+        headers:
+          Authorization: "Bearer {{ authentik_bootstrap_token }}"
+      register: existing_oidc_provider_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Create Gitea OAuth2 provider in Authentik
+      ansible.builtin.uri:
+        url: "{{ authentik_api_url }}/providers/oauth2/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ authentik_bootstrap_token }}"
+        body_format: json
+        body:
+          name: Gitea
+          authorization_flow: "{{ authentik_auth_flow_uuid }}"
+          invalidation_flow: "{{ authentik_invalidation_flow_uuid }}"
+          property_mappings: "{{ oidc_scope_mapping_uuids }}"
+          redirect_uris:
+            - matching_mode: strict
+              url: "https://{{ gitea_hostname }}/user/oauth2/Authentik/callback"
+          client_type: confidential
+          sub_mode: user_username
+        status_code: 201
+      register: create_oidc_provider_result
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - existing_oidc_provider_result.json.pagination.count == 0
+
+    - name: Set OIDC provider ID fact from existing provider
+      ansible.builtin.set_fact:
+        gitea_oidc_provider_id: "{{ existing_oidc_provider_result.json.results[0].pk }}"
+      when:
+        - bootstrap_node | default(false)
+        - existing_oidc_provider_result.json.pagination.count > 0
+
+    - name: Set OIDC provider ID fact from newly created provider
+      ansible.builtin.set_fact:
+        gitea_oidc_provider_id: "{{ create_oidc_provider_result.json.pk }}"
+      when:
+        - bootstrap_node | default(false)
+        - existing_oidc_provider_result.json.pagination.count == 0
+
+    - name: Check if Gitea application already exists in Authentik
+      ansible.builtin.uri:
+        url: "{{ authentik_api_url }}/core/applications/?slug=gitea"
+        headers:
+          Authorization: "Bearer {{ authentik_bootstrap_token }}"
+      register: existing_gitea_app_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Create Gitea application in Authentik
+      ansible.builtin.uri:
+        url: "{{ authentik_api_url }}/core/applications/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ authentik_bootstrap_token }}"
+        body_format: json
+        body:
+          name: Gitea
+          slug: gitea
+          provider: "{{ gitea_oidc_provider_id }}"
+        status_code: 201
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - existing_gitea_app_result.json.pagination.count == 0
+
+    - name: Get Gitea OAuth2 provider details from Authentik
+      ansible.builtin.uri:
+        url: "{{ authentik_api_url }}/providers/oauth2/{{ gitea_oidc_provider_id }}/"
+        headers:
+          Authorization: "Bearer {{ authentik_bootstrap_token }}"
+      register: gitea_oidc_provider_details
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set OIDC client credential facts
+      ansible.builtin.set_fact:
+        gitea_oidc_client_id: "{{ gitea_oidc_provider_details.json.client_id }}"
+        gitea_oidc_client_secret: "{{ gitea_oidc_provider_details.json.client_secret }}"
+      when: bootstrap_node | default(false)
+
+    # Persists the OIDC client_id and client_secret in a dedicated gitea-oidc
+    # Kubernetes Secret using apply semantics so the values stay in sync if
+    # Authentik ever rotates them. The Helm chart references this Secret via
+    # gitea.oauth[0].existingSecret, so the literal client_secret never enters
+    # the rendered Helm release blob or the chart-generated init script. Key
+    # names follow the chart's convention (`key` for client_id, `secret` for
+    # client_secret).
+    - name: Create or update Gitea OIDC credentials Secret
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail;
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic gitea-oidc -n {{ gitea_namespace }}
+          --from-literal=key={{ gitea_oidc_client_id }}
+          --from-literal=secret={{ gitea_oidc_client_secret }}
+          --dry-run=client -o yaml |
+          kubectl --kubeconfig={{ kubectl_config_path }} apply -f -
+      register: gitea_oidc_secret_apply
+      changed_when: "'unchanged' not in gitea_oidc_secret_apply.stdout"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Database
+    # Provisions a CloudNativePG Cluster for Gitea's PostgreSQL database. The
+    # cnpg-formatted credentials Secret (gitea-db-credentials) is created in
+    # the Gitea Credentials section above. The Cluster resource is applied
+    # idempotently via kubectl apply and the playbook waits for it to reach a
+    # healthy state before proceeding with the Helm install.
+    # -------------------------------------------------------------------------
+    - name: Write Gitea cnpg Cluster manifest
+      ansible.builtin.copy:
+        dest: /tmp/gitea-db-cluster.yml
+        mode: '0600'
+        content: |
+          apiVersion: postgresql.cnpg.io/v1
+          kind: Cluster
+          metadata:
+            name: gitea-db
+            namespace: '{{ gitea_namespace }}'
+          spec:
+            instances: 1
+            imageName: ghcr.io/cloudnative-pg/postgresql:17
+            storage:
+              storageClass: '{{ gitea_storage_class }}'
+              size: '{{ gitea_db_storage_size }}'
+            bootstrap:
+              initdb:
+                database: '{{ gitea_db_name }}'
+                owner: '{{ gitea_db_username }}'
+                secret:
+                  name: gitea-db-credentials
+      when: bootstrap_node | default(false)
+
+    - name: Apply Gitea cnpg Cluster manifest
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/gitea-db-cluster.yml
+      register: gitea_db_cluster_result
+      changed_when: >-
+        'created' in gitea_db_cluster_result.stdout or
+        'configured' in gitea_db_cluster_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Remove Gitea cnpg Cluster manifest temporary file
+      ansible.builtin.file:
+        path: /tmp/gitea-db-cluster.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Wait for Gitea cnpg Cluster to become healthy
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get cluster gitea-db -n {{ gitea_namespace }}
+          -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: gitea_db_ready
+      until: gitea_db_ready.stdout == 'True'
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Gitea Installation
+    # Installs Gitea via Helm using the official gitea-charts repository.
+    # PostgreSQL is managed by CloudNativePG. Valkey is disabled — Gitea uses
+    # an in-process cache when no external cache is configured. Credentials are
+    # injected via a values file rendered from the generated or existing
+    # Kubernetes Secret. The Authentik OIDC provider is
+    # configured so users can sign in with their Authentik credentials. Local
+    # account registration is disabled — accounts are created on first OIDC
+    # login.
+    # -------------------------------------------------------------------------
+    - name: Add Gitea Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add gitea-charts https://dl.gitea.com/charts/
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Update Helm repositories
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Write Gitea Helm values file
+      ansible.builtin.template:
+        src: gitea-values.yml.j2
+        dest: /tmp/gitea-values.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Delete existing gitea-ssh service to allow type change to LoadBalancer
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          delete service gitea-ssh -n {{ gitea_namespace }}
+      register: delete_gitea_ssh_result
+      changed_when: "'deleted' in delete_gitea_ssh_result.stdout"
+      failed_when:
+        - delete_gitea_ssh_result.rc != 0
+        - "'not found' not in delete_gitea_ssh_result.stderr"
+      when: bootstrap_node | default(false)
+
+    - name: Install or upgrade Gitea via Helm
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade --install gitea gitea-charts/gitea
+          --namespace {{ gitea_namespace }}
+          --kubeconfig {{ kubectl_config_path }}
+          --values /tmp/gitea-values.yml
+          --version {{ gitea_chart_version }}
+          --timeout 10m
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Remove Gitea Helm values file
+      ansible.builtin.file:
+        path: /tmp/gitea-values.yml
+        state: absent
+      when: bootstrap_node | default(false)

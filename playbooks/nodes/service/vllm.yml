@@ -1,0 +1,427 @@
+---
+# ==============================================================================
+# Playbook: Deploy vLLM via ArgoCD GitOps
+# ==============================================================================
+# This playbook configures and deploys vLLM to the Kubernetes cluster via ArgoCD
+# GitOps using native Kubernetes manifests (DaemonSet, Service).
+#
+# vLLM serves an OpenAI-compatible API for large language model inference using
+# the ROCm vLLM image. A DaemonSet schedules one vLLM pod on every node labeled
+# homelab.internal/vllm-host=true, determined by the vllm_host inventory
+# variable (defaults to true). GPU access is provided by mounting /dev/kfd and
+# /dev/dri directly from the host, bypassing the Kubernetes GPU device plugin
+# which does not support Ryzen AI APUs (see TODO.md).
+#
+# The vLLM API is exposed via a dedicated LoadBalancer service with ExternalDNS,
+# rather than through Traefik/ForwardAuth, so that OpenAI-compatible clients can
+# authenticate using a standard Bearer token. The API key is stored in a
+# Kubernetes Secret and can be disabled for LAN-trusted environments.
+#
+# The Hugging Face model cache is stored on a hostPath so each node maintains
+# its own local copy. A PVC cannot be used because DaemonSets do not support
+# volumeClaimTemplates and a single RWO PVC cannot be shared across nodes.
+#
+# Retrieving the API key:
+#   kubectl get secret vllm-credentials -n vllm \
+#     -o jsonpath='{.data.api-key}' | base64 -d
+#
+# Example query:
+#   curl http://vllm.<dns_zone>:8000/v1/chat/completions \
+#     -H "Authorization: Bearer <API_KEY>" \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#       "model": "microsoft/Phi-4-mini-instruct",
+#       "messages": [{"role": "user", "content": "Hello!"}],
+#       "max_tokens": 100
+#     }'
+#
+# Run order:
+#   1. cluster/authentication.yml
+#   2. cluster/git.yml
+#   3. cluster/gitops.yml
+#   4. service/vllm.yml (this playbook)
+#
+# Input Variables:
+#   bootstrap_node:          Boolean indicating if the host is the control
+#                            plane bootstrap node. Read from inventory.
+#   dns_zone:                DNS zone (e.g. homelab.internal). Read from
+#                            group_vars.
+#   vllm_namespace:          Kubernetes namespace for vLLM
+#                            (default: vllm).
+#   vllm_image:              Docker image for the vLLM server
+#                            (default: vllm/vllm-openai-rocm).
+#   vllm_image_tag:          Docker image tag for the vLLM server
+#                            (default: v0.18.0).
+#   vllm_model:              Hugging Face model ID to serve
+#                            (default: microsoft/Phi-4-mini-instruct).
+#   vllm_dtype:              Data type for model weights
+#                            (default: float16).
+#   vllm_gpu_memory_util:    Fraction of GPU memory vLLM is allowed to use
+#                            (default: 0.90).
+#   vllm_max_model_len:      Maximum sequence length the model can handle
+#                            (default: 2048).
+#   vllm_api_port:           Port for the OpenAI-compatible API server.
+#                            Derived from ufw_allowed_ports.vllm_api.port.
+#   vllm_api_key_enabled:    Whether to require an API key for requests.
+#                            When true, a random key is generated and stored
+#                            in the vllm-credentials Secret
+#                            (default: true).
+#   vllm_hf_token_enabled:   Whether to mount a Hugging Face token for
+#                            downloading gated models. When true, the token
+#                            must be provided via vllm_hf_token
+#                            (default: false).
+#   vllm_hf_token:           Hugging Face API token for gated model access.
+#                            Only used when vllm_hf_token_enabled is true
+#                            (default: "").
+#   vllm_hostname:           FQDN for the vLLM LoadBalancer service, used
+#                            by ExternalDNS
+#                            (default: vllm.<dns_zone>).
+#   vllm_cache_host_path:    Host path for the Hugging Face model cache.
+#                            Each node stores its own local copy
+#                            (default: /var/lib/vllm/cache).
+#   vllm_host:               Per-host boolean indicating whether the node
+#                            should run a vLLM pod. Read from inventory or
+#                            group_vars (default: true).
+#   vllm_gitops_path:        Path within the gitops repository where vLLM
+#                            manifests are stored
+#                            (default: apps/vllm).
+#   kubectl_config_path:     Full path to the kubectl config file
+#                            (default: /home/<ansible_user>/.kube/config).
+#   gitea_namespace:         Kubernetes namespace where Gitea is deployed
+#                            (default: gitea).
+#   gitea_admin_username:    Username of the Gitea admin account used to
+#                            push to the gitops repository
+#                            (default: gitea_admin).
+#   gitea_gitops_repo:       Name of the Gitea gitops repository
+#                            (default: gitops).
+#   argocd_namespace:        Kubernetes namespace where ArgoCD is deployed
+#                            (default: argocd).
+
+- name: Deploy vLLM via ArgoCD GitOps
+  hosts: nodes
+  become: true
+  become_exe: sudo.ws
+  vars:
+    vllm_namespace: vllm
+    vllm_hostname: 'vllm.{{ dns_zone }}'
+    vllm_image: vllm/vllm-openai-rocm
+    vllm_image_tag: v0.18.0
+    vllm_model: microsoft/Phi-4-mini-instruct
+    vllm_dtype: float16
+    vllm_gpu_memory_util: '0.90'
+    vllm_max_model_len: '2048'
+    vllm_api_port: '{{ ufw_allowed_ports.vllm_api.port }}'
+    vllm_api_key_enabled: true
+    vllm_hf_token_enabled: false
+    vllm_hf_token: ''
+    vllm_cache_host_path: /var/lib/vllm/cache
+    vllm_gitops_path: apps/vllm
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    gitea_namespace: gitea
+    gitea_admin_username: gitea_admin
+    gitea_gitops_repo: gitops
+    argocd_namespace: argocd
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Namespace
+    # -------------------------------------------------------------------------
+    # Creates the vLLM namespace before any other resources so that Secrets
+    # and the ArgoCD Application can target it on first run.
+    # -------------------------------------------------------------------------
+    - name: Create vLLM namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create namespace {{ vllm_namespace }}
+      register: vllm_ns_result
+      changed_when: "'created' in vllm_ns_result.stdout"
+      failed_when:
+        - vllm_ns_result.rc != 0
+        - "'already exists' not in vllm_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Pod Security Admission Opt-Out
+    # -------------------------------------------------------------------------
+    # The cluster default Pod Security Standard is 'restricted', which forbids
+    # hostPath volumes, host devices, and the elevated container privileges
+    # the vLLM DaemonSet needs to access /dev/kfd and /dev/dri for ROCm GPU
+    # access. Label this namespace with 'privileged' to opt out of the
+    # cluster default for this single namespace, without requiring the
+    # cluster-level PSA exemption list in cluster/security.yml to know about
+    # vLLM.
+    # -------------------------------------------------------------------------
+    - name: Label vLLM namespace with privileged Pod Security profile
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          label --overwrite namespace {{ vllm_namespace }}
+          pod-security.kubernetes.io/enforce=privileged
+          pod-security.kubernetes.io/warn=privileged
+          pod-security.kubernetes.io/audit=privileged
+      register: vllm_psa_label_result
+      changed_when: "'labeled' in vllm_psa_label_result.stdout"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Kyverno Opt-Out
+    # -------------------------------------------------------------------------
+    # Labels the vLLM namespace with 'homelab.internal/kyverno-exempt=true'
+    # so the cluster's Kyverno ClusterPolicies skip it. The vLLM image is
+    # consumed by tag without a digest pin and the DaemonSet exposes a
+    # NodePort-equivalent direct LoadBalancer for OpenAI-compatible clients,
+    # both of which the default policy set would otherwise reject. This label
+    # lets vLLM opt itself out without cluster/security.yml having to name
+    # vllm in its policy selector.
+    # -------------------------------------------------------------------------
+    - name: Label vLLM namespace as exempt from Kyverno ClusterPolicies
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          label --overwrite namespace {{ vllm_namespace }}
+          homelab.internal/kyverno-exempt=true
+      register: vllm_kyverno_label_result
+      changed_when: "'labeled' in vllm_kyverno_label_result.stdout"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Node Labeling
+    # -------------------------------------------------------------------------
+    # Labels each node where vllm_host is true in inventory so the DaemonSet
+    # schedules a vLLM pod on it. Nodes where vllm_host is false have the
+    # label set to false so the DaemonSet evicts their pods.
+    # -------------------------------------------------------------------------
+    - name: Set vLLM host label on each node
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          label node {{ item }}
+          homelab.internal/vllm-host={{
+            hostvars[item].vllm_host | default(true) | string | lower
+          }} --overwrite
+      register: vllm_label_result
+      changed_when: "'labeled' in vllm_label_result.stdout"
+      loop: "{{ groups['nodes'] }}"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Credentials
+    # -------------------------------------------------------------------------
+    # Generates a random API key (and optionally stores a Hugging Face token)
+    # in a Kubernetes Secret. The Secret is created only on first run to
+    # preserve the original key across playbook re-runs.
+    # -------------------------------------------------------------------------
+    - name: Check if vLLM credentials Secret exists
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret vllm-credentials -n {{ vllm_namespace }}
+      register: vllm_secret_check
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Generate vLLM API key
+      ansible.builtin.command:
+        cmd: openssl rand -base64 32
+      register: vllm_api_key_gen
+      changed_when: false
+      when:
+        - bootstrap_node | default(false)
+        - vllm_secret_check.rc != 0
+
+    - name: Create vLLM credentials Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic vllm-credentials
+          -n {{ vllm_namespace }}
+          --from-literal=api-key={{ vllm_api_key_gen.stdout }}
+          --from-literal=hf-token={{ vllm_hf_token }}
+      register: vllm_secret_result
+      changed_when: "'created' in vllm_secret_result.stdout"
+      when:
+        - bootstrap_node | default(false)
+        - vllm_secret_check.rc != 0
+      no_log: true
+
+    # -------------------------------------------------------------------------
+    # GitOps - Manifest Management
+    # -------------------------------------------------------------------------
+    # Renders the vLLM native Kubernetes manifests from a Jinja2 template and
+    # commits them to the Gitea gitops repository. ArgoCD watches this path
+    # and automatically syncs the manifests to the cluster.
+    # -------------------------------------------------------------------------
+    - name: Ensure git is installed
+      ansible.builtin.apt:
+        name: git
+        state: present
+      when: bootstrap_node | default(false)
+
+    - name: Get Gitea pod IP
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get pod -n {{ gitea_namespace }}
+          -l app.kubernetes.io/name=gitea,app.kubernetes.io/instance=gitea
+          -o jsonpath='{.items[0].status.podIP}'
+      register: gitea_pod_ip
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Read Gitea admin password from Kubernetes Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret gitea-credentials -n {{ gitea_namespace }}
+          -o jsonpath='{.data.admin-password}'
+      register: gitea_admin_password_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Gitea admin password fact
+      ansible.builtin.set_fact:
+        gitea_admin_password: "{{ gitea_admin_password_b64.stdout | b64decode }}"
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Clone or update gitops repository in temporary directory
+      ansible.builtin.git:
+        repo: >-
+          http://{{ gitea_admin_username }}:{{ gitea_admin_password }}@{{ gitea_pod_ip.stdout }}:3000/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}
+        dest: /tmp/gitops-vllm
+        version: main
+        update: true
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Create vLLM directory in gitops repository
+      ansible.builtin.file:
+        path: "/tmp/gitops-vllm/{{ vllm_gitops_path }}"
+        state: directory
+        mode: "0755"
+      when: bootstrap_node | default(false)
+
+    - name: Write vLLM manifests to gitops repository
+      ansible.builtin.template:
+        src: templates/vllm-manifests.yml.j2
+        dest: "/tmp/gitops-vllm/{{ vllm_gitops_path }}/manifests.yml"
+        mode: "0644"
+      when: bootstrap_node | default(false)
+
+    - name: Configure git user email for commit # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-vllm config user.email
+          'ansible@{{ dns_zone | default("homelab.internal") }}'
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Configure git user name for commit # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-vllm config user.name Ansible
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set gitops repository remote URL with credentials for push # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-vllm remote set-url origin
+          http://{{ gitea_admin_username }}:{{ gitea_admin_password }}@{{ gitea_pod_ip.stdout }}:3000/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}
+      no_log: true
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Stage vLLM manifests in gitops repository # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-vllm add
+          {{ vllm_gitops_path }}/manifests.yml
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Check for staged changes in gitops repository # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-vllm diff --cached --exit-code
+      register: gitops_diff_result
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Commit vLLM manifests to gitops repository # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-vllm commit
+          -m 'chore: update vllm manifests'
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - gitops_diff_result.rc != 0
+
+    - name: Push vLLM manifests commit to Gitea # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-vllm push origin main
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - gitops_diff_result.rc != 0
+
+    - name: Clean up gitops temporary directory
+      ansible.builtin.file:
+        path: /tmp/gitops-vllm
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ArgoCD Application
+    # -------------------------------------------------------------------------
+    # Applies the ArgoCD Application manifest that tracks the Gitea repository.
+    # This initiates the deployment of the vLLM resources to the cluster.
+    # -------------------------------------------------------------------------
+    - name: Write ArgoCD Application manifest for vLLM
+      ansible.builtin.template:
+        src: templates/vllm-app.yml.j2
+        dest: /tmp/vllm-app.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ArgoCD Application manifest for vLLM
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/vllm-app.yml
+      register: argocd_app_result
+      changed_when: >-
+        'configured' in argocd_app_result.stdout or
+        'created' in argocd_app_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up ArgoCD Application manifest for vLLM
+      ansible.builtin.file:
+        path: /tmp/vllm-app.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Trigger ArgoCD hard refresh to detect new gitops commit
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch application vllm -n {{ argocd_namespace }}
+          --type merge
+          -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Wait for ArgoCD to sync and deploy vLLM
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get application vllm -n {{ argocd_namespace }}
+          -o jsonpath='{.status.sync.status},{.status.health.status}'
+      register: argocd_status
+      until: argocd_status.stdout == 'Synced,Healthy'
+      retries: 60
+      delay: 10
+      changed_when: false
+      when: bootstrap_node | default(false)

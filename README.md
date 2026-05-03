@@ -25,7 +25,7 @@ Ansible playbooks to configure Ubuntu x86_64 compute nodes, Arch Linux-based IP 
     ```yaml
     all:
       children:
-        homelab:
+        nodes:
           vars:
             ansible_port: <SSH_PORT>
             ansible_python_interpreter: <PYTHON_PATH>
@@ -61,7 +61,7 @@ Ansible playbooks to configure Ubuntu x86_64 compute nodes, Arch Linux-based IP 
     tailscale_tailnet: <TAILSCALE_TAILNET>
     ```
 
-4.  Create a `group_vars/homelab.yml` file for homelab group variables:
+4.  Create a `group_vars/nodes.yml` file for cluster-node group variables:
 
     ```yaml
     ssh_users:
@@ -171,12 +171,12 @@ Ansible playbooks to configure Ubuntu x86_64 compute nodes, Arch Linux-based IP 
 Playbooks are organized by Ansible inventory group, then by category. Each category maintains its
 own `templates/` folder (if applicable) to keep playbooks and their dependencies tightly coupled:
 
-- `playbooks/homelab/infrastructure/`: OS-level configurations and bare-metal setup.
-- `playbooks/homelab/cluster/`: Kubernetes cluster bootstrapping and core platform components,
+- `playbooks/nodes/infrastructure/`: OS-level configurations and bare-metal setup.
+- `playbooks/nodes/cluster/`: Kubernetes cluster bootstrapping and core platform components,
   including the Git server (`git.yml`) and GitOps controller (`gitops.yml`).
-- `playbooks/homelab/development/`: Language toolchains, development environments, and common CLI
+- `playbooks/nodes/development/`: Language toolchains, development environments, and common CLI
   utilities.
-- `playbooks/homelab/service/`: Cluster-hosted user services (e.g. Syncthing, Jellyfin,
+- `playbooks/nodes/service/`: Cluster-hosted user services (e.g. Syncthing, Jellyfin,
   Vaultwarden).
 - `playbooks/ipkvm/infrastructure/`: OS-level configurations for IP KVM devices.
 
@@ -193,8 +193,8 @@ just install <GROUP> <CATEGORY> <PLAYBOOK>
 **Examples:**
 
 ```sh
-just install homelab infrastructure docker
-just install homelab cluster observability
+just install nodes infrastructure docker
+just install nodes cluster observability
 just install ipkvm infrastructure tailscale
 ```
 
@@ -217,14 +217,14 @@ just lint [TARGET]
 **Example:**
 
 ```sh
-just lint playbooks/homelab/cluster/bootstrap.yml
+just lint playbooks/nodes/cluster/bootstrap.yml
 ```
 
 ## Kubernetes
 
 ### Deploy a New Cluster
 
-Requires `ssh`, `network`, `docker`, and optionally `nfs` from `playbooks/homelab/infrastructure/`
+Requires `ssh`, `network`, `docker`, and optionally `nfs` from `playbooks/nodes/infrastructure/`
 to be installed first. Then run the cluster playbooks in this order:
 
 1. `kubernetes`
@@ -239,7 +239,7 @@ to be installed first. Then run the cluster playbooks in this order:
 10. `gitops`
 11. `security`
 
-Once complete, services in `playbooks/homelab/service/` are self-contained and can be installed in
+Once complete, services in `playbooks/nodes/service/` are self-contained and can be installed in
 any order.
 
 ### Destroy the Cluster
@@ -256,18 +256,18 @@ kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock
   not consumed by any playbook configuration — the port values defined here are used only by the
   UFW firewall rules and must match what the service actually listens on: `ssh`, `kubelet`,
   `etcd_client`, `etcd_peer`, `cilium_vxlan`, `cilium_health`, `hubble_peer`, and `nfs`.
-- **SSH port**: `ufw_allowed_ports.ssh.port` in `group_vars/homelab.yml` must match `ansible_port`
+- **SSH port**: `ufw_allowed_ports.ssh.port` in `group_vars/nodes.yml` must match `ansible_port`
   in `inventory.yml`.
-- **`become_exe` configuration**: `become_exe` must be set to `sudo.ws` on homelab nodes to resolve
+- **`become_exe` configuration**: `become_exe` must be set to `sudo.ws` on cluster nodes to resolve
   an issue with Ansible. See [Ansible Issue #85837](https://github.com/ansible/ansible/issues/85837)
   for details. IP KVM playbooks use standard `sudo` as `sudo.ws` is not available on Arch Linux.
 - **Service playbook run order**: Once the cluster playbooks (`bootstrap`, `network`, `storage`,
   `database`, `observability`, `secrets`, `authentication`, `git`, `gitops`, `security`) have all been run,
-  services in `playbooks/homelab/service/` are self-contained. Each service playbook applies its
+  services in `playbooks/nodes/service/` are self-contained. Each service playbook applies its
   own HTTPRoute, Traefik ForwardAuth Middleware, and namespace hardening, so adding a new service
   does NOT require re-running any cluster playbook:
   ```sh
-  just install homelab service <SERVICE>
+  just install nodes service <SERVICE>
   ```
 - **Cluster master credentials in the pass store**: every cluster-level master key — the etcd
   encryption-at-rest key plus the OpenBao unseal keys + root token — lives in the operator's
@@ -302,7 +302,7 @@ kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock
   `kube-apiserver.yaml` pod manifest; the kubelet reloads the apiserver automatically. Run after
   `cluster/authentication.yml`:
   ```sh
-  just install homelab cluster security
+  just install nodes cluster security
   ```
 - **Falco**: `cluster/security.yml` also deploys Falco as a DaemonSet via the
   `falcosecurity/falco` Helm chart. Falco monitors kernel syscalls using the modern eBPF driver
@@ -336,7 +336,7 @@ kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock
   (token-authenticated, no ForwardAuth). After every cluster reboot OpenBao comes up sealed;
   re-running the same command unseals it:
   ```sh
-  just install homelab cluster secrets
+  just install nodes cluster secrets
   ```
   The web UI is enabled in the pod but only reachable after `cluster/authentication.yml` runs,
   which adds a `/`-prefix HTTPRoute gated by Authentik ForwardAuth (so `openbao.<DNS_ZONE>/ui/`

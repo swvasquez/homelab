@@ -1,0 +1,95 @@
+---
+# ==============================================================================
+# Playbook: Install and Configure Docker
+# ==============================================================================
+# Installs and configures Docker Engine and Docker Compose.
+#
+# This playbook performs the following actions:
+#   - Installs prerequisite packages (ca-certificates, curl).
+#   - Adds Docker's official GPG key and APT repository.
+#   - Installs Docker Engine, CLI, containerd, and Docker Compose plugin.
+#   - Adds the current user to the 'docker' group to manage Docker as a
+#     non-root user.
+#   - Starts and enables the Docker service.
+#
+# Variables:
+#   docker_prereq_packages:  List of APT packages required to add Docker's
+#                            repository (default: [ca-certificates, curl]).
+#   docker_packages:         List of Docker APT packages to install
+#                            (default: [docker-ce, docker-ce-cli, containerd.io,
+#                            docker-buildx-plugin, docker-compose-plugin]).
+
+- name: Install and configure Docker
+  hosts: nodes
+  become: true
+  become_exe: sudo.ws
+  vars:
+    docker_prereq_packages:
+      - ca-certificates
+      - curl
+    docker_packages:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Prerequisites
+    # Installs packages needed to add the Docker APT repository securely, and
+    # ensures the system keyring directory exists to store the GPG key.
+    # -------------------------------------------------------------------------
+    - name: Install prerequisite packages for Docker repository
+      ansible.builtin.apt:
+        name: "{{ docker_prereq_packages }}"
+        state: present
+
+    - name: Ensure /etc/apt/keyrings directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    # -------------------------------------------------------------------------
+    # Repository Configuration
+    # Adds Docker's official GPG key and APT repository so that packages can
+    # be installed from Docker's distribution channel rather than the OS repos.
+    # -------------------------------------------------------------------------
+    - name: Download Docker's official GPG key
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
+
+    - name: Add the official Docker APT repository
+      ansible.builtin.apt_repository:
+        repo: >
+          deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc]
+          https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+        filename: docker
+        state: present
+        update_cache: true
+
+    # -------------------------------------------------------------------------
+    # Installation and Service Configuration
+    # Installs Docker Engine and its plugins, grants the current user non-root
+    # access via the 'docker' group, and starts the Docker daemon on boot.
+    # -------------------------------------------------------------------------
+    - name: Install Docker Engine, CLI, and plugins
+      ansible.builtin.apt:
+        name: "{{ docker_packages }}"
+        state: present
+        update_cache: true
+
+    - name: Add user to the 'docker' group
+      ansible.builtin.user:
+        name: "{{ ansible_user_id }}"
+        groups: docker
+        append: true
+
+    - name: Start and enable the Docker service
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true

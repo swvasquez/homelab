@@ -1,0 +1,302 @@
+#!/bin/bash
+# ==============================================================================
+# k8s-node-lifecycle.sh
+# ==============================================================================
+# Manages Kubernetes node lifecycle during system shutdown and startup.
+# Called by k8s-graceful-shutdown.service via ExecStop (shutdown) and
+# ExecStart (startup). Not used by the suspend path — k8s-suspend-hook.sh
+# handles suspend/resume with a purely local teardown (no drain, no kubectl).
+#
+# This is the PRIMARY nightly path. shutdown_mode is set to `shutdown` in
+# group_vars/nodes.yml because s2idle is unreliable on this Ryzen
+# workstation hardware (no S3 exposed by BIOS, s0ix never actually entered).
+# The nightly cron poweroffs each node, and WoL cold-boots them the next
+# morning — both sides go through this script.
+#
+# On shutdown:
+#   1. Syncs pending writes while volumes are still active.
+#   2. Cordons and drains workload pods first (with --ignore-daemonsets) so
+#      they can unmount Longhorn volumes cleanly while Longhorn is still
+#      running. Draining after the taint risks a deadlock where workload pods
+#      are stuck terminating because Longhorn was evicted before they finished
+#      unmounting.
+#   3. Applies a NoExecute taint to evict Longhorn DaemonSet pods.
+#   4. Waits for Longhorn pods to terminate so iSCSI volumes detach.
+#   5. Waits for iSCSI block devices to disappear, confirming detachment.
+#      Detection uses the same sysfs-based check as k8s-suspend-hook.sh so
+#      both scripts agree on "iSCSI device present" — important on nodes
+#      where local SATA disks also surface as /dev/sd*.
+#
+# On startup:
+#   1. Forks boot tasks into the background so ExecStart returns immediately.
+#      This ensures ExecStop is always eligible to fire on shutdown, even if
+#      the API server is not yet reachable when the service starts. Without
+#      this, a stuck uncordon retry loop blocks ExecStart, and systemd skips
+#      ExecStop entirely (oneshot services only run ExecStop after ExecStart
+#      completes).
+#   2. Background: removes the suspend/shutdown taint with retries until the
+#      API server is reachable.
+#   3. Background: waits for Longhorn iSCSI volumes to reattach.
+#   4. Background: uncordons the node so workload pod scheduling resumes.
+#
+# On shutdown (API unreachable fallback):
+#   If kubectl cannot reach the API server, falls back to a local-only
+#   teardown (no drain): stops kubelet, force-unmounts CSI volumes, logs
+#   out iSCSI sessions, waits for block devices to detach, and stops iscsid.
+#   This prevents the ext4 I/O errors and lvm2-monitor hangs that occur when
+#   systemd's normal shutdown sequence tears down iscsid while Longhorn
+#   volumes are still mounted.
+#
+#   The umount step is gated behind an iSCSI-reachability probe (same guard
+#   the suspend hook uses). An ext4 umount on a dead iSCSI target blocks in
+#   uninterruptible D-state and cannot be killed even by SIGKILL — which
+#   would hang the outer service at its TimeoutStopSec ceiling. If no
+#   session is alive at cleanup time, umount is skipped entirely; the data
+#   was already unreachable before we got here.
+#
+# Flags:
+#   --skip-device-wait  Skip waiting for iSCSI devices to disappear after
+#                       drain. Preserved for manual invocation; no automated
+#                       caller currently passes it.
+# ==============================================================================
+
+set -o pipefail
+
+KUBECONFIG="{{ kubectl_config_path }}"
+NODE="$(hostname)"
+LOG_TAG="k8s-node-lifecycle"
+ACTION="${1:-stop}"
+SKIP_DEVICE_WAIT=false
+SUSPEND_TAINT='homelab.io/suspending:NoExecute'
+LONGHORN_EVICTION_TIMEOUT=60
+
+for arg in "${@:2}"; do
+    case "$arg" in
+        --skip-device-wait) SKIP_DEVICE_WAIT=true ;;
+    esac
+done
+
+log() {
+    echo "$1" | systemd-cat -t "$LOG_TAG" -p info
+}
+
+log_err() {
+    echo "$1" | systemd-cat -t "$LOG_TAG" -p err
+}
+
+apply_suspend_taint() {
+    log "Applying suspend taint to evict Longhorn DaemonSet pods"
+    timeout 15 kubectl --kubeconfig="$KUBECONFIG" taint node "$NODE" "$SUSPEND_TAINT" --overwrite &>/dev/null || true
+}
+
+wait_for_longhorn_eviction() {
+    local deadline=$(( $(date +%s) + LONGHORN_EVICTION_TIMEOUT ))
+    log "Waiting for Longhorn pods to be evicted (timeout: ${LONGHORN_EVICTION_TIMEOUT}s)"
+    while timeout 10 kubectl --kubeconfig="$KUBECONFIG" get pods -n longhorn-system \
+            --field-selector="spec.nodeName=$NODE" --no-headers 2>/dev/null | grep -q .; do
+        if (( $(date +%s) >= deadline )); then
+            log_err "Timed out waiting for Longhorn eviction — proceeding anyway"
+            return 0
+        fi
+        sleep 2
+    done
+    log "Longhorn pods evicted"
+}
+
+unmount_csi_volumes() {
+    log 'Force-unmounting any lingering kubelet CSI volume mounts'
+    local mp
+    # Deepest paths first so bind mounts unmount before their sources.
+    # Scoped to /var/lib/kubelet to avoid touching the root filesystem.
+    while read -r mp; do
+        [[ -z "$mp" ]] && continue
+        log "Unmounting $mp"
+        if ! timeout 10 umount "$mp" &>/dev/null; then
+            log "Unmount of $mp busy — killing holders and retrying"
+            timeout 5 fuser -km "$mp" &>/dev/null || true
+            sleep 1
+            timeout 10 umount "$mp" &>/dev/null \
+                || timeout 10 umount -l "$mp" &>/dev/null \
+                || log_err "Failed to unmount $mp"
+        fi
+    done < <(awk '$2 ~ "kubernetes.io~csi|/plugins/kubernetes.io/csi" {print $2}' /proc/mounts | sort -r)
+}
+
+iscsi_target_reachable() {
+    # LOAD-BEARING GUARD — DO NOT REMOVE. Probes for at least one live iSCSI
+    # session. Used to gate umount: an ext4 umount on a dead iSCSI target
+    # enters uninterruptible D-state and cannot be killed even by SIGKILL,
+    # which hangs the entire shutdown path until systemd's TimeoutStopSec
+    # fires. Skipping umount when sessions are dead is the only safe action —
+    # the underlying data was already unreachable before we got here.
+    # Matches the guard used by k8s-suspend-hook.sh.
+    timeout 5 iscsiadm -m session &>/dev/null
+}
+
+local_iscsi_cleanup() {
+    # Fallback teardown when the API server is unreachable and kubectl drain
+    # cannot run. Mirrors the suspend hook's pre-suspend path so iSCSI-backed
+    # volumes are cleanly detached before systemd's shutdown sequence tears
+    # down iscsid, preventing ext4 I/O errors and lvm2-monitor hangs.
+    log "API server unreachable — falling back to local iSCSI cleanup"
+    log "Stopping kubelet"
+    timeout 30 systemctl stop kubelet &>/dev/null || true
+    log "Syncing pending writes before iSCSI logout"
+    timeout 30 sync || log_err "sync timed out — proceeding anyway"
+    if iscsi_target_reachable; then
+        unmount_csi_volumes
+    else
+        log_err "iSCSI sessions already dead — skipping umount to avoid D-state hang"
+    fi
+    log "Logging out iSCSI sessions"
+    timeout 30 iscsiadm -m node --logout &>/dev/null || true
+    local deadline=$(( $(date +%s) + 60 ))
+    log "Waiting for iSCSI devices to detach (timeout: 60s)"
+    while iscsi_devices_present; do
+        if (( $(date +%s) >= deadline )); then
+            log_err "Timed out waiting for iSCSI devices to detach — proceeding anyway"
+            break
+        fi
+        sleep 2
+    done
+    log "Stopping iscsid"
+    timeout 15 systemctl stop iscsid.socket iscsid.service &>/dev/null || true
+    log "Local iSCSI cleanup complete"
+}
+
+iscsi_devices_present() {
+    # Check for iSCSI-backed block devices by looking at the iscsi_session sysfs tree.
+    # Avoids falsely matching local SATA/SAS disks which also surface as /dev/sd*.
+    # Matches the detection used by k8s-suspend-hook.sh so both scripts agree on
+    # what "iSCSI device present" means.
+    ls /sys/class/iscsi_session/*/device/target*/*/block/sd* &>/dev/null 2>&1
+}
+
+wait_for_iscsi_attach() {
+    local deadline=$(( $(date +%s) + 60 ))
+    log "Waiting for Longhorn iSCSI volumes to reattach (timeout: 60s)"
+    while ! iscsi_devices_present; do
+        if (( $(date +%s) >= deadline )); then
+            log_err "Timed out waiting for iSCSI volumes to reattach — proceeding with uncordon"
+            return 0
+        fi
+        sleep 2
+    done
+    log "iSCSI volumes reattached"
+}
+
+remove_suspend_taint() {
+    local deadline=$(( $(date +%s) + {{ k8s_uncordon_timeout }} ))
+    log "Removing suspend taint from node (timeout: {{ k8s_uncordon_timeout }}s)"
+    while true; do
+        local taints
+        if taints=$(timeout 10 kubectl --kubeconfig="$KUBECONFIG" get node "$NODE" \
+                -o jsonpath='{.spec.taints[*].key}' 2>/dev/null); then
+            if [[ "$taints" != *'homelab.io/suspending'* ]]; then
+                log "Suspend taint not present"
+                return 0
+            fi
+            if timeout 10 kubectl --kubeconfig="$KUBECONFIG" taint node "$NODE" homelab.io/suspending- &>/dev/null; then
+                log "Suspend taint removed"
+                return 0
+            fi
+        fi
+
+        if (( $(date +%s) >= deadline )); then
+            log_err "Timed out waiting to remove suspend taint — node may still be tainted"
+            return 0
+        fi
+
+        log "API server not ready or taint removal failed — retrying in 5s"
+        sleep 5
+    done
+}
+
+# ------------------------------------------------------------------------------
+# Startup: fork boot tasks into background so ExecStart returns immediately.
+# ExecStop (drain) is only eligible after ExecStart completes for Type=oneshot
+# services. If the uncordon loop ran in the foreground and the user shuts down
+# before it finishes, ExecStop never fires — no drain, no iSCSI cleanup.
+# Forking ensures the service reaches active state in <1s regardless of API
+# server availability.
+# ------------------------------------------------------------------------------
+if [[ "$ACTION" == "start" ]]; then
+    log "Startup detected — forking boot tasks into background"
+    (
+        remove_suspend_taint
+        wait_for_iscsi_attach
+        DEADLINE=$(( $(date +%s) + {{ k8s_uncordon_timeout }} ))
+        while true; do
+            if timeout 10 kubectl --kubeconfig="$KUBECONFIG" uncordon "$NODE" &>/dev/null; then
+                log "Node $NODE uncordoned successfully"
+                exit 0
+            fi
+            log "API server not ready or uncordon failed — retrying in 5s"
+            if (( $(date +%s) >= DEADLINE )); then
+                log_err "Timed out waiting to uncordon $NODE — node may still be cordoned"
+                exit 0
+            fi
+            sleep 5
+        done
+    ) &
+    disown $!
+    exit 0
+fi
+
+# ------------------------------------------------------------------------------
+# Shutdown: evict Longhorn, drain, wait for iSCSI detachment
+# ------------------------------------------------------------------------------
+log "Shutdown detected — attempting graceful drain of node $NODE"
+
+if ! timeout 15 kubectl --kubeconfig="$KUBECONFIG" get node "$NODE" &>/dev/null; then
+    local_iscsi_cleanup
+    exit 0
+fi
+
+log "Clearing any stale suspend taint from a previous failed suspend"
+timeout 15 kubectl --kubeconfig="$KUBECONFIG" taint node "$NODE" homelab.io/suspending- &>/dev/null || true
+
+log "Syncing pending writes before draining (timeout: 30s)"
+timeout 30 sync || log_err "sync timed out — proceeding anyway"
+
+log "Cordoning node $NODE"
+if ! timeout 15 kubectl --kubeconfig="$KUBECONFIG" cordon "$NODE"; then
+    log_err "Failed to cordon $NODE — skipping drain"
+    exit 0
+fi
+
+log "Draining node $NODE (timeout: {{ k8s_drain_timeout }}s)"
+if ! timeout "$(( {{ k8s_drain_timeout }} + 30 ))" kubectl --kubeconfig="$KUBECONFIG" drain "$NODE" \
+    --ignore-daemonsets \
+    --delete-emptydir-data \
+    --disable-eviction \
+    --grace-period="{{ k8s_drain_grace_period }}" \
+    --timeout="{{ k8s_drain_timeout }}s"; then
+    log_err "Drain of $NODE failed or timed out — proceeding with shutdown anyway"
+fi
+
+log "Node $NODE drained successfully"
+
+apply_suspend_taint
+wait_for_longhorn_eviction
+
+# ------------------------------------------------------------------------------
+# Wait for Longhorn iSCSI volumes to detach.
+# Detection uses the same iscsi_devices_present sysfs check as the suspend hook
+# so both scripts agree on what "iSCSI device present" means — crucial on nodes
+# where local SATA disks also appear as /dev/sd*.
+# ------------------------------------------------------------------------------
+if [[ "$SKIP_DEVICE_WAIT" == false ]]; then
+    log "Waiting for iSCSI volumes to detach"
+    DEADLINE=$(( $(date +%s) + 120 ))
+    while iscsi_devices_present; do
+        if (( $(date +%s) >= DEADLINE )); then
+            log_err "Timed out waiting for iSCSI volumes to detach — proceeding anyway"
+            break
+        fi
+        sleep 5
+    done
+    log "iSCSI volumes detached"
+fi
+
+exit 0

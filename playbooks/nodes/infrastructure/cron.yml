@@ -1,0 +1,39 @@
+---
+# ==============================================================================
+# Playbook: Configure System Cron Jobs
+# ==============================================================================
+# Configures system-wide cron jobs for system maintenance and automation.
+#
+# Current tasks:
+#   - Scheduled System Shutdown: Shuts down or suspends the system at a
+#     configured time. The behavior is controlled by shutdown_mode:
+#       - 'suspend'  triggers S3 suspend-to-RAM via 'systemctl suspend'
+#       - 'shutdown' performs a full power-off via '/usr/sbin/shutdown -h now'
+#
+# Variables:
+#   shutdown_schedule:  Cron schedule string in standard 5-field notation
+#                       (e.g., '0 4 * * *'). Read from group_vars.
+#   shutdown_mode:      'suspend' or 'shutdown'. Read from group_vars.
+
+- name: Configure system cron jobs
+  hosts: nodes
+  become: true
+  become_exe: sudo.ws
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Scheduled Shutdown
+    # Creates a cron job that either suspends or shuts down the system at the
+    # time defined by shutdown_schedule. The command is selected based on
+    # shutdown_mode: 'suspend' uses systemctl suspend for S3 sleep, 'shutdown'
+    # uses /usr/sbin/shutdown -h now for a full power-off.
+    # -------------------------------------------------------------------------
+    - name: Create scheduled shutdown cron job
+      ansible.builtin.cron:
+        name: Scheduled System Shutdown
+        minute: "{{ shutdown_schedule.split(' ')[0] }}"
+        hour: "{{ shutdown_schedule.split(' ')[1] }}"
+        day: "{{ shutdown_schedule.split(' ')[2] }}"
+        month: "{{ shutdown_schedule.split(' ')[3] }}"
+        weekday: "{{ shutdown_schedule.split(' ')[4] }}"
+        job: "{{ '/bin/systemctl suspend' if shutdown_mode == 'suspend' else '/usr/sbin/shutdown -h now' }}"

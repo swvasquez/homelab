@@ -1,0 +1,86 @@
+---
+# ==============================================================================
+# Playbook: Configure Wake-on-LAN
+# ==============================================================================
+# Configures Wake-on-LAN (WoL) for a specified network interface using Netplan.
+#
+# This playbook performs the following actions:
+#   - Installs 'ethtool' and 'wakeonlan' utilities.
+#   - Removes /etc/netplan/00-installer-config.yaml if present, as it conflicts
+#     with the WoL config by managing the same interface.
+#   - Creates a Netplan configuration file (/etc/netplan/50-wol.yaml) to
+#     enable WoL on the specified interface. IPv6 is explicitly disabled
+#     (dhcp6, ipv6-privacy, link-local) to prevent systemd-networkd from
+#     waiting for an IPv6 Router Advertisement that never arrives, which
+#     causes the interface to remain in 'configuring' state.
+#   - Notifies a handler to apply the Netplan configuration.
+#
+# Variables (set in inventory.yml per host):
+#   network_interface:  The name of the network interface to configure
+#                       (e.g., eno1).
+#   mac_address:        The MAC address of the network interface
+#                       (e.g., 00:11:22:33:44:55).
+#
+# Variables:
+#   wol_packages:       List of APT packages to install for WoL support
+#                       (default: [ethtool, wakeonlan]).
+
+- name: Configure Wake-on-LAN (WoL)
+  hosts: nodes
+  become: true
+  become_exe: sudo.ws
+  vars:
+    wol_packages:
+      - ethtool
+      - wakeonlan
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Installation
+    # Installs ethtool for querying and setting NIC parameters, and wakeonlan
+    # for sending magic packets to wake remote machines.
+    # -------------------------------------------------------------------------
+    - name: Install WoL and networking utilities
+      ansible.builtin.apt:
+        name: "{{ wol_packages }}"
+        state: present
+        update_cache: true
+
+    # -------------------------------------------------------------------------
+    # Netplan Configuration
+    # Writes a Netplan configuration file that enables Wake-on-LAN on the
+    # target interface and applies it via a handler.
+    # -------------------------------------------------------------------------
+    - name: Remove Ubuntu installer netplan config
+      ansible.builtin.file:
+        path: /etc/netplan/00-installer-config.yaml
+        state: absent
+      notify: Apply Netplan configuration
+
+    - name: Deploy Netplan configuration for WoL
+      ansible.builtin.copy:
+        dest: /etc/netplan/50-wol.yaml
+        mode: '0600'
+        content: |
+          network:
+            version: 2
+            renderer: networkd
+            ethernets:
+              {{ network_interface }}:
+                match:
+                  macaddress: "{{ mac_address }}"
+                wakeonlan: true
+                dhcp4: true
+                dhcp6: false
+                ipv6-privacy: false
+                link-local: []
+      notify: Apply Netplan configuration
+
+  handlers:
+    # -------------------------------------------------------------------------
+    # Handlers
+    # -------------------------------------------------------------------------
+    - name: Apply Netplan configuration
+      ansible.builtin.command:
+        cmd: netplan apply
+      changed_when: false

@@ -1,0 +1,323 @@
+---
+# ==============================================================================
+# Playbook: Install Common CLI Tools
+# ==============================================================================
+# Installs a curated collection of modern command-line utilities to enhance
+# shell productivity, along with developer productivity tools for text editing,
+# terminal multiplexing, navigation, and file management. atuin requires
+# Ubuntu 24.04 or later (universe repository enabled).
+#
+# This playbook installs the following packages:
+#   - atuin:     A shell history manager with sync and search capabilities.
+#   - bat:       A 'cat' replacement with syntax highlighting and git integration.
+#                Installed as 'batcat'; symlinked to 'bat' in /usr/local/bin.
+#   - btop:      A modern, interactive process and resource monitor.
+#   - duf:       A user-friendly disk usage summary, replacing 'df'.
+#   - fd-find:   A simple, fast, and user-friendly alternative to 'find'.
+#   - fzf:       A general-purpose command-line fuzzy finder.
+#   - helix:     A modal text editor with built-in language server support
+#                (installed from GitHub releases; see below).
+#   - jq:        A lightweight and flexible command-line JSON processor.
+#   - hyperfine: A command-line benchmarking tool.
+#   - mtr:       A network diagnostic tool combining ping and traceroute
+#                (package: mtr-tiny).
+#   - ncdu:      An interactive, ncurses-based disk usage explorer.
+#   - parallel:  A shell tool for executing jobs in parallel.
+#   - pigz:      A parallel implementation of gzip.
+#   - ripgrep:   A line-oriented search tool that recursively searches the
+#                current directory for a regex pattern.
+#   - unzip:     Utility for extracting ZIP archives.
+#   - vim:       A highly configurable text editor.
+#   - yq:        A portable command-line YAML processor.
+#   - zoxide:    A smarter 'cd' command that learns your most-used directories.
+#
+# The following tools are installed from GitHub releases:
+#   - bash-preexec: Provides preexec/precmd hook support in bash, required by
+#                   atuin for shell history integration.
+#   - helix:        A modal text editor installed with its runtime directory to
+#                   /usr/local/lib/helix, with 'hx' symlinked to /usr/local/bin.
+#   - yazi:         A terminal file manager with a 'ya' companion CLI.
+#   - zellij:       A terminal multiplexer with a built-in layout system.
+#
+# A .bashrc is deployed to /etc/skel and all existing user home directories,
+# configuring history settings, vi editing mode, and shell integrations for
+# atuin, zoxide, and yazi.
+#
+# Variables:
+#   util_packages:         List of APT packages to install as common CLI utilities
+#                          (default: [atuin, bat, btop, duf, fd-find, ...]).
+#   bash_preexec_url:      URL to download the bash-preexec script
+#                          (default: https://raw.githubusercontent.com/rcaloras/bash-preexec/master/bash-preexec.sh).
+#   bash_preexec_dest:     System-wide installation path for the bash-preexec script
+#                          (default: /usr/local/lib/bash-preexec.sh).
+#   helix_version:         Version of helix to install (default: 25.01).
+#   helix_arch:            CPU architecture identifier for the helix binary
+#                          (default: x86_64).
+#   zellij_version:        Version of zellij to install (default: 0.41.0).
+#   zellij_arch:           CPU architecture identifier for the zellij binary
+#                          (default: x86_64).
+#   yazi_version:          Version of yazi to install (default: 0.4.0).
+#   yazi_arch:             CPU architecture identifier for the yazi binary
+#                          (default: x86_64).
+
+- name: Install common CLI tools
+  hosts: nodes
+  become: true
+  become_exe: sudo.ws
+  vars:
+    util_packages:
+      - atuin
+      - bat
+      - btop
+      - duf
+      - fd-find
+      - fzf
+      - jq
+      - hyperfine
+      - mtr-tiny
+      - ncdu
+      - parallel
+      - pigz
+      - ripgrep
+      - unzip
+      - vim
+      - yq
+      - zoxide
+    bash_preexec_url: 'https://raw.githubusercontent.com/rcaloras/bash-preexec/master/bash-preexec.sh'
+    bash_preexec_dest: '/usr/local/lib/bash-preexec.sh'
+    helix_version: '25.01'
+    helix_arch: 'x86_64'
+    zellij_version: '0.41.0'
+    zellij_arch: 'x86_64'
+    yazi_version: '0.4.0'
+    yazi_arch: 'x86_64'
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # APT Packages
+    # Installs common CLI utilities and developer productivity tools from the
+    # OS package manager, making them available system-wide to all users.
+    # -------------------------------------------------------------------------
+    - name: Install common CLI tool packages
+      ansible.builtin.apt:
+        name: '{{ util_packages }}'
+        state: present
+        update_cache: true
+
+    - name: Symlink batcat to bat in /usr/local/bin
+      ansible.builtin.file:
+        src: /usr/bin/batcat
+        dest: /usr/local/bin/bat
+        state: link
+
+    # -------------------------------------------------------------------------
+    # bash-preexec
+    # Downloads the bash-preexec hook framework to a system-wide path. It
+    # provides preexec and precmd hook support in bash, which atuin requires
+    # for shell history integration.
+    # -------------------------------------------------------------------------
+    - name: Download bash-preexec to system library directory
+      ansible.builtin.get_url:
+        url: '{{ bash_preexec_url }}'
+        dest: '{{ bash_preexec_dest }}'
+        mode: '0644'
+
+    # -------------------------------------------------------------------------
+    # GitHub Binary Tools
+    # Downloads and installs helix, zellij, and yazi from GitHub releases.
+    # Each tool is skipped if the target version is already present.
+    #   - helix:  tar.xz containing an 'hx' binary and a 'runtime/' directory;
+    #             installed to /usr/local/lib/helix with 'hx' symlinked into
+    #             /usr/local/bin. The runtime directory must be co-located with
+    #             the binary for themes and language queries to work.
+    #   - zellij: tar.gz containing a single binary; extracted directly to
+    #             /usr/local/bin.
+    #   - yazi:   zip nested under a named subdirectory containing 'yazi' and
+    #             'ya' binaries; both copied to /usr/local/bin.
+    # -------------------------------------------------------------------------
+    - name: Check installed helix version
+      ansible.builtin.command:
+        cmd: hx --version
+      register: helix_installed
+      changed_when: false
+      failed_when: false
+
+    - name: Install helix
+      when: helix_installed.rc != 0 or helix_version not in helix_installed.stdout
+      vars:
+        helix_archive: 'helix-{{ helix_version }}-{{ helix_arch }}-linux.tar.xz'
+        helix_download_url: >-
+          https://github.com/helix-editor/helix/releases/download/{{ helix_version }}/{{ helix_archive }}
+        helix_tmp_path: '/tmp/{{ helix_archive }}'
+        helix_extract_dir: '/tmp/helix-{{ helix_version }}-{{ helix_arch }}-linux'
+        helix_install_dir: '/usr/local/lib/helix'
+      block:
+        - name: Download helix archive
+          ansible.builtin.get_url:
+            url: '{{ helix_download_url }}'
+            dest: '{{ helix_tmp_path }}'
+            mode: '0644'
+
+        - name: Extract helix archive to /tmp
+          ansible.builtin.unarchive:
+            src: '{{ helix_tmp_path }}'
+            dest: /tmp
+            remote_src: true
+
+        - name: Remove previous helix installation
+          ansible.builtin.file:
+            path: '{{ helix_install_dir }}'
+            state: absent
+
+        - name: Create helix installation directory
+          ansible.builtin.file:
+            path: '{{ helix_install_dir }}'
+            state: directory
+            mode: '0755'
+
+        - name: Install hx binary to helix installation directory
+          ansible.builtin.copy:
+            src: '{{ helix_extract_dir }}/hx'
+            dest: '{{ helix_install_dir }}/hx'
+            remote_src: true
+            mode: '0755'
+
+        - name: Install helix runtime directory
+          ansible.builtin.copy:
+            src: '{{ helix_extract_dir }}/runtime'
+            dest: '{{ helix_install_dir }}/'
+            remote_src: true
+            mode: '0755'
+
+        - name: Symlink hx to /usr/local/bin
+          ansible.builtin.file:
+            src: '{{ helix_install_dir }}/hx'
+            dest: /usr/local/bin/hx
+            state: link
+
+        - name: Clean up helix archive and extracted directory
+          ansible.builtin.file:
+            path: '{{ item }}'
+            state: absent
+          loop:
+            - '{{ helix_tmp_path }}'
+            - '{{ helix_extract_dir }}'
+
+    - name: Check installed zellij version
+      ansible.builtin.command:
+        cmd: zellij --version
+      register: zellij_installed
+      changed_when: false
+      failed_when: false
+
+    - name: Install zellij
+      when: zellij_installed.rc != 0 or zellij_version not in zellij_installed.stdout
+      vars:
+        zellij_archive: 'zellij-{{ zellij_arch }}-unknown-linux-musl.tar.gz'
+        zellij_download_url: >-
+          https://github.com/zellij-org/zellij/releases/download/v{{ zellij_version }}/{{ zellij_archive }}
+        zellij_tmp_path: '/tmp/{{ zellij_archive }}'
+      block:
+        - name: Download zellij archive
+          ansible.builtin.get_url:
+            url: '{{ zellij_download_url }}'
+            dest: '{{ zellij_tmp_path }}'
+            mode: '0644'
+
+        - name: Extract zellij binary to /usr/local/bin
+          ansible.builtin.unarchive:
+            src: '{{ zellij_tmp_path }}'
+            dest: /usr/local/bin
+            remote_src: true
+
+        - name: Clean up zellij archive
+          ansible.builtin.file:
+            path: '{{ zellij_tmp_path }}'
+            state: absent
+
+    - name: Check installed yazi version
+      ansible.builtin.command:
+        cmd: yazi --version
+      register: yazi_installed
+      changed_when: false
+      failed_when: false
+
+    - name: Install yazi
+      when: yazi_installed.rc != 0 or yazi_version not in yazi_installed.stdout
+      vars:
+        yazi_archive: 'yazi-{{ yazi_arch }}-unknown-linux-musl.zip'
+        yazi_download_url: >-
+          https://github.com/sxyazi/yazi/releases/download/v{{ yazi_version }}/{{ yazi_archive }}
+        yazi_tmp_path: '/tmp/{{ yazi_archive }}'
+        yazi_extract_dir: '/tmp/yazi-{{ yazi_arch }}-unknown-linux-musl'
+      block:
+        - name: Download yazi archive
+          ansible.builtin.get_url:
+            url: '{{ yazi_download_url }}'
+            dest: '{{ yazi_tmp_path }}'
+            mode: '0644'
+
+        - name: Extract yazi archive
+          ansible.builtin.unarchive:
+            src: '{{ yazi_tmp_path }}'
+            dest: /tmp
+            remote_src: true
+
+        - name: Install yazi and ya binaries to /usr/local/bin
+          ansible.builtin.copy:
+            src: '{{ yazi_extract_dir }}/{{ item }}'
+            dest: '/usr/local/bin/{{ item }}'
+            remote_src: true
+            mode: '0755'
+          loop:
+            - yazi
+            - ya
+
+        - name: Clean up yazi archive and extracted directory
+          ansible.builtin.file:
+            path: '{{ item }}'
+            state: absent
+          loop:
+            - '{{ yazi_tmp_path }}'
+            - '{{ yazi_extract_dir }}'
+
+    # -------------------------------------------------------------------------
+    # Shell Configuration
+    # Deploys a .bashrc template to /etc/skel so new users inherit it
+    # automatically, and to all existing user home directories under /home and
+    # the root home directory. The template configures history settings, vi
+    # editing mode, and shell integrations for atuin, zoxide, and yazi.
+    # -------------------------------------------------------------------------
+    - name: Deploy .bashrc template to /etc/skel
+      ansible.builtin.template:
+        src: bashrc.j2
+        dest: /etc/skel/.bashrc
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Find existing user home directories
+      ansible.builtin.find:
+        paths: /home
+        file_type: directory
+        recurse: false
+      register: home_dirs
+
+    - name: Deploy .bashrc to existing user home directories
+      ansible.builtin.template:
+        src: bashrc.j2
+        dest: '{{ item.path }}/.bashrc'
+        owner: '{{ item.path | basename }}'
+        group: '{{ item.path | basename }}'
+        mode: '0644'
+      loop: '{{ home_dirs.files }}'
+      loop_control:
+        label: '{{ item.path }}'
+
+    - name: Deploy .bashrc to root home directory
+      ansible.builtin.template:
+        src: bashrc.j2
+        dest: /root/.bashrc
+        owner: root
+        group: root
+        mode: '0644'
