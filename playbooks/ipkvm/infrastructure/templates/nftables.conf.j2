@@ -1,0 +1,50 @@
+#!/usr/sbin/nft -f
+# Managed by ansible. Do not edit by hand.
+#
+# Default-deny ingress with explicit allow rules for ports in
+# firewall_allowed_ports, restricted to lan_cidr and tailscale_cidr. Only
+# the input hook is filtered; forward and output are intentionally not
+# hooked here. tailscaled installs its own forward-accept and POSTROUTING
+# MASQUERADE rules in a separate nftables table for exit-node operation,
+# and a 'policy drop' chain at the forward hook in this table would drop
+# tailscale-forwarded packets even though tailscaled's own chain accepts
+# them (in netfilter, when multiple chains hook the same point, a drop
+# verdict in any one of them is final).
+#
+# Established/related connections are accepted via conntrack so outbound
+# flows (NAT traversal, package fetches, etc.) get return traffic.
+#
+# The table is deleted and recreated rather than flushed, because
+# 'flush table' only empties the rules inside existing chains and leaves
+# the chains themselves in place — so chains from a previous version of
+# this template (e.g., a 'forward' or 'output' chain we have since
+# removed) would persist and stay hooked. 'delete table' removes the
+# table and all its chains, giving a clean slate. The empty 'table inet
+# filter {}' on the line before makes 'delete table' safe on first run
+# (delete fails if the table does not exist).
+#
+# Only this table is touched on reload; tables managed by other
+# components (notably tailscaled's) are left alone, so their rules
+# survive playbook runs uninterrupted. A 'flush ruleset' would wipe
+# tailscaled's forward/MASQUERADE rules and they don't always come back
+# automatically — see https://github.com/tailscale/tailscale/issues/11926.
+table inet filter {}
+delete table inet filter
+table inet filter {
+  chain input {
+    type filter hook input priority 0; policy drop;
+
+    ct state { established, related } accept
+    ct state invalid drop
+    iif lo accept
+
+{% set tcp_ports = firewall_allowed_ports.values() | selectattr('protocol', 'equalto', 'tcp') | map(attribute='port') | list %}
+{% set udp_ports = firewall_allowed_ports.values() | selectattr('protocol', 'equalto', 'udp') | map(attribute='port') | list %}
+{% if tcp_ports %}
+    ip saddr { {{ lan_cidr }}, {{ tailscale_cidr }} } tcp dport { {{ tcp_ports | join(', ') }} } accept
+{% endif %}
+{% if udp_ports %}
+    ip saddr { {{ lan_cidr }}, {{ tailscale_cidr }} } udp dport { {{ udp_ports | join(', ') }} } accept
+{% endif %}
+  }
+}

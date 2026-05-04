@@ -91,7 +91,6 @@
                 - '{{ tailscale_ssh_server_tag }}'
               users:
                 - autogroup:nonroot
-                - root
 
     # -------------------------------------------------------------------------
     # ACL POST

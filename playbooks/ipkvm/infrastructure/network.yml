@@ -92,3 +92,122 @@
       ansible.builtin.service:
         name: systemd-resolved
         state: restarted
+
+# ==============================================================================
+# Playbook: Configure Host Firewall on IP KVM
+# ==============================================================================
+# Renders an nftables ruleset that enforces a default-deny ingress policy.
+# Each port in firewall_allowed_ports is opened only to the LAN CIDR and the
+# tailnet CIDR — nothing in this homelab needs world-accessible ingress.
+# Outbound traffic is allowed by default and conntrack accepts established
+# return traffic so outbound flows (NAT traversal, package fetches, etc.)
+# get their replies.
+#
+# Why nftables instead of UFW: the Arch Linux ARM UFW package is a Python
+# script whose modules live under /usr/lib/python3.X/site-packages/ufw.
+# Whenever Arch's Python jumps a minor version, UFW silently breaks until
+# the package is rebuilt against the new Python — a common partial-upgrade
+# state on PiKVM where the aarch64 mirror lags behind x86. nftables has no
+# language-runtime dependency and is the native Linux firewall, so it
+# survives Python upgrades cleanly.
+#
+# Variables:
+#   nftables_packages:       List of packages to install (default: [nftables]).
+#   firewall_allowed_ports:  Dictionary mapping service name to port and
+#                            protocol. Each entry is opened to lan_cidr and
+#                            tailscale_cidr. Set in group_vars/ipkvm.yml.
+#   lan_cidr:                CIDR of the homelab LAN. Set in
+#                            group_vars/ipkvm.yml.
+#   tailscale_cidr:          CIDR of the Tailscale CGNAT range. Defined as a
+#                            play var since it is fixed by RFC 6598.
+
+- name: Configure host firewall on IP KVM
+  hosts: ipkvm
+  become: true
+  become_exe: sudo
+  vars:
+    nftables_packages:
+      - nftables
+    # CGNAT range reserved by RFC 6598 and used for all Tailscale tailnet IPs.
+    # Fixed by IANA — Tailscale would have to migrate to a different reserved
+    # range to change it.
+    tailscale_cidr: 100.64.0.0/10
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Filesystem
+    # PiKVM mounts the root filesystem read-only by default. All write
+    # operations are wrapped in a block so the filesystem is always restored
+    # to read-only, even if a task fails.
+    # -------------------------------------------------------------------------
+    - name: Remount root filesystem as read-write
+      ansible.builtin.command: # noqa: command-instead-of-module
+        cmd: mount -o remount,rw /
+      changed_when: false
+
+    - name: Install and configure nftables
+      block:
+        # ---------------------------------------------------------------------
+        # Installation
+        # Installs nftables from the official Arch Linux repository.
+        # ---------------------------------------------------------------------
+        - name: Install nftables package
+          community.general.pacman:
+            name: '{{ nftables_packages }}'
+            state: present
+            update_cache: true
+
+        # ---------------------------------------------------------------------
+        # Ruleset
+        # Renders /etc/nftables.conf from the inventory of allowed ports and
+        # applies it directly via 'nft -f' rather than notifying a handler
+        # that runs 'systemctl restart nftables'. Two reasons:
+        #
+        #   - 'nft -f' fails the task on a syntax or load error, so a
+        #     broken ruleset is loud rather than silently leaving the
+        #     kernel with whatever it had before.
+        #   - Arch's nftables.service is 'Type=oneshot' without
+        #     'RemainAfterExit=yes' or an 'ExecStop=' (Debian's unit has
+        #     both), and 'systemctl restart' on that combination has been
+        #     reported to keep stale rules in the kernel without surfacing
+        #     an error. See https://bbs.archlinux.org/viewtopic.php?id=272145.
+        #     Going through 'nft -f' avoids that class of failure.
+        #
+        # 'changed_when' is bound to the template-render result so the
+        # task always runs (correcting any drift between file and kernel)
+        # but only reports 'changed' when the rendered content differs
+        # from what was on disk.
+        # ---------------------------------------------------------------------
+        - name: Render nftables ruleset
+          ansible.builtin.template:
+            src: nftables.conf.j2
+            dest: /etc/nftables.conf
+            owner: root
+            group: root
+            mode: '0644'
+          register: nftables_render
+
+        - name: Apply nftables ruleset
+          ansible.builtin.command:
+            cmd: nft -f /etc/nftables.conf
+          changed_when: nftables_render.changed
+
+        # ---------------------------------------------------------------------
+        # Service
+        # Enables and starts nftables so the systemd unit reapplies
+        # /etc/nftables.conf at boot. Live reloads during a playbook run are
+        # handled by the 'Apply nftables ruleset' task above rather than this
+        # unit.
+        # ---------------------------------------------------------------------
+        - name: Enable and start nftables service
+          ansible.builtin.service:
+            name: nftables
+            enabled: true
+            state: started
+
+      always:
+        - name: Remount root filesystem as read-only
+          ansible.builtin.command: # noqa: command-instead-of-module
+            cmd: mount -o remount,ro /
+          changed_when: false
+          failed_when: false
