@@ -2,34 +2,33 @@
 # ==============================================================================
 # Playbook: Configure SSH
 # ==============================================================================
-# Hardens the SSH daemon configuration on all hosts.
+# Hardens the SSH daemon on Ubuntu cluster nodes.
 #
-# Current tasks:
-#   - Create SSH Group: Creates a dedicated 'ssh' group used to control which
-#     users are permitted to log in via SSH.
-#   - Add Users to SSH Group: Adds specified users to the 'ssh' group.
-#   - Disable Password Authentication: Requires all logins to use SSH keys.
-#     Key passphrases are unaffected — they unlock the local private key and
-#     are never sent to the server.
-#   - Disable Root Login: Prevents the root account from logging in via SSH
-#     directly. Root access is still possible via sudo after logging in as an
-#     authorized user.
-#   - Disable Empty Passwords: Prevents accounts with no password set from
-#     logging in via SSH.
-#   - Disable X11 Forwarding: Disables X11 display forwarding, reducing the
-#     attack surface on headless server hosts.
-#   - Restrict SSH Access by Group: Only users in the 'ssh' group are permitted
-#     to connect via SSH.
+# Hardening directives are written to a drop-in at
+# /etc/ssh/sshd_config.d/99-hardening.conf. The main /etc/ssh/sshd_config
+# already contains 'Include /etc/ssh/sshd_config.d/*.conf' so the drop-in
+# is layered on top of stock config; the '99-' prefix ensures it loads last
+# and wins on overlapping directives.
+#
+# The drop-in is rendered from sshd_hardening.conf.j2 (encrypted at rest via
+# git-crypt) and covers: publickey-only auth via the 'ssh' group, root login
+# disabled, brute-force window capped, idle session timeout, modern crypto
+# algorithms only, and forwarding features disabled except TCP forwarding.
+#
+# This playbook performs the following actions:
+#   - Creates the 'ssh' group and adds ssh_users to it.
+#   - Renders the hardened sshd_config drop-in from the template.
+#   - Validates the rendered configuration with 'sshd -t' before reloading.
+#   - Reloads sshd to pick up the new configuration.
 #
 # Variables:
-#   ssh_config_dir:      Directory for SSH daemon config snippets
-#                        (default: /etc/ssh/sshd_config.d).
-#   ssh_users:           List of users to add to the 'ssh' group. These are the
-#                        only users that will be permitted to log in via SSH. Set
-#                        in group_vars/nodes.yml.
-#   ufw_allowed_ports:   Port map read from group_vars/nodes.yml. The SSH
-#                        daemon port is sourced from ufw_allowed_ports.ssh.port.
-#                        Must match ansible_port in inventory.yml.
+#   ssh_config_dir:    Directory for SSH daemon config snippets
+#                      (default: /etc/ssh/sshd_config.d).
+#   ssh_users:         List of users to add to the 'ssh' group. Only these
+#                      users may log in via SSH. Set in group_vars/nodes.yml.
+#   ufw_allowed_ports: Port map read from group_vars/nodes.yml. The SSH
+#                      daemon port is sourced from ufw_allowed_ports.ssh.port
+#                      and must match ansible_port in inventory.yml.
 #
 # NOTE: Misconfiguring SSH can block all remote access to the hosts. Review
 # all changes carefully before deploying.
@@ -62,27 +61,29 @@
 
     # -------------------------------------------------------------------------
     # SSH Daemon Configuration
-    # Drops a config snippet into sshd_config.d that disables password-based
-    # logins and restricts access to members of the 'ssh' group. Using
-    # sshd_config.d keeps changes isolated and avoids modifying the main
-    # sshd_config file directly.
+    # Renders the hardening drop-in into sshd_config.d. Using a drop-in keeps
+    # changes isolated from the main sshd_config and the '99-' prefix ensures
+    # it loads last so its directives override stock defaults.
     # -------------------------------------------------------------------------
     - name: Configure SSH daemon hardening
-      ansible.builtin.copy:
+      ansible.builtin.template:
+        src: sshd_hardening.conf.j2
         dest: '{{ ssh_config_dir }}/99-hardening.conf'
-        content: |
-          Port {{ ufw_allowed_ports.ssh.port }}
-          PasswordAuthentication no
-          PermitRootLogin no
-          PermitEmptyPasswords no
-          X11Forwarding no
-          AllowGroups ssh
         owner: root
         group: root
         mode: '0600'
-      notify: Reload sshd
 
-  handlers:
+    # -------------------------------------------------------------------------
+    # Validation
+    # 'sshd -t' parses every Include'd file and exits non-zero on any syntax
+    # or directive error. Catching a bad config here prevents the reload from
+    # breaking the running daemon.
+    # -------------------------------------------------------------------------
+    - name: Validate sshd configuration
+      ansible.builtin.command:
+        cmd: sshd -t
+      changed_when: false
+
     - name: Reload sshd
       ansible.builtin.service:
         name: sshd

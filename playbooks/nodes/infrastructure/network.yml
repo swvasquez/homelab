@@ -2,17 +2,19 @@
 # ==============================================================================
 # Playbook: Configure Host Firewall
 # ==============================================================================
-# Installs UFW and enforces a default-deny inbound policy on every homelab host.
-# Outbound traffic is allowed by default. Loopback traffic is explicitly
+# Installs UFW and enforces a default-deny ingress policy on every homelab
+# node. Egress traffic is allowed by default. Loopback traffic is explicitly
 # permitted.
 #
 # This playbook performs the following actions:
 #   - Installs the UFW package.
-#   - Sets the default inbound policy to deny and outbound policy to allow.
+#   - Resets UFW so rules from previous runs are cleared before re-applying.
+#   - Sets the default ingress policy to deny and egress policy to allow.
 #   - Allows all loopback interface traffic.
-#   - Opens inbound ports for each service listed in ufw_allowed_ports. Entries
-#     marked node_only: true are restricted to source IPs of other homelab
-#     nodes derived from inventory private_ip host variables.
+#   - Opens ingress ports for each service listed in ufw_allowed_ports. By
+#     default each port is opened only to the LAN CIDR and the tailnet CIDR.
+#     Entries marked node_only: true are further restricted to source IPs of
+#     other homelab nodes derived from inventory private_ip host variables.
 #   - Allows port 4244/tcp (hubble peer) from the pod CIDR 10.0.0.0/8 so that
 #     hubble-relay pods can reach the hubble peer gRPC endpoint on each node.
 #   - Allows port 9100/tcp (node-exporter) from the pod CIDR 10.0.0.0/8 so that
@@ -25,8 +27,10 @@
 #                      (default: [ufw]).
 #   ufw_allowed_ports: Dictionary mapping service name to port, protocol, and
 #                      an optional node_only flag. When node_only is true the
-#                      rule is created once per homelab node IP rather than
-#                      being open to all sources. Read from group_vars.
+#                      rule is created once per homelab node IP. Otherwise the
+#                      port is opened to the LAN and tailnet CIDRs. Read from
+#                      group_vars.
+#   lan_cidr:          CIDR of the homelab LAN. Read from group_vars/nodes.yml.
 
 - name: Configure host firewall
   hosts: nodes
@@ -35,6 +39,10 @@
   vars:
     ufw_packages:
       - ufw
+    # CGNAT range reserved by RFC 6598 and used for all Tailscale tailnet IPs.
+    # Fixed by IANA — Tailscale would have to migrate to a different reserved
+    # range to change it.
+    tailscale_cidr: 100.64.0.0/10
 
   tasks:
     # -------------------------------------------------------------------------
@@ -46,6 +54,17 @@
         name: '{{ ufw_packages }}'
         state: present
         update_cache: true
+
+    # -------------------------------------------------------------------------
+    # Reset
+    # Clears any rules left over from previous playbook runs. Without this,
+    # changing a rule's source CIDR adds a new rule alongside the old one
+    # rather than replacing it, leaving the previous (less restrictive) rule
+    # in effect.
+    # -------------------------------------------------------------------------
+    - name: Reset UFW to a clean state
+      community.general.ufw:
+        state: reset
 
     # -------------------------------------------------------------------------
     # Default Policies
@@ -71,26 +90,39 @@
 
     # -------------------------------------------------------------------------
     # Firewall Rules
-    # Opens inbound ports for services defined in ufw_allowed_ports. Ports
-    # without node_only are opened to all sources. Ports with node_only: true
-    # are opened only for the private IPs of other homelab nodes, restricting
-    # access to intra-cluster traffic.
+    # Opens ingress ports for services defined in ufw_allowed_ports. Ports
+    # without node_only are opened to the LAN CIDR and tailnet CIDR only —
+    # nothing in this homelab needs world-accessible ingress. Ports with
+    # node_only: true are restricted further to the private IPs of other
+    # homelab nodes for intra-cluster traffic.
     # -------------------------------------------------------------------------
     - name: Collect homelab node IPs for intra-node firewall rules
       ansible.builtin.set_fact:
         node_ips: '{{ groups["nodes"] | map("extract", hostvars, "private_ip") | list }}'
 
-    - name: Allow inbound port
+    - name: Allow ingress on port from LAN
       community.general.ufw:
         rule: allow
         port: '{{ item.value.port | string }}'
         proto: '{{ item.value.protocol }}'
+        from_ip: '{{ lan_cidr }}'
       loop: '{{ ufw_allowed_ports | dict2items }}'
       when: not (item.value.node_only | default(false))
       loop_control:
-        label: '{{ item.key }}'
+        label: '{{ item.key }} from LAN'
 
-    - name: Allow node-only inbound port
+    - name: Allow ingress on port from tailnet
+      community.general.ufw:
+        rule: allow
+        port: '{{ item.value.port | string }}'
+        proto: '{{ item.value.protocol }}'
+        from_ip: '{{ tailscale_cidr }}'
+      loop: '{{ ufw_allowed_ports | dict2items }}'
+      when: not (item.value.node_only | default(false))
+      loop_control:
+        label: '{{ item.key }} from tailnet'
+
+    - name: Allow node-only ingress on port
       community.general.ufw:
         rule: allow
         port: '{{ item.0.value.port | string }}'

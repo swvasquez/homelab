@@ -70,9 +70,9 @@
     - name: Authorize Dropbear public key for initramfs
       ansible.builtin.lineinfile:
         path: /etc/dropbear/initramfs/authorized_keys
-        line: "{{ lookup('file', '~/.ssh/dropbear.pub') }}"
+        line: "no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty {{ lookup('file', '~/.ssh/dropbear.pub') }}"
         create: true
-        mode: '0644'
+        mode: '0600'
 
     - name: Configure Dropbear server options for initramfs
       ansible.builtin.lineinfile:

@@ -171,6 +171,19 @@ Ansible playbooks to configure Ubuntu x86_64 compute nodes, Arch Linux-based IP 
     tailscale_key_expiry_disabled: <true|false>
     tailscale_ssh: <true|false>
     tailscale_hostname: <TAILSCALE_HOSTNAME>
+    ssh_users:
+      - <USER>
+    lan_cidr: <CIDR>
+    firewall_allowed_ports:
+      ssh:
+        port: <PORT>
+        protocol: tcp
+      pikvm_http:
+        port: <PORT>
+        protocol: tcp
+      pikvm_https:
+        port: <PORT>
+        protocol: tcp
     ```
 
 ## Directory Structure

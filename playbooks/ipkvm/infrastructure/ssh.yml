@@ -1,0 +1,118 @@
+---
+# ==============================================================================
+# Playbook: Configure SSH on IP KVM
+# ==============================================================================
+# Hardens the SSH daemon on Arch Linux-based IP KVM devices (e.g., PiKVM).
+#
+# PiKVM ships with root-as-the-only-SSH-user as the default. This playbook
+# moves to a non-root model: the ansible user is added to a dedicated 'ssh'
+# group, AllowGroups restricts SSH to that group, and PermitRootLogin is
+# disabled. Make sure key-based login as the ansible user works before this
+# playbook runs, otherwise the operator can be locked out (recovery requires
+# local console access via the SD card or PiKVM's webterm).
+#
+# Hardening directives are written to a drop-in at
+# /etc/ssh/sshd_config.d/99-hardening.conf. The main /etc/ssh/sshd_config
+# already contains 'Include /etc/ssh/sshd_config.d/*.conf' so the drop-in
+# is layered on top of stock config; the '99-' prefix ensures it loads last
+# and wins on overlapping directives.
+#
+# This playbook performs the following actions:
+#   - Remounts the root filesystem as read-write (PiKVM is read-only by default).
+#   - Creates the 'ssh' group and adds ssh_users to it.
+#   - Writes the hardened sshd_config drop-in.
+#   - Validates the rendered sshd configuration with 'sshd -t' before
+#     reloading.
+#   - Reloads sshd to pick up the new configuration.
+#   - Remounts the root filesystem as read-only regardless of task outcome.
+#
+# Variables:
+#   ssh_config_dir: Directory for SSH daemon config snippets
+#                   (default: /etc/ssh/sshd_config.d).
+#   ssh_users:      List of users to add to the 'ssh' group. Only these users
+#                   may log in via SSH. Set in group_vars/ipkvm.yml.
+#   firewall_allowed_ports:
+#                   Port map read from group_vars/ipkvm.yml. The SSH daemon
+#                   port is sourced from firewall_allowed_ports.ssh.port and
+#                   must match ansible_port in inventory.yml.
+#
+# NOTE: Misconfiguring SSH can block all remote access to the host. Review
+# all changes carefully before deploying.
+
+- name: Configure SSH on IP KVM
+  hosts: ipkvm
+  become: true
+  become_exe: sudo
+  vars:
+    ssh_config_dir: /etc/ssh/sshd_config.d
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Filesystem
+    # PiKVM mounts the root filesystem read-only by default. All write
+    # operations are wrapped in a block so the filesystem is always restored
+    # to read-only, even if a task fails.
+    # -------------------------------------------------------------------------
+    - name: Remount root filesystem as read-write
+      ansible.builtin.command: # noqa: command-instead-of-module
+        cmd: mount -o remount,rw /
+      changed_when: false
+
+    - name: Configure SSH daemon
+      block:
+        # ---------------------------------------------------------------------
+        # SSH Group
+        # Creates the 'ssh' group and adds the specified users to it. Only
+        # members of this group will be permitted to connect via SSH, as
+        # enforced by AllowGroups. Arch Linux ARM does not create this group
+        # out of the box, so the playbook creates it explicitly.
+        # ---------------------------------------------------------------------
+        - name: Create ssh group
+          ansible.builtin.group:
+            name: ssh
+            state: present
+
+        - name: Add users to ssh group
+          ansible.builtin.user:
+            name: '{{ item }}'
+            groups: ssh
+            append: true
+          loop: '{{ ssh_users }}'
+
+        # ---------------------------------------------------------------------
+        # SSH Daemon Configuration
+        # Drops a config snippet into sshd_config.d that disables password-
+        # based logins, restricts access to members of the 'ssh' group, caps
+        # the brute-force window, locks auth methods to publickey, and
+        # disables forwarding features that are not used by PiKVM.
+        # ---------------------------------------------------------------------
+        - name: Configure SSH daemon hardening
+          ansible.builtin.template:
+            src: sshd_hardening.conf.j2
+            dest: '{{ ssh_config_dir }}/99-hardening.conf'
+            owner: root
+            group: root
+            mode: '0600'
+
+        # ---------------------------------------------------------------------
+        # Validation
+        # 'sshd -t' parses every Include'd file and exits non-zero on any
+        # syntax or directive error. Catching a bad config here prevents the
+        # reload from breaking the running daemon.
+        # ---------------------------------------------------------------------
+        - name: Validate sshd configuration
+          ansible.builtin.command:
+            cmd: sshd -t
+          changed_when: false
+
+        - name: Reload sshd
+          ansible.builtin.service:
+            name: sshd
+            state: reloaded
+
+      always:
+        - name: Remount root filesystem as read-only
+          ansible.builtin.command: # noqa: command-instead-of-module
+            cmd: mount -o remount,ro /
+          changed_when: false
+          failed_when: false

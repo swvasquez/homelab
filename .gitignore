@@ -9,6 +9,7 @@
 !playbooks/*/*/scripts
 !playbooks/*/*/scripts/*
 !.gitignore
+!.gitattributes
 !.pre-commit-config.yaml
 !AGENTS.md
 !justfile
