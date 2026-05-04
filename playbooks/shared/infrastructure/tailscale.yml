@@ -1,0 +1,110 @@
+---
+# ==============================================================================
+# Playbook: Configure Tailnet ACL
+# ==============================================================================
+# Pushes the Tailscale tailnet ACL via the REST API. The ACL defines the
+# exit-node and client tagOwners, marks the exit-node tag as auto-approved
+# as an exit node, and restricts exit-node use and Tailscale SSH to nodes
+# carrying the client tag.
+#
+# This playbook owns the tailnet's ACL document. Per-host Tailscale
+# playbooks (ipkvm and nodes) set tags via the API after connecting, so
+# the tagOwners defined here must exist before those playbooks run.
+#
+# POST replaces the entire ACL document — add custom rules in the set_fact
+# below rather than the admin console, otherwise the next playbook run
+# will overwrite them. The body is built via set_fact rather than play
+# vars because Ansible does not template dictionary keys declared at the
+# vars level, which the tagOwners block requires.
+#
+# Before running, store the Tailscale API key in pass:
+#   just tailscale-set-keys
+#
+# Variables (set in group_vars/all.yml unless noted):
+#   tailscale_exit_node_tag:  Tag carried by exit-node hosts.
+#   tailscale_client_tag:     Tag carried by clients (laptops, phones)
+#                             permitted to use the exit node and SSH into
+#                             ssh-server hosts.
+#   tailscale_ssh_server_tag: Tag carried by hosts that accept Tailscale
+#                             SSH connections.
+#   pass_namespace:           Top-level folder in the pass store. The
+#                             API key is read from
+#                             '<pass_namespace>/tailscale/api-key'.
+#   tailscale_tailnet:        Tailnet name targeted by the API. Use '-'
+#                             for the default tailnet.
+
+- name: Configure Tailnet ACL
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # API Key
+    # Reads the Tailscale API key from the pass store on the control node so
+    # it can be passed non-interactively to the Tailscale REST API.
+    # -------------------------------------------------------------------------
+    - name: Read Tailscale API key from pass store
+      ansible.builtin.command:
+        cmd: pass show '{{ pass_namespace }}/tailscale/api-key'
+      register: tailscale_api_key_result
+      changed_when: false
+      no_log: true
+
+    - name: Set Tailscale API key fact
+      ansible.builtin.set_fact:
+        tailscale_api_key: '{{ tailscale_api_key_result.stdout | trim }}'
+      no_log: true
+
+    # -------------------------------------------------------------------------
+    # ACL Body
+    # Builds the tailnet ACL document. tagOwners is templated via set_fact
+    # because Ansible does not template dictionary keys declared at the vars
+    # level. autoApprovers marks the exit-node tag as auto-approved so a
+    # node that advertises the tag becomes usable as an exit node without a
+    # manual click in the admin console. The acls block restricts exit-node
+    # use and internet egress to clients carrying the client tag, and the
+    # ssh block permits Tailscale SSH from the same clients.
+    # -------------------------------------------------------------------------
+    - name: Build Tailscale ACL body
+      ansible.builtin.set_fact:
+        tailscale_acl_body:
+          tagOwners: >-
+            {{ {tailscale_exit_node_tag: ['autogroup:admin'],
+                tailscale_client_tag: ['autogroup:admin'],
+                tailscale_ssh_server_tag: ['autogroup:admin']} }}
+          autoApprovers:
+            exitNode:
+              - '{{ tailscale_exit_node_tag }}'
+          acls:
+            - action: accept
+              src:
+                - '{{ tailscale_client_tag }}'
+              dst:
+                - '{{ tailscale_exit_node_tag }}:*'
+                - 'autogroup:internet:*'
+          ssh:
+            - action: accept
+              src:
+                - '{{ tailscale_client_tag }}'
+              dst:
+                - '{{ tailscale_ssh_server_tag }}'
+              users:
+                - autogroup:nonroot
+                - root
+
+    # -------------------------------------------------------------------------
+    # ACL POST
+    # POSTs the ACL document to the Tailscale REST API. POST replaces the
+    # entire ACL — the request body is the source of truth for the
+    # tailnet's access-control policy.
+    # -------------------------------------------------------------------------
+    - name: Configure Tailscale ACL for the tailnet
+      ansible.builtin.uri:
+        url: 'https://api.tailscale.com/api/v2/tailnet/{{ tailscale_tailnet }}/acl'
+        method: POST
+        headers:
+          Authorization: 'Bearer {{ tailscale_api_key }}'
+          Content-Type: application/json
+        body: '{{ tailscale_acl_body | to_json }}'
+        status_code: 200

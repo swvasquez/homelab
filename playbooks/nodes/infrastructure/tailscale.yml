@@ -1,107 +1,301 @@
 ---
 # ==============================================================================
-# Playbook: Install and Configure Tailscale
+# Playbook: Install and Configure Tailscale on Nodes
 # ==============================================================================
-# Installs and configures the Tailscale mesh VPN client.
+# Installs and configures the Tailscale mesh VPN client on Ubuntu-based
+# homelab cluster nodes. Nodes with tailscale_exit_node: true advertise as
+# a Tailscale exit node and carry tailscale_exit_node_tag plus
+# tailscale_ssh_server_tag. All other nodes carry only tailscale_ssh_server_tag.
+#
+# The tailnet ACL (tagOwners and exit-node auto-approver) is owned by
+# playbooks/shared/infrastructure/tailscale.yml and must be applied first
+# so the tags set via the API are recognized. Split DNS configuration is
+# also managed by the shared playbook and is not repeated here.
 #
 # This playbook performs the following actions:
-#   - Enables IP forwarding to allow the host to act as a subnet router or
-#     exit node.
+#   - Reads the Tailscale auth and API keys from the pass store on the
+#     Ansible control node.
+#   - Enables IP forwarding so the host can route exit-node traffic.
 #   - Adds the official Tailscale GPG key and APT repository.
 #   - Installs the Tailscale package.
-#   - Attempts to connect the machine to the Tailscale network using
-#     'tailscale up'.
+#   - Enables and starts the tailscaled service.
+#   - Connects the host to the Tailscale network, advertising as an exit
+#     node when tailscale_exit_node is true.
+#   - Sets the correct tags via the Tailscale REST API.
+#   - Polls for exit-node auto-approval when tailscale_exit_node is true.
+#   - Configures node-key expiry via the Tailscale REST API.
 #
-# Note: The 'tailscale up' command may require interactive browser-based
-# authentication. For a non-interactive setup, an auth key must be provided
-# as a command-line argument.
+# Before running, store the Tailscale auth and API keys in pass:
+#   just tailscale-set-keys
 #
-# Variables:
-#   tailscale_packages:  List of APT packages to install for Tailscale
-#                        (default: [tailscale]).
-#   tailscale_port:      UDP port the tailscaled daemon binds for WireGuard peer
-#                        connections. Written to /etc/default/tailscaled as
-#                        FLAGS="--port=<value>". Derived from
+# Variables (set in group_vars/nodes.yml unless noted):
+#   tailscale_key_expiry_disabled:
+#                        Whether to disable node-key expiry on this host via
+#                        the Tailscale API. When true (recommended for
+#                        unattended nodes) the node never auto-expires.
+#   tailscale_ssh:       Whether to enable Tailscale SSH on this host,
+#                        allowing SSH access via the tailnet without a
+#                        separate SSH key.
+#   pass_namespace:      Top-level folder in the pass store. The auth and
+#                        API keys are read from
+#                        '<pass_namespace>/tailscale/auth-key' and
+#                        '<pass_namespace>/tailscale/api-key'. Set in
+#                        group_vars/all.yml.
+#   tailscale_tailnet:   Tailnet name targeted by the API. Use '-' for the
+#                        default tailnet. Set in group_vars/all.yml.
+#   tailscale_exit_node_tag:
+#                        Tag assigned to exit-node hosts via the API. Set in
+#                        group_vars/all.yml.
+#   tailscale_ssh_server_tag:
+#                        Tag assigned to all nodes to permit Tailscale SSH
+#                        from homelab-client devices. Set in
+#                        group_vars/all.yml.
+# Per-host variables (set in inventory.yml):
+#   tailscale:           Whether to install and configure Tailscale on this
+#                        host. When false all tasks are skipped.
+#   tailscale_exit_node: Whether to advertise this host as a Tailscale exit
+#                        node. When false the host joins as a client node.
+# Derived variables:
+#   tailscale_port:      UDP port the tailscaled daemon binds for WireGuard
+#                        peer connections. Derived from
 #                        ufw_allowed_ports.tailscale.port.
 
-- name: Install and configure Tailscale
+- name: Install and configure Tailscale on nodes
   hosts: nodes
   become: true
   become_exe: sudo.ws
   vars:
-    tailscale_packages:
-      - tailscale
     tailscale_port: '{{ ufw_allowed_ports.tailscale.port }}'
+    # Each node registers in Tailscale as '<hostname>-ts' to distinguish
+    # tailnet identities from LAN hostnames.
+    tailscale_up_args: >-
+      --reset
+      --accept-dns=false
+      --hostname={{ inventory_hostname }}-ts
+      {{ '--advertise-exit-node' if tailscale_exit_node | default(false) else '' }}
+      {{ '--ssh' if tailscale_ssh | default(false) else '' }}
+      --authkey={{ tailscale_auth_key }}
 
   tasks:
-    # -------------------------------------------------------------------------
-    # System Configuration
-    # Enables IPv4 and IPv6 forwarding so this host can act as a Tailscale
-    # subnet router or exit node.
-    # -------------------------------------------------------------------------
-    - name: Enable IP forwarding for subnet routing or exit node
-      ansible.posix.sysctl:
-        name: "{{ item }}"
-        value: "1"
-        state: present
-        sysctl_set: true
-        reload: true
-      loop:
-        - net.ipv4.ip_forward
-        - net.ipv6.conf.all.forwarding
+    - name: Install and configure Tailscale
+      when: tailscale | default(false)
+      block:
+        # -----------------------------------------------------------------------
+        # Auth Keys
+        # Reads the Tailscale auth and API keys from the pass store on the
+        # Ansible control node so they can be passed non-interactively to
+        # 'tailscale up' and the Tailscale REST API.
+        # -----------------------------------------------------------------------
+        - name: Read Tailscale auth key from pass store
+          ansible.builtin.command:
+            cmd: pass show '{{ pass_namespace }}/tailscale/auth-key'
+          delegate_to: localhost
+          become: false
+          register: tailscale_auth_key_result
+          changed_when: false
+          no_log: true
+
+        - name: Set Tailscale auth key fact
+          ansible.builtin.set_fact:
+            tailscale_auth_key: '{{ tailscale_auth_key_result.stdout | trim }}'
+          no_log: true
+
+        - name: Read Tailscale API key from pass store
+          ansible.builtin.command:
+            cmd: pass show '{{ pass_namespace }}/tailscale/api-key'
+          delegate_to: localhost
+          become: false
+          register: tailscale_api_key_result
+          changed_when: false
+          no_log: true
+
+        - name: Set Tailscale API key fact
+          ansible.builtin.set_fact:
+            tailscale_api_key: '{{ tailscale_api_key_result.stdout | trim }}'
+          no_log: true
+
+        # -----------------------------------------------------------------------
+        # System Configuration
+        # Enables IPv4 and IPv6 forwarding so this host can route exit-node
+        # traffic between the tunnel and the local network.
+        # -----------------------------------------------------------------------
+        - name: Enable IP forwarding for exit node
+          ansible.posix.sysctl:
+            name: '{{ item }}'
+            value: '1'
+            state: present
+            sysctl_set: true
+            reload: true
+          loop:
+            - net.ipv4.ip_forward
+            - net.ipv6.conf.all.forwarding
+
+        # -----------------------------------------------------------------------
+        # Repository Configuration
+        # Adds Tailscale's official GPG key and APT repository so the package
+        # can be installed and updated from the official Tailscale channel.
+        # -----------------------------------------------------------------------
+        - name: Check for Tailscale GPG key
+          ansible.builtin.stat:
+            path: /usr/share/keyrings/tailscale-archive-keyring.gpg
+          register: tailscale_keyring_stat
+
+        - name: Add Tailscale GPG key
+          ansible.builtin.get_url:
+            url: >-
+              https://pkgs.tailscale.com/stable/ubuntu/{{ ansible_distribution_release }}.noarmor.gpg
+            dest: /usr/share/keyrings/tailscale-archive-keyring.gpg
+            mode: '0644'
+          when: not tailscale_keyring_stat.stat.exists
+
+        - name: Add Tailscale APT repository
+          ansible.builtin.apt_repository:
+            repo: >-
+              deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg]
+              https://pkgs.tailscale.com/stable/ubuntu
+              {{ ansible_distribution_release }} main
+            state: present
+            filename: tailscale
+            update_cache: true
+
+        # -----------------------------------------------------------------------
+        # Installation
+        # Installs the Tailscale package from the official APT repository and
+        # configures the daemon listen port.
+        # -----------------------------------------------------------------------
+        - name: Install Tailscale package
+          ansible.builtin.apt:
+            name: tailscale
+            state: present
+            update_cache: false
+
+        - name: Set Tailscale WireGuard listen port in daemon configuration
+          ansible.builtin.lineinfile:
+            path: /etc/default/tailscaled
+            regexp: '^FLAGS='
+            line: 'FLAGS="--port={{ tailscale_port }}"'
+            create: true
+            mode: '0644'
+          notify: Restart tailscaled
+
+        - name: Enable and start tailscaled service
+          ansible.builtin.service:
+            name: tailscaled
+            enabled: true
+            state: started
+
+        # Flush so any pending Restart tailscaled fires before 'tailscale up'.
+        - name: Flush handlers so tailscaled restart precedes tailscale up
+          ansible.builtin.meta: flush_handlers
+
+        # -----------------------------------------------------------------------
+        # Network Connection
+        # Connects the host to the Tailscale network. Tags are set via the
+        # API in the Device Configuration section rather than via tailscale up,
+        # since a tagged node cannot reassign its own tags via the CLI.
+        # -----------------------------------------------------------------------
+        - name: Connect to Tailscale network
+          ansible.builtin.command:
+            cmd: 'tailscale up {{ tailscale_up_args }}'
+          changed_when: false
+          no_log: true
+
+        # -----------------------------------------------------------------------
+        # Device Configuration
+        # Resolves the device ID by hostname, then uses the API key (which has
+        # admin authority satisfying tagOwners) to set the correct tag. A tagged
+        # node cannot reassign its own tag via tailscale up, but the API can.
+        # Setting the tag triggers the autoApprovers exit-node rule. Key expiry
+        # is configured in the same section since the device ID is already known.
+        # -----------------------------------------------------------------------
+        - name: List Tailscale devices in the tailnet
+          ansible.builtin.uri:
+            url: 'https://api.tailscale.com/api/v2/tailnet/{{ tailscale_tailnet }}/devices'
+            method: GET
+            headers:
+              Authorization: 'Bearer {{ tailscale_api_key }}'
+            return_content: true
+          register: tailscale_devices_result
+          delegate_to: localhost
+          become: false
+          no_log: true
+
+        - name: Resolve this host's Tailscale device ID by hostname
+          ansible.builtin.set_fact:
+            tailscale_device_id: >-
+              {{ (tailscale_devices_result.json.devices
+                  | selectattr('hostname', 'equalto', inventory_hostname + '-ts')
+                  | first).id }}
+
+        - name: Build device tags list
+          ansible.builtin.set_fact:
+            tailscale_device_tags: >-
+              {{ ([tailscale_exit_node_tag] if tailscale_exit_node | default(false) else [])
+                 + [tailscale_ssh_server_tag] }}
+
+        - name: Set device tags via API
+          ansible.builtin.uri:
+            url: 'https://api.tailscale.com/api/v2/device/{{ tailscale_device_id }}/tags'
+            method: POST
+            headers:
+              Authorization: 'Bearer {{ tailscale_api_key }}'
+              Content-Type: application/json
+            body: '{"tags": {{ tailscale_device_tags | to_json }}}'
+            status_code: 200
+          delegate_to: localhost
+          become: false
+
+        - name: Wait for exit-node auto-approval
+          ansible.builtin.command:
+            cmd: tailscale status --json
+          register: tailscale_status_wait
+          changed_when: false
+          until: >-
+            (tailscale_status_wait.stdout | from_json).Self.ExitNodeOption
+            | default(false)
+          retries: 12
+          delay: 5
+          when: tailscale_exit_node | default(false)
+
+        - name: Configure node-key expiry for this host
+          ansible.builtin.uri:
+            url: 'https://api.tailscale.com/api/v2/device/{{ tailscale_device_id }}/key'
+            method: POST
+            headers:
+              Authorization: 'Bearer {{ tailscale_api_key }}'
+              Content-Type: application/json
+            body: '{"keyExpiryDisabled": {{ tailscale_key_expiry_disabled | bool | to_json }}}'
+            status_code: 200
+          delegate_to: localhost
+          become: false
 
     # -------------------------------------------------------------------------
-    # Repository Configuration
-    # Adds Tailscale's official GPG key and APT repository so the package can
-    # be installed and updated from the official Tailscale channel.
+    # Teardown
+    # When tailscale is false, disconnects the host from the tailnet and
+    # stops the daemon if it is installed. Guards on the tailscale binary
+    # so nodes that never had Tailscale installed are skipped silently.
     # -------------------------------------------------------------------------
-    - name: Check for Tailscale's official GPG key
-      ansible.builtin.stat:
-        path: /usr/share/keyrings/tailscale-archive-keyring.gpg
-      register: tailscale_keyring_stat
+    - name: Stop and disconnect Tailscale
+      when: not (tailscale | default(false))
+      block:
+        - name: Check if Tailscale is installed
+          ansible.builtin.stat:
+            path: /usr/bin/tailscale
+          register: tailscale_binary_stat
 
-    - name: Add Tailscale's official GPG key
-      ansible.builtin.get_url:
-        url: "https://pkgs.tailscale.com/stable/ubuntu/{{ ansible_distribution_release }}.noarmor.gpg"
-        dest: /usr/share/keyrings/tailscale-archive-keyring.gpg
-        mode: "0644"
-      when: not tailscale_keyring_stat.stat.exists
+        - name: Disconnect from Tailscale network
+          ansible.builtin.command:
+            cmd: tailscale logout
+          changed_when: false
+          failed_when: false
+          when: tailscale_binary_stat.stat.exists
 
-    - name: Add Tailscale APT repository
-      ansible.builtin.apt_repository:
-        repo: >
-          deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg]
-          https://pkgs.tailscale.com/stable/ubuntu
-          {{ ansible_distribution_release }} main
-        state: present
-        filename: tailscale
-        update_cache: true
-
-    # -------------------------------------------------------------------------
-    # Installation and Network Connection
-    # Installs the Tailscale package and connects the host to the Tailscale
-    # network. The 'tailscale up' step may require interactive authentication.
-    # -------------------------------------------------------------------------
-    - name: Install Tailscale package
-      ansible.builtin.apt:
-        name: "{{ tailscale_packages }}"
-        state: present
-
-    - name: Set Tailscale WireGuard listen port in daemon configuration
-      ansible.builtin.lineinfile:
-        path: /etc/default/tailscaled
-        regexp: '^FLAGS='
-        line: 'FLAGS="--port={{ tailscale_port }}"'
-        create: true
-        mode: '0644'
-      notify: Restart tailscaled
-
-    - name: Connect to Tailscale network
-      ansible.builtin.command:
-        cmd: tailscale up
-      changed_when: false
-      # This may require interactive authentication.
-      # For non-interactive setup, pass '--authkey' and other flags.
+        - name: Stop and disable tailscaled service
+          ansible.builtin.service:
+            name: tailscaled
+            enabled: false
+            state: stopped
+          when: tailscale_binary_stat.stat.exists
 
   handlers:
     - name: Restart tailscaled

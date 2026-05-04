@@ -42,6 +42,8 @@ Ansible playbooks to configure Ubuntu x86_64 compute nodes, Arch Linux-based IP 
               slurm_controller: <true|false>
               slurm_compute_node: <true|false>
               vllm_host: <true|false>
+              tailscale: <true|false>
+              tailscale_exit_node: <true|false>
         ipkvm:
           vars:
             ansible_python_interpreter: <PYTHON_PATH>
@@ -59,6 +61,9 @@ Ansible playbooks to configure Ubuntu x86_64 compute nodes, Arch Linux-based IP 
     dns_zone: <DNS_ZONE>
     bind9_lb_ip: <BIND9_LB_IP>
     tailscale_tailnet: <TAILSCALE_TAILNET>
+    tailscale_exit_node_tag: <TAILSCALE_EXIT_NODE_TAG>
+    tailscale_client_tag: <TAILSCALE_CLIENT_TAG>
+    tailscale_ssh_server_tag: <TAILSCALE_SSH_SERVER_TAG>
     ```
 
 4.  Create a `group_vars/nodes.yml` file for cluster-node group variables:
@@ -154,6 +159,8 @@ Ansible playbooks to configure Ubuntu x86_64 compute nodes, Arch Linux-based IP 
       syncthing_discovery:
         port: <PORT>
         protocol: udp
+    tailscale_key_expiry_disabled: <true|false>
+    tailscale_ssh: <true|false>
     ```
 
 5.  Create a `group_vars/ipkvm.yml` file for IP KVM group variables:
@@ -179,6 +186,8 @@ own `templates/` folder (if applicable) to keep playbooks and their dependencies
 - `playbooks/nodes/service/`: Cluster-hosted user services (e.g. Syncthing, Jellyfin,
   Vaultwarden).
 - `playbooks/ipkvm/infrastructure/`: OS-level configurations for IP KVM devices.
+- `playbooks/shared/infrastructure/`: Tailnet- and other cross-group config that targets
+  `localhost` rather than a specific inventory group (e.g. the Tailscale ACL).
 
 ## Usage
 
@@ -195,6 +204,7 @@ just install <GROUP> <CATEGORY> <PLAYBOOK>
 ```sh
 just install nodes infrastructure docker
 just install nodes cluster observability
+just install shared infrastructure tailscale
 just install ipkvm infrastructure tailscale
 ```
 
