@@ -60,6 +60,7 @@ Ansible playbooks to configure Ubuntu x86_64 compute nodes, Arch Linux-based IP 
     pass_namespace: <PASS_NAMESPACE>
     dns_zone: <DNS_ZONE>
     bind9_lb_ip: <BIND9_LB_IP>
+    lan_cidr: <CIDR>
     tailscale_tailnet: <TAILSCALE_TAILNET>
     tailscale_exit_node_tag: <TAILSCALE_EXIT_NODE_TAG>
     tailscale_client_tag: <TAILSCALE_CLIENT_TAG>
@@ -79,7 +80,6 @@ Ansible playbooks to configure Ubuntu x86_64 compute nodes, Arch Linux-based IP 
     nfs_group_gid: <NFS_GROUP_GID>
     nonroot_uid: <NONROOT_UID>
     lb_ip_pool_cidr: <CIDR>
-    lan_cidr: <CIDR>
     router_private_ip: <ROUTER_IP>
     shutdown_schedule: <SHUTDOWN_SCHEDULE>
     admin_email: <ADMIN_EMAIL>
@@ -173,7 +173,6 @@ Ansible playbooks to configure Ubuntu x86_64 compute nodes, Arch Linux-based IP 
     tailscale_hostname: <TAILSCALE_HOSTNAME>
     ssh_users:
       - <USER>
-    lan_cidr: <CIDR>
     firewall_allowed_ports:
       ssh:
         port: <PORT>
@@ -297,6 +296,18 @@ kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock
   does NOT require re-running any cluster playbook:
   ```sh
   just install nodes service <SERVICE>
+  ```
+- **Tailscale playbook run order**: `playbooks/shared/infrastructure/tailscale.yml` owns the
+  tailnet ACL (tagOwners, exit-node auto-approver, and subnet-route auto-approver) and must be
+  run before the per-host Tailscale playbooks (`nodes/infrastructure/tailscale.yml`,
+  `ipkvm/infrastructure/tailscale.yml`) so the tags they assign via the API are recognized and
+  any advertised LAN subnet routes are auto-approved on first advertisement. Running out of order
+  leaves routes pending in the admin console; the next push of the shared playbook re-evaluates
+  and approves them.
+  ```sh
+  just install shared infrastructure tailscale
+  just install nodes infrastructure tailscale
+  just install ipkvm infrastructure tailscale
   ```
 - **Cluster master credentials in the pass store**: every cluster-level master key — the etcd
   encryption-at-rest key plus the OpenBao unseal keys + root token — lives in the operator's

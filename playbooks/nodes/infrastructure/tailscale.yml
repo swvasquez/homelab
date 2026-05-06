@@ -3,14 +3,32 @@
 # Playbook: Install and Configure Tailscale on Nodes
 # ==============================================================================
 # Installs and configures the Tailscale mesh VPN client on Ubuntu-based
-# homelab cluster nodes. Nodes with tailscale_exit_node: true advertise as
-# a Tailscale exit node and carry tailscale_exit_node_tag plus
-# tailscale_ssh_server_tag. All other nodes carry only tailscale_ssh_server_tag.
+# homelab cluster nodes. When tailscale_exit_node is true the host is
+# advertised as a Tailscale exit node and the homelab LAN CIDR is advertised
+# as a subnet route, so a tailnet member that selects it routes all traffic
+# through the node and out the home WAN, and LAN services are reachable by IP
+# through the same tunnel. When false the host joins as a plain tailnet member
+# (still reachable for Tailscale SSH if tailscale_ssh is true).
 #
-# The tailnet ACL (tagOwners and exit-node auto-approver) is owned by
-# playbooks/shared/infrastructure/tailscale.yml and must be applied first
-# so the tags set via the API are recognized. Split DNS configuration is
-# also managed by the shared playbook and is not repeated here.
+# The subnet-route advertisement is what makes LAN destinations reachable
+# through the exit node. Without it the Tailscale daemon on the client
+# silently drops RFC1918-bound traffic even though the kernel route table
+# sends those packets to the Tailscale tun device — internet still works
+# (non-RFC1918 destinations are not subject to the filter) but the router,
+# cluster nodes, and LoadBalancer VIPs are unreachable. The subnet route is
+# auto-approved by the tailnet ACL and the client tag is granted explicit
+# access to lan_cidr in the same ACL (since autogroup:internet is defined as
+# 0.0.0.0/0 minus the RFC1918 ranges and so does not by itself permit reaching
+# the LAN). Both are owned by playbooks/shared/infrastructure/tailscale.yml.
+#
+# The tailnet ACL (tagOwners, exit-node auto-approver, and subnet-route
+# auto-approver) is owned by playbooks/shared/infrastructure/tailscale.yml
+# and must be applied first so the tags set via the API are recognized and
+# the lan_cidr subnet route is auto-approved on first advertisement. Running
+# this playbook before the shared one leaves the route pending in the admin
+# console until the next ACL push (Tailscale re-evaluates pending approvals
+# when the ACL changes). Split DNS configuration is also managed by the shared
+# playbook and is not repeated here.
 #
 # This playbook performs the following actions:
 #   - Reads the Tailscale auth and API keys from the pass store on the
@@ -19,8 +37,9 @@
 #   - Adds the official Tailscale GPG key and APT repository.
 #   - Installs the Tailscale package.
 #   - Enables and starts the tailscaled service.
-#   - Connects the host to the Tailscale network, advertising as an exit
-#     node when tailscale_exit_node is true.
+#   - Connects the host to the Tailscale network, advertising it as an exit
+#     node and advertising lan_cidr as a subnet route when
+#     tailscale_exit_node is true.
 #   - Sets the correct tags via the Tailscale REST API.
 #   - Polls for exit-node auto-approval when tailscale_exit_node is true.
 #   - Configures node-key expiry via the Tailscale REST API.
@@ -36,6 +55,10 @@
 #   tailscale_ssh:       Whether to enable Tailscale SSH on this host,
 #                        allowing SSH access via the tailnet without a
 #                        separate SSH key.
+#   lan_cidr:            CIDR of the homelab LAN, advertised as a subnet
+#                        route alongside the exit node so clients can reach
+#                        LAN destinations through this host. Set in
+#                        group_vars/all.yml.
 #   pass_namespace:      Top-level folder in the pass store. The auth and
 #                        API keys are read from
 #                        '<pass_namespace>/tailscale/auth-key' and
@@ -54,7 +77,8 @@
 #   tailscale:           Whether to install and configure Tailscale on this
 #                        host. When false all tasks are skipped.
 #   tailscale_exit_node: Whether to advertise this host as a Tailscale exit
-#                        node. When false the host joins as a client node.
+#                        node and advertise lan_cidr as a subnet route.
+#                        When false the host joins as a plain tailnet member.
 # Derived variables:
 #   tailscale_port:      UDP port the tailscaled daemon binds for WireGuard
 #                        peer connections. Derived from
@@ -73,6 +97,7 @@
       --accept-dns=false
       --hostname={{ inventory_hostname }}-ts
       {{ '--advertise-exit-node' if tailscale_exit_node | default(false) else '' }}
+      {{ '--advertise-routes=' ~ lan_cidr if tailscale_exit_node | default(false) else '' }}
       {{ '--ssh' if tailscale_ssh | default(false) else '' }}
       --authkey={{ tailscale_auth_key }}
 

@@ -4,21 +4,37 @@
 # ==============================================================================
 # Installs and configures the Tailscale mesh VPN client on Arch Linux-based
 # IP KVM devices (e.g., PiKVM). When tailscale_exit_node is true the host is
-# advertised as a Tailscale exit node so a tailnet member that selects it
-# routes all traffic through the IP KVM and out the home WAN; LAN services
-# are reached by IP via the same tunnel. When false the host is a plain
-# tailnet member (still useful for Tailscale SSH-based access).
+# advertised as a Tailscale exit node and the homelab LAN CIDR is advertised
+# as a subnet route, so a tailnet member that selects it routes all traffic
+# through the IP KVM and out the home WAN, and LAN services are reachable
+# by IP through the same tunnel. When false the host is a plain tailnet
+# member (still useful for Tailscale SSH-based access).
 #
-# Exit-node operation is the only routing mode this playbook supports.
-# Subnet routing and 4via6 advertising were considered and rejected: they
-# add DNS-record bookkeeping (AAAA seeding, stale-record cleanup) that has
-# to stay in sync with mode changes, and a drift while remote turns into
-# "kubectl falls back to a stale A record and times out." Sticking to a
-# single optional mode keeps remote recovery limited to one client toggle.
+# The subnet-route advertisement is what makes LAN destinations reachable
+# through the exit node. Without it the Tailscale daemon on the client
+# silently drops RFC1918-bound traffic even though the kernel route
+# table sends those packets to the Tailscale tun device — internet
+# still works (non-RFC1918 destinations are not subject to the filter)
+# but the router, cluster nodes, and LoadBalancer VIPs are unreachable.
+# The subnet route is auto-approved by the tailnet ACL and the client
+# tag is granted explicit access to lan_cidr in the same ACL (since
+# autogroup:internet is defined as 0.0.0.0/0 minus the RFC1918 ranges
+# and so does not by itself permit reaching the LAN). Both are owned by
+# playbooks/shared/infrastructure/tailscale.yml.
 #
-# The tailnet ACL (tagOwners and exit-node auto-approver) is owned by
-# playbooks/shared/infrastructure/tailscale.yml and must be applied first
-# so the tags set via the API are recognized.
+# 4via6 advertising was considered and rejected: it adds DNS-record
+# bookkeeping (AAAA seeding, stale-record cleanup) that has to stay in
+# sync with mode changes, and a drift while remote turns into "kubectl
+# falls back to a stale A record and times out." Plain subnet-route
+# advertising avoids that.
+#
+# The tailnet ACL (tagOwners, exit-node auto-approver, and subnet-route
+# auto-approver) is owned by playbooks/shared/infrastructure/tailscale.yml
+# and must be applied first so the tags set via the API are recognized
+# and the lan_cidr subnet route is auto-approved on first advertisement.
+# Running this playbook before the shared one leaves the route pending
+# in the admin console until the next ACL push (Tailscale re-evaluates
+# pending approvals when the ACL changes).
 #
 # This playbook performs the following actions:
 #   - Reads the Tailscale auth and API keys from the pass store on the
@@ -46,9 +62,14 @@
 #   tailscale_hostname:           Hostname to register in the Tailscale admin
 #                                 console.
 #   tailscale_exit_node:          Whether to advertise this host as a Tailscale
-#                                 exit node. When false, the host is a plain
+#                                 exit node and advertise lan_cidr as a subnet
+#                                 route. When false, the host is a plain
 #                                 tailnet member (still reachable for SSH if
 #                                 tailscale_ssh is true).
+#   lan_cidr:                     CIDR of the homelab LAN, advertised as a
+#                                 subnet route alongside the exit node so
+#                                 clients can reach LAN destinations through
+#                                 this host. Set in group_vars/all.yml.
 #   tailscale_key_expiry_disabled:
 #                                 Whether to disable node-key expiry on this
 #                                 host via the Tailscale API. When true
@@ -101,6 +122,7 @@
       --accept-dns=false
       --hostname={{ tailscale_hostname }}
       {{ '--advertise-exit-node' if tailscale_exit_node else '' }}
+      {{ '--advertise-routes=' ~ lan_cidr if tailscale_exit_node else '' }}
       {{ '--ssh' if tailscale_ssh else '' }}
       --authkey={{ tailscale_auth_key }}
 
