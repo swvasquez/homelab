@@ -1,0 +1,18 @@
+# Managed by playbooks/nodes/infrastructure/ssh.yml. Manual edits will be
+# overwritten on the next playbook run.
+{% for host in groups['nodes'] | sort %}
+
+Host {{ host }}
+    HostName {{ hostvars[host].private_ip }}
+    User {{ hostvars[host].ansible_user }}
+    Port {{ hostvars[host].ansible_port | default(hostvars[host].ufw_allowed_ports.ssh.port) }}
+    IdentityFile ~/.ssh/{{ ssh_identity_file }}
+    IdentitiesOnly yes
+{% endfor %}
+{% for host in groups['nodes'] | sort if hostvars[host].tailscale | default(false) %}
+
+Host {{ host }}-ts
+    HostName {{ host }}-ts
+    User {{ hostvars[host].ansible_user }}
+    Port {{ hostvars[host].ansible_port | default(hostvars[host].ufw_allowed_ports.ssh.port) }}
+{% endfor %}

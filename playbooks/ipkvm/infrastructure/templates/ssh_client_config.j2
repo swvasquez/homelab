@@ -1,0 +1,18 @@
+# Managed by playbooks/ipkvm/infrastructure/ssh.yml. Manual edits will be
+# overwritten on the next playbook run.
+{% for host in groups['ipkvm'] | sort %}
+
+Host {{ host }}
+    HostName {{ hostvars[host].private_ip }}
+    User {{ hostvars[host].ansible_user }}
+    Port {{ hostvars[host].ansible_port | default(hostvars[host].firewall_allowed_ports.ssh.port) }}
+    IdentityFile ~/.ssh/{{ ssh_identity_file }}
+    IdentitiesOnly yes
+{% endfor %}
+{% for host in groups['ipkvm'] | sort %}
+
+Host {{ hostvars[host].tailscale_hostname }}
+    HostName {{ hostvars[host].tailscale_hostname }}
+    User {{ hostvars[host].ansible_user }}
+    Port {{ hostvars[host].ansible_port | default(hostvars[host].firewall_allowed_ports.ssh.port) }}
+{% endfor %}

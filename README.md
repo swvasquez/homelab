@@ -65,6 +65,8 @@ Ansible playbooks to configure Ubuntu x86_64 compute nodes, Arch Linux-based IP 
     tailscale_exit_node_tag: <TAILSCALE_EXIT_NODE_TAG>
     tailscale_client_tag: <TAILSCALE_CLIENT_TAG>
     tailscale_ssh_server_tag: <TAILSCALE_SSH_SERVER_TAG>
+    ssh_identity_file: <SSH_IDENTITY_FILENAME>
+    dropbear_identity_file: <DROPBEAR_IDENTITY_FILENAME>
     ```
 
 4.  Create a `group_vars/nodes.yml` file for cluster-node group variables:

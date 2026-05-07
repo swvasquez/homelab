@@ -1,0 +1,20 @@
+# Managed by playbooks/nodes/infrastructure/dropbear-initramfs.yml. Manual
+# edits will be overwritten on the next playbook run.
+{% for host in groups['nodes'] | sort %}
+
+Host unlock-{{ host }}
+    HostName {{ hostvars[host].private_ip }}
+    User root
+    Port {{ hostvars[host].ufw_allowed_ports.dropbear.port }}
+    IdentityFile ~/.ssh/{{ dropbear_identity_file }}
+    IdentitiesOnly yes
+{% endfor %}
+{% for host in groups['nodes'] | sort if hostvars[host].tailscale | default(false) %}
+
+Host unlock-{{ host }}-ts
+    HostName {{ hostvars[host].private_ip }}
+    User root
+    Port {{ hostvars[host].ufw_allowed_ports.dropbear.port }}
+    IdentityFile ~/.ssh/{{ dropbear_identity_file }}
+    IdentitiesOnly yes
+{% endfor %}
