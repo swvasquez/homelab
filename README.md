@@ -216,16 +216,16 @@ own `templates/` folder (if applicable) to keep playbooks and their dependencies
 To run a specific playbook, specify the inventory group, category, and playbook name:
 
 ```sh
-just install <GROUP> <CATEGORY> <PLAYBOOK>
+just deploy <GROUP> <CATEGORY> <PLAYBOOK>
 ```
 
 **Examples:**
 
 ```sh
-just install nodes infrastructure docker
-just install nodes cluster observability
-just install shared infrastructure tailscale
-just install ipkvm infrastructure tailscale
+just deploy nodes infrastructure docker
+just deploy nodes cluster observability
+just deploy shared infrastructure tailscale
+just deploy ipkvm infrastructure tailscale
 ```
 
 ### Verify Connectivity
@@ -297,7 +297,7 @@ kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock
   own HTTPRoute, Traefik ForwardAuth Middleware, and namespace hardening, so adding a new service
   does NOT require re-running any cluster playbook:
   ```sh
-  just install nodes service <SERVICE>
+  just deploy nodes service <SERVICE>
   ```
 - **Tailscale playbook run order**: `playbooks/shared/infrastructure/tailscale.yml` owns the
   tailnet ACL (tagOwners, exit-node auto-approver, and subnet-route auto-approver) and must be
@@ -307,9 +307,9 @@ kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock
   leaves routes pending in the admin console; the next push of the shared playbook re-evaluates
   and approves them.
   ```sh
-  just install shared infrastructure tailscale
-  just install nodes infrastructure tailscale
-  just install ipkvm infrastructure tailscale
+  just deploy shared infrastructure tailscale
+  just deploy nodes infrastructure tailscale
+  just deploy ipkvm infrastructure tailscale
   ```
 - **Cluster master credentials in the pass store**: every cluster-level master key — the etcd
   encryption-at-rest key plus the OpenBao unseal keys + root token — lives in the operator's
@@ -344,7 +344,7 @@ kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock
   `kube-apiserver.yaml` pod manifest; the kubelet reloads the apiserver automatically. Run after
   `cluster/authentication.yml`:
   ```sh
-  just install nodes cluster security
+  just deploy nodes cluster security
   ```
 - **Falco**: `cluster/security.yml` also deploys Falco as a DaemonSet via the
   `falcosecurity/falco` Helm chart. Falco monitors kernel syscalls using the modern eBPF driver
@@ -378,7 +378,7 @@ kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock
   (token-authenticated, no ForwardAuth). After every cluster reboot OpenBao comes up sealed;
   re-running the same command unseals it:
   ```sh
-  just install nodes cluster secrets
+  just deploy nodes cluster secrets
   ```
   The web UI is enabled in the pod but only reachable after `cluster/authentication.yml` runs,
   which adds a `/`-prefix HTTPRoute gated by Authentik ForwardAuth (so `openbao.<DNS_ZONE>/ui/`
