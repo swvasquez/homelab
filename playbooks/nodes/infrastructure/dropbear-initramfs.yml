@@ -30,6 +30,10 @@
 #      - Authorizes the generated public key for initramfs login.
 #      - Configures Dropbear server options (port, command).
 #      - Sets a static IP address for the initramfs environment.
+#      - Installs an init-premount script that powers the host off if the
+#        LUKS root volume is not unlocked within a configurable timeout, so
+#        a node left at the unlock prompt does not sit indefinitely waiting
+#        on a passphrase.
 #      - Rebuilds the initramfs to apply all changes.
 #
 # Variables (set in inventory.yml per host):
@@ -61,6 +65,12 @@
 #   dropbear_port:         The SSH port Dropbear will listen on in
 #                          initramfs. Derived from
 #                          ufw_allowed_ports.dropbear.port.
+#
+# Play variables:
+#   dropbear_unlock_timeout:
+#                          Seconds the initramfs will wait for the LUKS
+#                          root volume to be unlocked before forcing a hard
+#                          power-off. Set on the remote play below.
 
 # ==============================================================================
 # Local key generation
@@ -206,6 +216,7 @@
   become_exe: sudo.ws
   vars:
     dropbear_port: '{{ ufw_allowed_ports.dropbear.port }}'
+    dropbear_unlock_timeout: 1800
 
   tasks:
     # -------------------------------------------------------------------------
@@ -252,6 +263,23 @@
         state: present
         create: true
         mode: '0644'
+
+    # -------------------------------------------------------------------------
+    # Unlock Timeout
+    # Installs an init-premount script that backgrounds a watchdog inside the
+    # initramfs. The watchdog polls /proc/mounts for the real root filesystem
+    # at /root, which only appears once cryptroot has unlocked the LUKS volume
+    # and the local stage has mounted root. If that does not happen within
+    # dropbear_unlock_timeout seconds, the watchdog issues a hard power-off so
+    # a node sitting at the passphrase prompt does not remain powered on
+    # indefinitely. The watchdog process is torn down by switch_root once the
+    # real init takes over, so it only ever fires during the initramfs window.
+    # -------------------------------------------------------------------------
+    - name: Install LUKS unlock timeout watchdog into initramfs scripts
+      ansible.builtin.template:
+        src: luks_unlock_timeout.sh.j2
+        dest: /etc/initramfs-tools/scripts/init-premount/zz-luks-unlock-timeout
+        mode: '0755'
 
     - name: Rebuild initramfs to apply changes
       ansible.builtin.command:
