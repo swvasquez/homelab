@@ -1,0 +1,15 @@
+#!/bin/sh
+# Initramfs hook that bundles the ethtool binary (and its shared library
+# dependencies) into the initramfs. Installed by
+# playbooks/nodes/infrastructure/initramfs.yml so the LUKS
+# unlock-timeout watchdog can arm Wake-on-LAN on the NIC before issuing a
+# hard power-off from inside the initramfs environment.
+PREREQ=''
+prereqs() { echo "$PREREQ"; }
+case "$1" in
+    prereqs) prereqs; exit 0 ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+copy_exec /usr/sbin/ethtool /sbin/ethtool

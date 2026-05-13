@@ -48,11 +48,11 @@ reboot subset="nodes":
         -e ansible_become_exe=sudo.ws \
         -B 1 -P 0
 
-# Wake all nodes in a group via Wake-on-LAN magic packet (MAC addresses read from inventory.yml)
+# Wake all nodes in a group via Wake-on-LAN magic packet (MAC addresses and broadcast address read from inventory.yml)
 wake subset="nodes":
     uv run ansible-inventory -i inventory.yml --list \
-        | jq -r '.{{ subset }}.hosts[] as $h | ._meta.hostvars[$h].mac_address' \
-        | xargs -I{} wakeonlan {}
+        | jq -r '.{{ subset }}.hosts[] as $h | ._meta.hostvars[$h] | "wakeonlan -i \(.lan_broadcast) \(.mac_address)"' \
+        | sh
 
 # Suspend all nodes in the inventory to S3 (non-blocking)
 suspend subset="nodes":

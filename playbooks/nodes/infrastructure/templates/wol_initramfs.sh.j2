@@ -1,0 +1,23 @@
+#!/bin/sh
+# Init-premount script that arms Wake-on-LAN on the configured network
+# interface so the host remains recoverable via magic packet after any
+# shutdown from the initramfs environment (operator power button, manual
+# poweroff from the dropbear SSH session, etc.). Installed by
+# playbooks/nodes/infrastructure/initramfs.yml.
+PREREQ=''
+prereqs() { echo "$PREREQ"; }
+case "$1" in
+    prereqs) prereqs; exit 0 ;;
+esac
+
+IFACE={{ network_interface }}
+
+mkdir -p /run/initramfs
+
+if ethtool -s "$IFACE" wol g 2>/dev/null; then
+    echo "Wake-on-LAN armed on ${IFACE}." >> /run/initramfs/wol.log
+    echo "Wake-on-LAN armed on ${IFACE}." > /dev/console
+else
+    echo "Failed to arm Wake-on-LAN on ${IFACE}." >> /run/initramfs/wol.log
+    echo "Failed to arm Wake-on-LAN on ${IFACE}." > /dev/console
+fi

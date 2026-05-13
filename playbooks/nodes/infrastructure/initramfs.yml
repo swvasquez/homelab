@@ -26,14 +26,14 @@
 #      Inputs come from inventory.yml and group_vars only, so this play
 #      does not require remote hosts to be reachable.
 #   3. On target hosts:
-#      - Installs the 'dropbear-initramfs' package.
+#      - Installs the 'dropbear-initramfs' and 'ethtool' packages.
 #      - Authorizes the generated public key for initramfs login.
 #      - Configures Dropbear server options (port, command).
 #      - Sets a static IP address for the initramfs environment.
-#      - Installs an init-premount script that powers the host off if the
-#        LUKS root volume is not unlocked within a configurable timeout, so
-#        a node left at the unlock prompt does not sit indefinitely waiting
-#        on a passphrase.
+#      - Bundles the ethtool binary into the initramfs via a hook and
+#        installs an init-premount script that arms Wake-on-LAN on the NIC
+#        so the host remains recoverable via magic packet after any shutdown
+#        from the initramfs environment.
 #      - Rebuilds the initramfs to apply all changes.
 #
 # Variables (set in inventory.yml per host):
@@ -66,11 +66,6 @@
 #                          initramfs. Derived from
 #                          ufw_allowed_ports.dropbear.port.
 #
-# Play variables:
-#   dropbear_unlock_timeout:
-#                          Seconds the initramfs will wait for the LUKS
-#                          root volume to be unlocked before forcing a hard
-#                          power-off. Set on the remote play below.
 
 # ==============================================================================
 # Local key generation
@@ -216,7 +211,6 @@
   become_exe: sudo.ws
   vars:
     dropbear_port: '{{ ufw_allowed_ports.dropbear.port }}'
-    dropbear_unlock_timeout: 1800
 
   tasks:
     # -------------------------------------------------------------------------
@@ -225,9 +219,11 @@
     # into the initramfs so the host can be unlocked remotely before the root
     # filesystem mounts.
     # -------------------------------------------------------------------------
-    - name: Install dropbear-initramfs package
+    - name: Install dropbear-initramfs and ethtool packages
       ansible.builtin.apt:
-        name: dropbear-initramfs
+        name:
+          - dropbear-initramfs
+          - ethtool
         state: present
         update_cache: true
 
@@ -265,20 +261,31 @@
         mode: '0644'
 
     # -------------------------------------------------------------------------
-    # Unlock Timeout
-    # Installs an init-premount script that backgrounds a watchdog inside the
-    # initramfs. The watchdog polls /proc/mounts for the real root filesystem
-    # at /root, which only appears once cryptroot has unlocked the LUKS volume
-    # and the local stage has mounted root. If that does not happen within
-    # dropbear_unlock_timeout seconds, the watchdog issues a hard power-off so
-    # a node sitting at the passphrase prompt does not remain powered on
-    # indefinitely. The watchdog process is torn down by switch_root once the
-    # real init takes over, so it only ever fires during the initramfs window.
+    # Wake-on-LAN
+    # Linux NIC drivers reset the Wake-on-LAN enable bit to off on every boot.
+    # Netplan re-arms it when the interface comes up in the real OS, but a
+    # shutdown issued from inside the initramfs (operator power button, manual
+    # poweroff from the dropbear SSH session, etc.) happens before the real OS
+    # boots, leaving WoL disabled and the host unreachable via magic packet.
+    # The ethtool hook bundles the ethtool binary into the initramfs so the
+    # init-premount script can arm WoL immediately at boot, before any shutdown
+    # path can fire.
     # -------------------------------------------------------------------------
-    - name: Install LUKS unlock timeout watchdog into initramfs scripts
+    - name: Install ethtool initramfs hook to bundle ethtool in initramfs
       ansible.builtin.template:
-        src: luks_unlock_timeout.sh.j2
-        dest: /etc/initramfs-tools/scripts/init-premount/zz-luks-unlock-timeout
+        src: ethtool_initramfs_hook.sh.j2
+        dest: /etc/initramfs-tools/hooks/ethtool
+        mode: '0755'
+
+    - name: Remove old LUKS unlock timeout init-premount script if present
+      ansible.builtin.file:
+        path: /etc/initramfs-tools/scripts/init-premount/zz-luks-unlock-timeout
+        state: absent
+
+    - name: Install Wake-on-LAN init-premount script into initramfs
+      ansible.builtin.template:
+        src: wol_initramfs.sh.j2
+        dest: /etc/initramfs-tools/scripts/init-premount/zz-wol
         mode: '0755'
 
     - name: Rebuild initramfs to apply changes
