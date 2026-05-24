@@ -1,0 +1,216 @@
+---
+# ==============================================================================
+# Playbook: Manage Kernel Crash Dump (kdump-tools)
+# ==============================================================================
+#
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║ STATUS: ROOT CAUSE NOT FIXED — this playbook only contains           ║
+# ║ mitigations and a safety net. The actual bug is still open.          ║
+# ║                                                                      ║
+# ║ The bug: `mkinitramfs`, when invoked by `kdump-config load` at       ║
+# ║ early boot to regenerate /var/lib/kdump/initrd.img-<kver> after a    ║
+# ║ kernel upgrade, hangs indefinitely. The same `mkinitramfs`           ║
+# ║ invocation completes in ~5s from a recovery shell or the             ║
+# ║ fully-booted OS — so the hang is specific to the early-boot          ║
+# ║ environment (something about /tmp, depmod, module loading, or one    ║
+# ║ of the /etc/initramfs-tools/hooks/ scripts behaves differently       ║
+# ║ before basic.target). We have NOT isolated which syscall blocks;     ║
+# ║ every instrumentation attempt either deadlocked the wrapper or       ║
+# ║ never executed in a true early-boot context. Until the underlying    ║
+# ║ hang is identified and fixed, every new kernel install is a          ║
+# ║ candidate to re-trigger it.                                          ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+#
+# What this playbook actually does
+# --------------------------------
+# Two mitigations that reduce the blast radius of the unresolved hang,
+# plus a safety-net cache refresh:
+#
+# 1. Caps `TimeoutStartSec` for kdump-tools.service at 120s.
+#    kdump-tools.service is Type=oneshot, for which systemd's default
+#    TimeoutStartSec is INFINITY (per systemd-system.conf(5)). That
+#    default is what turns the early-boot mkinitramfs hang into a
+#    fully-bricked boot: basic.target waits forever for the oneshot to
+#    complete, so SSH and console login never come up. With a bounded
+#    timeout, a hung mkinitramfs is killed after 120s, kdump-tools
+#    moves to a failed state, and the rest of boot proceeds.
+#
+# 2. Runs `kdump-config load` from the running OS at the end of every
+#    playbook run, which pre-generates the kdump initrd cache for the
+#    currently running kernel (mkinitramfs reliably works here, away
+#    from the early-boot trigger). The next boot then cache-hits and
+#    sidesteps the hang entirely — but only as long as the cache file
+#    survives until that boot.
+#
+# Symptoms when the bug fires anyway (cache went missing between
+# playbook run and reboot, or playbook hasn't been run since the last
+# kernel install):
+#   - Boot is delayed by `TimeoutStartSec` (currently 120s).
+#   - `systemctl status kdump-tools.service` shows
+#     `failed (Result: timeout)`.
+#   - Crash-dump capture is NOT functional until the cached initrd is
+#     regenerated.
+# Operator recovery: SSH in, run `sudo systemctl start kdump-tools.service`
+# (which runs `kdump-config load` from a working environment and
+# populates the cache), then `sudo systemctl restart kdump-tools.service`
+# to clear the failed state. The next boot will cache-hit and skip the
+# slow path.
+#
+# Rejected approaches (kept here so we don't try them again)
+# ----------------------------------------------------------
+# - `After=multi-user.target` + `Before=` cleared (inspired by Launchpad
+#   #1708409): introduces a systemd ordering cycle because the shipped
+#   `WantedBy=basic.target` is still active. systemd resolves the cycle
+#   by deleting the `systemd-user-sessions.service` and `getty.target`
+#   jobs, which leaves `/run/nologin` in place and makes every PAM
+#   login fail. Would only work if `WantedBy=` were also overridden
+#   and `systemctl reenable` were run — strictly more moving parts
+#   than the timeout approach for the same blast-radius benefit.
+# - `After=tmp.mount` drop-in: theorized that a tmpfs/tmp race caused
+#   the hang. Field testing refuted that theory.
+# Both stale drop-in files (ordering.conf and after-tmp-mount.conf)
+# are explicitly cleaned up below in case they linger on older nodes.
+#
+# This playbook performs the following actions:
+#   - Installs the kdump-tools package via apt.
+#   - Removes the ineffective after-tmp-mount.conf drop-in if present.
+#   - Removes the cycle-inducing ordering.conf drop-in if present.
+#   - Installs a timeout drop-in that bounds TimeoutStartSec.
+#   - Reloads systemd so the new drop-in takes effect.
+#   - Runs `kdump-config load` from the running OS to populate the
+#     /var/lib/kdump/initrd.img-<kver> cache for the currently running
+#     kernel and arm kexec for crash capture. Acts as a safety net
+#     against the early-boot mkinitramfs hang: if the cache is good
+#     before reboot, the next boot's kdump-tools.service hits the
+#     cache and skips the slow regeneration path entirely.
+#
+# Variables:
+#   kdump_packages: List of APT packages providing kdump support
+#                   (default: [kdump-tools]).
+
+- name: Manage kdump-tools
+  hosts: nodes
+  become: true
+  become_exe: sudo.ws
+  vars:
+    kdump_packages:
+      - kdump-tools
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Installation
+    # Ensures the kdump-tools package is present. Ubuntu ships it on most
+    # server installs, but installing it idempotently here keeps the
+    # playbook self-contained for a node re-provisioned from a minimal
+    # base image.
+    # -------------------------------------------------------------------------
+    - name: Install kdump-tools package
+      ansible.builtin.apt:
+        name: '{{ kdump_packages }}'
+        state: present
+        update_cache: true
+
+    # -------------------------------------------------------------------------
+    # Stale Drop-in Cleanup
+    # Removes the after-tmp-mount.conf drop-in deployed by an earlier
+    # revision of this playbook. The drop-in did not actually fix the
+    # boot hang and is taken back out so the on-disk state honestly
+    # reflects what is doing work. Targets the file specifically rather
+    # than the parent directory so the ordering drop-in installed below
+    # is not affected on re-runs.
+    # -------------------------------------------------------------------------
+    - name: Remove ineffective after-tmp-mount.conf drop-in if present
+      ansible.builtin.file:
+        path: /etc/systemd/system/kdump-tools.service.d/after-tmp-mount.conf
+        state: absent
+      notify: Reload systemd daemon
+
+    # -------------------------------------------------------------------------
+    # Stale Ordering Drop-in Cleanup
+    # Removes the ordering.conf drop-in deployed by an earlier revision
+    # of this playbook. That drop-in (Before= cleared, After=multi-user.target)
+    # introduced a systemd ordering cycle — basic.target Wants
+    # kdump-tools, kdump-tools After=multi-user.target, multi-user.target
+    # After=basic.target. systemd resolved the cycle by deleting the
+    # systemd-user-sessions.service job, which left /run/nologin in
+    # place and blocked every PAM-account login (ssh and console alike).
+    # The file is removed so the timeout drop-in below is the only one
+    # in effect.
+    # -------------------------------------------------------------------------
+    - name: Remove cycle-inducing ordering.conf drop-in if present
+      ansible.builtin.file:
+        path: /etc/systemd/system/kdump-tools.service.d/ordering.conf
+        state: absent
+      notify: Reload systemd daemon
+
+    # -------------------------------------------------------------------------
+    # Timeout Drop-in
+    # kdump-tools.service is Type=oneshot. systemd's default
+    # TimeoutStartSec for Type=oneshot is infinity (per
+    # systemd-system.conf(5)), so a hang in the ExecStart leaves
+    # basic.target waiting forever and bricks the boot. Capping the
+    # start timeout at 120s means a hung mkinitramfs is sent SIGTERM
+    # (then SIGKILL) and the service transitions to failed, letting
+    # basic.target reach and the rest of boot proceed. 120s is generous
+    # enough to cover a worst-case successful mkinitramfs run on a slow
+    # node.
+    # -------------------------------------------------------------------------
+    - name: Ensure kdump-tools systemd drop-in directory exists
+      ansible.builtin.file:
+        path: /etc/systemd/system/kdump-tools.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Install kdump-tools timeout drop-in
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/kdump-tools.service.d/timeout.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Service]
+          TimeoutStartSec=120s
+      notify: Reload systemd daemon
+
+    # -------------------------------------------------------------------------
+    # Cache Pre-Generation
+    # Runs kdump-config load from the running OS, which (a) generates
+    # /var/lib/kdump/initrd.img-<kver> via mkinitramfs if missing for the
+    # current kernel and (b) loads that kernel + initrd into the kexec
+    # reserved region so a panic during this boot actually captures a
+    # dump.
+    #
+    # The upstream /etc/kernel/postinst.d/kdump-tools hook already
+    # pre-generates the cache for each newly-installed kernel. This task
+    # is a defensive safety net for the case where the cache went
+    # missing between kernel install and the next reboot (we have
+    # observed this happen — mechanism unknown). Re-running this on
+    # every playbook execution ensures the cache is good for the
+    # currently running kernel, so the next boot's kdump-tools.service
+    # cache-hits and skips the slow mkinitramfs path entirely.
+    #
+    # mkinitramfs invoked from the running OS reliably completes in
+    # ~5–15s; the early-boot hang documented in the header has never
+    # been reproduced from a fully-booted system.
+    #
+    # If crashkernel= is absent from /proc/cmdline (e.g. node currently
+    # booted in GRUB recovery mode), kdump-config exits 1 with
+    # "no crashkernel= parameter in the kernel cmdline"; that is not
+    # treated as a playbook failure since the operator may legitimately
+    # be running Ansible against a recovery-mode node during debugging.
+    # -------------------------------------------------------------------------
+    - name: Pre-generate kdump initrd and arm kexec for current kernel
+      ansible.builtin.command:
+        cmd: /usr/sbin/kdump-config load
+      register: kdump_config_load
+      changed_when: "'Generating' in kdump_config_load.stdout"
+      failed_when:
+        - kdump_config_load.rc != 0
+        - "'no crashkernel= parameter' not in kdump_config_load.stdout"
+
+  handlers:
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
