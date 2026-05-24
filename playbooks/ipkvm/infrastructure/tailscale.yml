@@ -331,10 +331,7 @@
           ansible.builtin.set_fact:
             tailscale_dns_body:
               nameservers: '{{ tailscale_global_nameservers }}'
-              splitDNS:
-                '{{ dns_zone }}':
-                  - address: '{{ bind9_lb_ip }}'
-                    useWithExitNode: true
+              splitDNS: "{{ {dns_zone: [{'address': bind9_lb_ip, 'useWithExitNode': true}]} }}"
               preferences:
                 overrideLocalDNS: true
                 magicDNS: true

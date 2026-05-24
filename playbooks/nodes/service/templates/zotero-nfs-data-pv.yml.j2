@@ -1,0 +1,69 @@
+{#
+  Static PersistentVolume and PersistentVolumeClaim for the Zotero WebDAV
+  data tree, backed by the homelab NFS share. Applied directly by zotero.yml
+  before ArgoCD syncs the manifests, so the PVC exists when the Deployment
+  references it as a regular volume.
+
+  The storageClassName is set to '' and volumeName is set explicitly to force
+  binding to this specific PV and prevent the default StorageClass from
+  interfering. The reclaim policy is Retain so that deleting the PVC during
+  development never destroys the underlying Zotero attachments — cleanup of
+  the NFS export must be done explicitly.
+
+  NFS supports ReadWriteMany, but the Deployment uses replicas=1 with a
+  Recreate strategy to avoid two Apache instances mutating the same WebDAV
+  tree concurrently.
+
+  Variables:
+    zotero_namespace:        Kubernetes namespace where the WebDAV server is
+                             deployed.
+    zotero_nfs_data_size:    Nominal size annotation for the PV and PVC.
+                             NFS does not enforce quotas via PVC size.
+    nfs_server_ip:           IP address of the NFS server.
+    zotero_nfs_data_path:    Absolute path on the NFS server for the WebDAV
+                             data tree (e.g. <nfs_k8s_path>/zotero-webdav).
+
+  Mount options:
+    soft       Instructs the kernel to return EIO after the timeout rather
+               than retrying indefinitely. Allows Kubernetes to restart the
+               pod and recover automatically once the NFS server is
+               reachable, rather than hanging in uninterruptible D state.
+    timeo=600  Initial RPC timeout in tenths of a second (60 seconds) before
+               returning EIO to the calling process under soft mount
+               semantics.
+#}
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: zotero-webdav-data
+  labels:
+    app.kubernetes.io/name: zotero-webdav
+spec:
+  capacity:
+    storage: '{{ zotero_nfs_data_size }}'
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ''
+  mountOptions:
+    - soft
+    - timeo=600
+  nfs:
+    server: '{{ nfs_server_ip }}'
+    path: '{{ zotero_nfs_data_path }}'
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: zotero-webdav-data
+  namespace: '{{ zotero_namespace }}'
+  labels:
+    app.kubernetes.io/name: zotero-webdav
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ''
+  volumeName: zotero-webdav-data
+  resources:
+    requests:
+      storage: '{{ zotero_nfs_data_size }}'

@@ -1,0 +1,580 @@
+---
+# ==============================================================================
+# Playbook: Deploy Zotero WebDAV Server via ArgoCD GitOps
+# ==============================================================================
+# This playbook provisions a self-hosted WebDAV endpoint that the Zotero
+# desktop and iOS clients use to sync file attachments (PDFs, web snapshots,
+# etc.). Library metadata still syncs through zotero.org's Data Sync service;
+# only the attachments traverse this server.
+#
+# Architecture:
+#   The endpoint runs as a single-replica Deployment of the upstream Apache
+#   httpd image with mod_dav and mod_dav_fs enabled. Apache listens on an
+#   unprivileged port inside the pod (the restricted Pod Security Admission
+#   profile forbids binding to ports below 1024 from a non-root process) and
+#   sits behind Traefik. Traefik terminates TLS using the homelab wildcard
+#   certificate and forwards plain HTTP to the Service.
+#
+#   File attachments are stored on the homelab NFS share at
+#   nfs_k8s_path/zotero-webdav, exposed through a static PersistentVolume
+#   with ReadWriteMany access. The path is deliberately separate from
+#   nfs_k8s_path/syncthing so the existing Syncthing-backed Zotero data is
+#   never touched by this server.
+#
+# Authentication:
+#   Zotero clients only support HTTP Basic authentication for WebDAV — they
+#   do not follow redirects to an SSO provider. The HTTPRoute shipped in the
+#   gitops bundle therefore does NOT carry the Authentik ForwardAuth
+#   middleware. Instead, Apache authenticates each request against an
+#   htpasswd file. The htpasswd line is stored in OpenBao at
+#   secret/zotero/webdav with property 'htpasswd' (bcrypt-hashed) and
+#   materialized into the cluster by the External Secrets Operator as
+#   Kubernetes Secret zotero-webdav-credentials.
+#
+#   The OpenBao path must be seeded out-of-band before this playbook can
+#   complete — the precheck task fails fast with a helpful message if the
+#   path is empty so the operator does not silently end up with an
+#   unauthenticated WebDAV endpoint.
+#
+# Manifest layout:
+#   Every namespaced resource (ExternalSecret, ConfigMap, Service, HTTPRoute,
+#   Deployment) is rendered into a single gitops manifest bundle from
+#   templates/zotero-manifests.yml.j2 and managed by ArgoCD. Only the
+#   cluster-scoped PersistentVolume and its bound PVC are applied directly
+#   by this playbook (from templates/zotero-nfs-data-pv.yml.j2) so the
+#   storage exists before ArgoCD reconciles the Deployment.
+#
+# Run order:
+#   1. infrastructure/nfs.yml         (NFS server and Kubernetes NFS path)
+#   2. cluster/network.yml            (Traefik gateway, homelab CA, wildcard TLS)
+#   3. cluster/secrets.yml            (OpenBao + External Secrets Operator)
+#   4. cluster/git.yml                (Gitea)
+#   5. cluster/gitops.yml             (ArgoCD)
+#   6. service/zotero.yml             (this playbook)
+#
+# cluster/authentication.yml is intentionally NOT a prerequisite. Zotero
+# clients only speak HTTP Basic and cannot follow Authentik's browser
+# login redirect, so this service deliberately bypasses Authentik
+# ForwardAuth and authenticates against an htpasswd file at the Apache
+# layer.
+#
+# Operator bootstrap (one-time, before the playbook runs):
+#
+#   # Generate an htpasswd line with bcrypt:
+#   htpasswd -nbBC 12 zotero '<your-chosen-password>'
+#   # -> zotero:$2y$12$xUf.../...
+#
+#   # If htpasswd is not installed locally, run it from the same image used
+#   # by the Deployment:
+#   docker run --rm httpd:2.4 \
+#       htpasswd -nbBC 12 zotero '<your-chosen-password>'
+#
+#   # Store the line plus a plaintext copy of the password (so it can be
+#   # retrieved later when configuring a new Zotero client):
+#   just bao-shell
+#   bao kv put secret/zotero/webdav \
+#       username=zotero \
+#       password='<your-chosen-password>' \
+#       htpasswd='zotero:$2y$12$xUf.../...'
+#   exit
+#
+# Input Variables:
+#   bootstrap_node:             Boolean indicating if the host is the control
+#                               plane bootstrap node. Read from inventory.
+#   nfs_server:                 Boolean indicating if the host is the NFS
+#                               server. Read from inventory.
+#   dns_zone:                   DNS zone (e.g. homelab.internal). Read from
+#                               group_vars.
+#   zotero_namespace:           Kubernetes namespace for the WebDAV server
+#                               (default: zotero).
+#   zotero_hostname:            FQDN under which the WebDAV endpoint is
+#                               reachable from the LAN
+#                               (default: zotero.<dns_zone>).
+#   zotero_image:               Docker image for the Apache httpd server
+#                               (default: httpd).
+#   zotero_image_tag:           Docker image tag for the Apache httpd server.
+#                               The Debian-based '2.4' tag is used in
+#                               preference to '2.4-alpine' because Alpine
+#                               omits APR-Util's DBM drivers, which
+#                               mod_dav_fs requires for its lock database.
+#                               Without DBM, every WebDAV write returns 500
+#                               (default: 2.4).
+#   zotero_listen_port:         Unprivileged port Apache binds to inside the
+#                               pod. Traefik forwards to the Service which
+#                               maps port 80 to this targetPort
+#                               (default: 8080).
+#   zotero_max_upload_size:     Maximum request body size in bytes accepted
+#                               by Apache. Sized for occasional very large
+#                               PDFs (default: 524288000, i.e. 500 MiB).
+#   zotero_request_timeout:     Gateway API HTTPRoute request timeout applied
+#                               to the Traefik route. Expressed as a Go
+#                               duration string. Doubles Traefik's built-in
+#                               default of 60s to accommodate large attachment
+#                               uploads (default: 120s).
+#   zotero_nfs_data_path:       Absolute path on the NFS server for the
+#                               WebDAV data tree, derived from nfs_k8s_path
+#                               (default: <nfs_k8s_path>/zotero-webdav).
+#   zotero_nfs_data_size:       Nominal size annotation for the NFS PV and
+#                               PVC. NFS does not enforce quotas via PVC
+#                               size (default: 30Gi).
+#   zotero_htpasswd_kv_path:    OpenBao KV path holding the htpasswd line
+#                               consumed by the ExternalSecret
+#                               (default: secret/zotero/webdav).
+#   zotero_gitops_path:         Path within the gitops repository where the
+#                               Zotero manifests are stored
+#                               (default: apps/zotero).
+#   nfs_k8s_path:               Base NFS path for Kubernetes workloads.
+#                               Read from group_vars.
+#   nfs_group:                  Name of the NFS users group. Read from
+#                               group_vars.
+#   nfs_group_gid:              GID of the NFS users group. Read from
+#                               group_vars.
+#   nonroot_uid:                Non-root UID the WebDAV pod runs as. Read
+#                               from group_vars.
+#   nfs_server_ip:              IP address of the NFS server, derived from
+#                               inventory hostvars at runtime.
+#   openbao_hostname:           FQDN under which OpenBao is reachable from
+#                               the Ansible host. Used by 'bao kv get' to
+#                               check that the WebDAV credentials have been
+#                               seeded (default: openbao.<dns_zone>).
+#   openbao_unseal_threshold:   Number of unseal keys required to unseal
+#                               OpenBao after a cluster reboot. Must match
+#                               the key threshold used at init time by
+#                               playbooks/nodes/cluster/secrets.yml
+#                               (default: 3).
+#   pass_namespace:             Top-level folder in the pass store. The
+#                               OpenBao root token is read from
+#                               '<pass_namespace>/openbao/root-token'. Read
+#                               from group_vars.
+#   kubectl_config_path:        Full path to the kubectl config file
+#                               (default: /home/<ansible_user>/.kube/config).
+#   gitea_namespace:            Kubernetes namespace where Gitea is deployed
+#                               (default: gitea).
+#   gitea_admin_username:       Username of the Gitea admin account used to
+#                               push to the gitops repository
+#                               (default: gitea_admin).
+#   gitea_gitops_repo:          Name of the Gitea gitops repository
+#                               (default: gitops).
+#   argocd_namespace:           Kubernetes namespace where ArgoCD is deployed
+#                               (default: argocd).
+
+- name: Deploy Zotero WebDAV via ArgoCD GitOps
+  hosts: nodes
+  become: true
+  become_exe: sudo.ws
+  vars:
+    zotero_namespace: zotero
+    zotero_hostname: 'zotero.{{ dns_zone }}'
+    zotero_image: httpd
+    zotero_image_tag: '2.4'
+    zotero_listen_port: 8080
+    zotero_max_upload_size: 524288000
+    zotero_request_timeout: 120s
+    zotero_nfs_data_path: '{{ nfs_k8s_path }}/zotero-webdav'
+    zotero_nfs_data_size: 30Gi
+    zotero_htpasswd_kv_path: secret/zotero/webdav
+    zotero_gitops_path: apps/zotero
+    nfs_server_ip: >-
+      {{ hostvars | dict2items
+         | selectattr('value.nfs_server', 'defined')
+         | selectattr('value.nfs_server', 'equalto', true)
+         | map(attribute='value.private_ip')
+         | first }}
+    openbao_hostname: 'openbao.{{ dns_zone }}'
+    openbao_unseal_threshold: 3
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    gitea_namespace: gitea
+    gitea_admin_username: gitea_admin
+    gitea_gitops_repo: gitops
+    argocd_namespace: argocd
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Namespace
+    # -------------------------------------------------------------------------
+    # Creates the Zotero namespace before any other resources so that the
+    # ExternalSecret, HTTPRoute, and ArgoCD Application can target it on the
+    # first run.
+    # -------------------------------------------------------------------------
+    - name: Create Zotero namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create namespace {{ zotero_namespace }}
+      register: zotero_ns_result
+      changed_when: "'created' in zotero_ns_result.stdout"
+      failed_when:
+        - zotero_ns_result.rc != 0
+        - "'already exists' not in zotero_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Default ServiceAccount Hardening
+    # -------------------------------------------------------------------------
+    # Disables the default ServiceAccount token automount in this namespace
+    # so ad-hoc pods that don't name a ServiceAccount cannot read a usable
+    # API bearer credential. The httpd Deployment does not need API access.
+    # -------------------------------------------------------------------------
+    - name: Disable default ServiceAccount token automount in Zotero namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch serviceaccount default
+          -n {{ zotero_namespace }}
+          --type=merge
+          -p '{"automountServiceAccountToken": false}'
+      register: zotero_sa_automount_result
+      changed_when: "'patched' in zotero_sa_automount_result.stdout"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # OpenBao Unseal Guard
+    # -------------------------------------------------------------------------
+    # OpenBao comes up sealed after every cluster reboot, so a service
+    # playbook run shortly after a reboot would otherwise fail on its
+    # first `bao kv` call with "Vault is sealed". The three tasks below
+    # detect an initialized-but-sealed OpenBao and unseal it using the
+    # keys stashed under `<pass_namespace>/openbao/unseal-key-{1..N}` in
+    # the operator's pass store. Initial bootstrap is NOT handled here —
+    # if OpenBao is uninitialized, the play fails fast with a pointer at
+    # `playbooks/nodes/cluster/secrets.yml`, which owns that flow.
+    #
+    # The logic is inlined rather than imported from
+    # `playbooks/nodes/cluster/` so this play stays self-contained. If
+    # another service playbook ever needs the same guard, paste the three
+    # tasks in directly.
+    # -------------------------------------------------------------------------
+    - name: Detect OpenBao seal and init state
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          export BAO_ADDR='https://{{ openbao_hostname }}'
+          export BAO_SKIP_VERIFY=true
+          # `bao status` exits 0 unsealed, 1 on error, 2 sealed — so a
+          # sealed OpenBao trips `set -e` even though the JSON output is
+          # what we want. Capture stdout first and tolerate the exit.
+          STATUS=$(bao status -format=json 2>/dev/null || true)
+          printf '%s' "$STATUS" \
+            | jq -r '"initialized=\(.initialized) sealed=\(.sealed)"'
+        executable: /bin/sh
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      register: openbao_state
+      when: bootstrap_node | default(false)
+
+    - name: Fail when OpenBao is not initialized
+      ansible.builtin.fail:
+        msg: >-
+          OpenBao reports {{ openbao_state.stdout }} — bootstrap the
+          cluster via `just deploy nodes cluster secrets` before
+          re-running this playbook.
+      when:
+        - bootstrap_node | default(false)
+        - "'initialized=true' not in openbao_state.stdout"
+
+    - name: Unseal OpenBao when sealed
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          export BAO_ADDR='https://{{ openbao_hostname }}'
+          export BAO_SKIP_VERIFY=true
+          for i in $(seq 1 {{ openbao_unseal_threshold }}); do
+            KEY="$(pass show '{{ pass_namespace }}/openbao/unseal-key-'$i)"
+            bao operator unseal -format=json "$KEY" >/dev/null
+          done
+          unset KEY
+        executable: /bin/sh
+      delegate_to: localhost
+      become: false
+      changed_when: true
+      no_log: true
+      when:
+        - bootstrap_node | default(false)
+        - "'sealed=true' in openbao_state.stdout"
+
+    # -------------------------------------------------------------------------
+    # OpenBao Precheck
+    # -------------------------------------------------------------------------
+    # Zotero clients only support HTTP Basic Authentication for WebDAV; the
+    # endpoint is therefore exposed without Authentik ForwardAuth and Apache
+    # authenticates against an htpasswd file sourced from OpenBao via the
+    # External Secrets Operator. If the OpenBao path is empty when ArgoCD
+    # syncs the manifests, ESO will materialize an empty Secret and Apache
+    # will reject every request with 401. Fail fast here with an actionable
+    # error so the operator seeds the secret before the WebDAV endpoint goes
+    # live.
+    #
+    # 'bao kv get' is delegated to the Ansible host (the bao CLI authenticates
+    # using the root token from the pass store, which only exists there).
+    # -------------------------------------------------------------------------
+    - name: Verify Zotero WebDAV credentials are seeded in OpenBao
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+
+          BAO_TOKEN="$(pass show '{{ pass_namespace }}/openbao/root-token')"
+          export BAO_TOKEN
+          export BAO_ADDR='https://{{ openbao_hostname }}'
+          export BAO_SKIP_VERIFY=true
+
+          if ! bao kv get -format=json '{{ zotero_htpasswd_kv_path }}' \
+              >/dev/null 2>&1; then
+            cat >&2 <<'MSG'
+          OpenBao path {{ zotero_htpasswd_kv_path }} is empty. Seed it before
+          running this playbook. Example:
+
+            htpasswd -nbBC 12 zotero '<your-chosen-password>'
+            # -> zotero:$2y$12$xUf.../...
+
+            just bao-shell
+            bao kv put {{ zotero_htpasswd_kv_path }} \
+                username=zotero \
+                password='<your-chosen-password>' \
+                htpasswd='zotero:$2y$12$xUf.../...'
+          MSG
+            exit 1
+          fi
+
+          HTPASSWD="$(bao kv get -format=json '{{ zotero_htpasswd_kv_path }}' \
+            | jq -r '.data.data.htpasswd // empty')"
+          if [ -z "$HTPASSWD" ]; then
+            echo "OpenBao path {{ zotero_htpasswd_kv_path }} is missing the 'htpasswd' field" >&2
+            exit 1
+          fi
+
+          unset BAO_TOKEN HTPASSWD
+        executable: /bin/sh
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # NFS Data Directory
+    # -------------------------------------------------------------------------
+    # Creates the WebDAV data directory on the NFS server node. Runs on the
+    # NFS server to operate directly on the server filesystem, bypassing NFS
+    # root_squash restrictions. infrastructure/nfs.yml must have been run
+    # first to create nfs_k8s_path. The setgid bit (mode 2775) makes new
+    # files and subdirectories inherit the NFS users group so the pod can
+    # write to them.
+    # -------------------------------------------------------------------------
+    - name: Create Zotero WebDAV data directory on NFS server
+      ansible.builtin.file:
+        path: '{{ zotero_nfs_data_path }}'
+        state: directory
+        owner: root
+        group: '{{ nfs_group }}'
+        mode: '2775'
+      when: nfs_server | default(false)
+
+    # -------------------------------------------------------------------------
+    # NFS Data PersistentVolume
+    # -------------------------------------------------------------------------
+    # Applies a static PersistentVolume and PersistentVolumeClaim backed by
+    # the NFS share. Pre-applied here so the PVC exists when the Deployment
+    # references it as a regular volume. The PV uses Retain reclaim policy
+    # so the WebDAV data is not deleted if the PVC is removed.
+    # -------------------------------------------------------------------------
+    - name: Write Zotero NFS data PV manifest
+      ansible.builtin.template:
+        src: templates/zotero-nfs-data-pv.yml.j2
+        dest: /tmp/zotero-nfs-data-pv.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Apply Zotero NFS data PV and PVC
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/zotero-nfs-data-pv.yml
+      register: zotero_pv_result
+      changed_when: >-
+        'configured' in zotero_pv_result.stdout or
+        'created' in zotero_pv_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Zotero NFS data PV manifest
+      ansible.builtin.file:
+        path: /tmp/zotero-nfs-data-pv.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # GitOps - Manifest Management
+    # -------------------------------------------------------------------------
+    # Renders the Zotero native Kubernetes manifests (ExternalSecret,
+    # ConfigMap, Service, HTTPRoute, Deployment) from a Jinja2 template and
+    # commits them to the Gitea gitops repository. ArgoCD watches this path
+    # and automatically syncs the manifests to the cluster.
+    # -------------------------------------------------------------------------
+    - name: Ensure git is installed
+      ansible.builtin.apt:
+        name: git
+        state: present
+      when: bootstrap_node | default(false)
+
+    - name: Get Gitea pod IP
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get pod -n {{ gitea_namespace }}
+          -l app.kubernetes.io/name=gitea,app.kubernetes.io/instance=gitea
+          -o jsonpath='{.items[0].status.podIP}'
+      register: gitea_pod_ip
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Read Gitea admin password from Kubernetes Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret gitea-credentials -n {{ gitea_namespace }}
+          -o jsonpath='{.data.admin-password}'
+      register: gitea_admin_password_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Gitea admin password fact
+      ansible.builtin.set_fact:
+        gitea_admin_password: "{{ gitea_admin_password_b64.stdout | b64decode }}"
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Clone or update gitops repository in temporary directory
+      ansible.builtin.git:
+        repo: >-
+          http://{{ gitea_admin_username }}:{{ gitea_admin_password }}@{{ gitea_pod_ip.stdout }}:3000/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}
+        dest: /tmp/gitops-zotero
+        version: main
+        update: true
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Create Zotero directory in gitops repository
+      ansible.builtin.file:
+        path: '/tmp/gitops-zotero/{{ zotero_gitops_path }}'
+        state: directory
+        mode: '0755'
+      when: bootstrap_node | default(false)
+
+    - name: Write Zotero manifests to gitops repository
+      ansible.builtin.template:
+        src: templates/zotero-manifests.yml.j2
+        dest: '/tmp/gitops-zotero/{{ zotero_gitops_path }}/manifests.yml'
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Configure git user email for commit # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-zotero config user.email 'ansible@{{ dns_zone | default("homelab.internal") }}'
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Configure git user name for commit # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-zotero config user.name Ansible
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set gitops repository remote URL with credentials for push # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-zotero remote set-url origin
+          http://{{ gitea_admin_username }}:{{ gitea_admin_password }}@{{ gitea_pod_ip.stdout }}:3000/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}
+      no_log: true
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Stage Zotero manifests in gitops repository # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-zotero add {{ zotero_gitops_path }}/manifests.yml
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Check for staged changes in gitops repository # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-zotero diff --cached --exit-code
+      register: gitops_diff_result
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Commit Zotero manifests to gitops repository # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-zotero commit -m 'chore: update zotero manifests'
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - gitops_diff_result.rc != 0
+
+    - name: Push Zotero manifests commit to Gitea # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-zotero push origin main
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - gitops_diff_result.rc != 0
+
+    - name: Clean up gitops temporary directory
+      ansible.builtin.file:
+        path: /tmp/gitops-zotero
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ArgoCD Application
+    # -------------------------------------------------------------------------
+    # Applies the ArgoCD Application manifest that tracks the Gitea gitops
+    # path. This initiates the deployment of the Zotero WebDAV resources to
+    # the cluster.
+    # -------------------------------------------------------------------------
+    - name: Write ArgoCD Application manifest for Zotero
+      ansible.builtin.template:
+        src: templates/zotero-app.yml.j2
+        dest: /tmp/zotero-app.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ArgoCD Application manifest for Zotero
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/zotero-app.yml
+      register: argocd_app_result
+      changed_when: >-
+        'configured' in argocd_app_result.stdout or
+        'created' in argocd_app_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up ArgoCD Application manifest for Zotero
+      ansible.builtin.file:
+        path: /tmp/zotero-app.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Trigger ArgoCD hard refresh to detect new gitops commit
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch application zotero -n {{ argocd_namespace }}
+          --type merge
+          -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Wait for ArgoCD to sync and deploy Zotero
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get application zotero -n {{ argocd_namespace }}
+          -o jsonpath='{.status.sync.status},{.status.health.status}'
+      register: argocd_status
+      until: argocd_status.stdout == 'Synced,Healthy'
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: bootstrap_node | default(false)
