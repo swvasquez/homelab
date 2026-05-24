@@ -299,6 +299,23 @@ kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock
   ```sh
   just deploy nodes service <SERVICE>
   ```
+- **Homelab CA trust install**: `cluster/network.yml` creates a private root CA (`homelab-ca`)
+  that signs the wildcard TLS certificate used by every `*.<DNS_ZONE>` service. To trust homelab
+  services in browsers, native apps, `curl`, and similar TLS clients without per-call flags or
+  clickthrough warnings, the CA cert must be installed on each operator device once. The same
+  `cluster/network.yml` playbook runs a `localhost` play at the end that extracts the cert from
+  the cluster's `wildcard-tls` Secret, caches it under `~/.local/state/homelab/homelab-ca.crt`,
+  and installs it into the System keychain (macOS) or `/usr/local/share/ca-certificates` plus
+  `update-ca-certificates` (Linux). Other operator devices (iOS, Windows, etc.) need a manual
+  install:
+  ```sh
+  kubectl -n kube-system get secret wildcard-tls \
+      -o jsonpath='{.data.ca\.crt}' | base64 -d > homelab-ca.crt
+  ```
+  Then add it to the device trust store (on iOS: install as a Configuration Profile via AirDrop
+  or email, then enable under Settings → General → About → Certificate Trust Settings).
+  See [`tls-hardening.md`](tls-hardening.md) for the threat model around the unconstrained CA and
+  the `nameConstraints` hardening procedure.
 - **Tailscale playbook run order**: `playbooks/shared/infrastructure/tailscale.yml` owns the
   tailnet ACL (tagOwners, exit-node auto-approver, and subnet-route auto-approver) and must be
   run before the per-host Tailscale playbooks (`nodes/infrastructure/tailscale.yml`,

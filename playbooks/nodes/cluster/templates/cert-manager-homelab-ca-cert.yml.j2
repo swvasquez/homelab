@@ -1,0 +1,45 @@
+{#
+  Defines a cert-manager Certificate that issues the homelab root CA. The
+  Certificate is signed by the selfsigned-issuer ClusterIssuer and marked
+  as a CA so the resulting key pair can in turn sign downstream certificates
+  via a ca-type ClusterIssuer (cert-manager-homelab-ca-issuer.yml.j2).
+
+  Layering this CA above the wildcard certificate fixes the missing
+  Subject / Issuer DN problem that prevents a directly self-signed wildcard
+  from being installed as a trust anchor in macOS Keychain, iOS profiles
+  and similar OS-level trust stores. The CA cert carries an explicit
+  commonName plus an O= organization so every client treats it as a
+  well-formed root.
+
+  The resulting Secret (homelab-ca) lives in the cert-manager namespace and
+  is consumed by the homelab-ca-issuer ClusterIssuer. The Secret contains
+  ca.crt, tls.crt and tls.key; the ca.crt and tls.crt fields are identical
+  for a self-signed CA. tls.crt is what gets installed in the OS trust
+  store on operator devices.
+
+  Variables:
+    cert_manager_namespace:  Kubernetes namespace where cert-manager runs.
+                             The Certificate resource and its Secret live
+                             here so the ca-type ClusterIssuer can find them
+                             without cross-namespace references.
+#}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: homelab-ca
+  namespace: '{{ cert_manager_namespace }}'
+spec:
+  isCA: true
+  commonName: homelab-ca
+  subject:
+    organizations:
+      - homelab
+  secretName: homelab-ca
+  duration: 87600h
+  renewBefore: 720h
+  privateKey:
+    algorithm: RSA
+    size: 2048
+  issuerRef:
+    name: selfsigned-issuer
+    kind: ClusterIssuer

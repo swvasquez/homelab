@@ -1,14 +1,22 @@
 {#
-  Defines a cert-manager Certificate that issues a wildcard TLS secret for the homelab
-  DNS zone. The certificate covers both the apex domain ({{ dns_zone }}) and all
-  subdomains (*.{{ dns_zone }}), so any service exposed via a HTTPRoute gets TLS
-  automatically without requiring per-resource certificate configuration.
+  Defines a cert-manager Certificate that issues a wildcard TLS secret for
+  the homelab DNS zone. The certificate covers both the apex domain
+  ({{ dns_zone }}) and all subdomains (*.{{ dns_zone }}), so any service
+  exposed via an HTTPRoute gets TLS automatically without requiring
+  per-resource certificate configuration.
 
-  The resulting Secret (wildcard-tls) is stored in the kube-system namespace and
-  referenced by the traefik-gateway.yml.j2 HTTPS listener.
+  The certificate is signed by homelab-ca-issuer (a ca-type ClusterIssuer
+  backed by the homelab-ca Secret) rather than by selfsigned-issuer
+  directly. This produces a wildcard cert whose Issuer field references a
+  real, installable root CA — without this layer the wildcard cert would
+  have an empty Issuer DN and could not be added to OS trust stores.
+
+  The resulting Secret (wildcard-tls) is stored in the kube-system
+  namespace and referenced by the traefik-gateway.yml.j2 HTTPS listener.
 
   Variables:
-    dns_zone: DNS zone served by Bind9 (e.g. homelab.internal). Read from group_vars.
+    dns_zone: DNS zone served by Bind9 (e.g. homelab.internal). Read from
+              group_vars.
 #}
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -18,7 +26,7 @@ metadata:
 spec:
   secretName: wildcard-tls
   issuerRef:
-    name: selfsigned-issuer
+    name: homelab-ca-issuer
     kind: ClusterIssuer
   dnsNames:
     - '*.{{ dns_zone }}'

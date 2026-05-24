@@ -1,0 +1,30 @@
+{#
+  Defines a cert-manager ClusterIssuer of type 'ca' that signs downstream
+  certificates with the homelab-ca key pair. The CA Secret it references
+  is produced by cert-manager-homelab-ca-cert.yml.j2 and lives in the
+  cert-manager namespace.
+
+  Together with the selfsigned-issuer ClusterIssuer this completes the
+  two-tier trust chain:
+
+      selfsigned-issuer ─signs→ homelab-ca (Certificate, isCA: true)
+                                    │
+                                 homelab-ca-issuer (ClusterIssuer, type ca)
+                                    │
+                                    └─signs→ wildcard-tls, future certs
+
+  Any future Certificate that wants to be trusted by operator devices
+  should reference this issuer rather than the selfsigned-issuer.
+
+  Variables:
+    cert_manager_namespace:  Namespace where the homelab-ca Secret lives,
+                             so the ca-type issuer can locate the
+                             signing material.
+#}
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: homelab-ca-issuer
+spec:
+  ca:
+    secretName: homelab-ca

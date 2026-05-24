@@ -207,13 +207,24 @@
 
     # -------------------------------------------------------------------------
     # Cluster CA Certificate
-    # Reads the cluster CA certificate from the wildcard-tls Secret in
-    # kube-system and creates a ConfigMap named homelab-ca in the Gitea
-    # namespace. This ConfigMap is mounted into Gitea's containers via the Helm
-    # values and combined with the Alpine system CA bundle so that Gitea trusts
-    # the self-signed wildcard certificate used by cluster services such as
-    # Authentik. Without this, the configure-gitea init container cannot fetch
-    # the Authentik OIDC discovery document over HTTPS.
+    # Reads the homelab CA certificate from the wildcard-tls Secret in
+    # kube-system (the Secret's ca.crt field carries the issuer's cert —
+    # since the wildcard is signed by homelab-ca-issuer, ca.crt is the
+    # homelab-ca root) and materializes it as a ConfigMap named homelab-ca
+    # in the Gitea namespace. The ConfigMap is mounted into Gitea's
+    # containers via the Helm values and combined with the Alpine system
+    # CA bundle so that Gitea trusts the wildcard certificate used by
+    # cluster services such as Authentik. Without this, the configure-gitea
+    # init container cannot fetch the Authentik OIDC discovery document
+    # over HTTPS.
+    #
+    # The ConfigMap is APPLIED (not create-only) so a rotation or refactor
+    # of the underlying CA — e.g. swapping the wildcard issuer from
+    # selfsigned-issuer to homelab-ca-issuer — propagates into Gitea's
+    # trust bundle on the next playbook run. A plain `kubectl create
+    # configmap` returns "already exists" and silently leaves a stale CA
+    # in place, which causes the configure-gitea init container to fail
+    # the next time Authentik's cert chain changes.
     # -------------------------------------------------------------------------
     - name: Read cluster CA certificate from wildcard-tls secret
       ansible.builtin.command:
@@ -232,18 +243,21 @@
         mode: '0644'
       when: bootstrap_node | default(false)
 
-    - name: Create homelab CA ConfigMap in Gitea namespace
-      ansible.builtin.command:
-        cmd: >-
-          kubectl --kubeconfig={{ kubectl_config_path }}
-          create configmap homelab-ca
-          -n {{ gitea_namespace }}
-          --from-file=ca.crt=/tmp/homelab-ca.crt
+    - name: Apply homelab CA ConfigMap in Gitea namespace
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          kubectl --kubeconfig={{ kubectl_config_path }} \
+              create configmap homelab-ca \
+              -n {{ gitea_namespace }} \
+              --from-file=ca.crt=/tmp/homelab-ca.crt \
+              --dry-run=client -o yaml \
+            | kubectl --kubeconfig={{ kubectl_config_path }} apply -f -
+        executable: /bin/sh
       register: homelab_ca_configmap_result
-      changed_when: "'created' in homelab_ca_configmap_result.stdout"
-      failed_when:
-        - homelab_ca_configmap_result.rc != 0
-        - "'already exists' not in homelab_ca_configmap_result.stderr"
+      changed_when: >-
+        'configured' in homelab_ca_configmap_result.stdout
+        or 'created' in homelab_ca_configmap_result.stdout
       when: bootstrap_node | default(false)
 
     - name: Remove cluster CA certificate temporary file

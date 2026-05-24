@@ -35,6 +35,14 @@
 #   - Configures systemd-resolved on every cluster node with a split-DNS
 #     drop-in so node-level queries for the homelab zone resolve via Bind9.
 #   - Installs the Cilium CLI on all nodes for inspecting and troubleshooting.
+#   - On the Ansible control host (localhost), extracts the homelab-ca
+#     certificate from the wildcard-tls Secret and installs it into the
+#     operator workstation's OS-level trust store so browsers, native apps
+#     (Zotero, Vaultwarden, etc.), and curl all trust every '*.<dns_zone>'
+#     hostname without warnings or per-call flags. Supports macOS (via the
+#     System keychain) and Linux (via update-ca-certificates). Idempotent
+#     on existence of a cert labeled 'homelab-ca'; rotate the CA manually
+#     if you ever need to replace it.
 #
 # Node roles are determined by host variables in inventory.yml:
 #   bootstrap_node: true — node runs cluster management commands (kubectl,
@@ -121,6 +129,18 @@
 #   local_kubeconfig_path:   Destination path for the kubeconfig on the local
 #                            machine. Rewritten in place to point at
 #                            kubernetes_api_hostname (default: ~/.kube/config).
+#   homelab_ca_local_path:   Path on the Ansible control host where the
+#                            extracted homelab-ca PEM is cached and from
+#                            which it is read into the OS trust store
+#                            (default: ~/.local/state/homelab/homelab-ca.crt).
+#   install_ca_root:
+#                            Boolean toggle that controls whether the
+#                            playbook modifies the local OS trust store
+#                            and writes the cached PEM. Set to false to
+#                            run the cluster play but leave the operator
+#                            workstation untouched (default: true).
+#                            Override on the command line with
+#                            `-e install_ca_root=false`.
 
 - name: Install cluster networking and DNS
   hosts: nodes
@@ -537,11 +557,24 @@
     # cert-manager
     # Installs cert-manager via the Jetstack Helm chart. cert-manager
     # automates TLS certificate management in Kubernetes, providing
-    # issuance and renewal. A self-signed ClusterIssuer is created
-    # along with a wildcard Certificate for *.{{ dns_zone }}. The
-    # wildcard cert is referenced by the Gateway's HTTPS listener so
+    # issuance and renewal. The trust chain is two-tier so the wildcard
+    # cert carries a real Issuer DN and can be installed as a root in
+    # macOS Keychain, iOS configuration profiles, and similar OS trust
+    # stores:
+    #
+    #     selfsigned-issuer (ClusterIssuer, selfSigned)
+    #            └─signs→ homelab-ca (Certificate, isCA: true,
+    #                       CN=homelab-ca)
+    #                       └─backs→ homelab-ca-issuer (ClusterIssuer,
+    #                                 ca-type)
+    #                                 └─signs→ wildcard-tls
+    #                                           (*.{{ dns_zone }})
+    #
+    # The wildcard cert is referenced by the Gateway's HTTPS listener so
     # all services exposed via HTTPRoute get TLS automatically without
-    # per-resource annotations.
+    # per-resource annotations. Operator devices install the homelab-ca
+    # cert from kube-system/wildcard-tls (the ca.crt field) once and
+    # thereafter trust every '*.{{ dns_zone }}' hostname.
     # -------------------------------------------------------------------------
     - name: Add Jetstack Helm repository
       ansible.builtin.command:
@@ -601,6 +634,90 @@
         state: absent
       when: bootstrap_node | default(false)
 
+    # -------------------------------------------------------------------------
+    # Two-tier CA chain
+    # Layers a properly-formed root CA on top of selfsigned-issuer so the
+    # wildcard certificate carries a real Issuer DN and can be installed
+    # as a trust anchor in macOS Keychain, iOS profiles, and other OS-level
+    # trust stores. The selfsigned-issuer signs the homelab-ca Certificate
+    # (isCA: true, CN=homelab-ca), and a ca-type ClusterIssuer
+    # (homelab-ca-issuer) then signs the wildcard certificate further down.
+    # -------------------------------------------------------------------------
+    - name: Write homelab-ca Certificate manifest
+      ansible.builtin.template:
+        src: cert-manager-homelab-ca-cert.yml.j2
+        dest: /tmp/cert-manager-homelab-ca-cert.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply homelab-ca Certificate
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/cert-manager-homelab-ca-cert.yml
+      register: homelab_ca_cert_result
+      changed_when: >-
+        'created' in homelab_ca_cert_result.stdout or
+        'configured' in homelab_ca_cert_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Wait for homelab-ca Certificate to be Ready
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get certificate homelab-ca
+          -n {{ cert_manager_namespace }}
+          -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: homelab_ca_cert_ready
+      changed_when: false
+      retries: 30
+      delay: 2
+      until: homelab_ca_cert_ready.stdout == 'True'
+      when: bootstrap_node | default(false)
+
+    - name: Clean up homelab-ca Certificate manifest
+      ansible.builtin.file:
+        path: /tmp/cert-manager-homelab-ca-cert.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write homelab-ca-issuer ClusterIssuer manifest
+      ansible.builtin.template:
+        src: cert-manager-homelab-ca-issuer.yml.j2
+        dest: /tmp/cert-manager-homelab-ca-issuer.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply homelab-ca-issuer ClusterIssuer
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/cert-manager-homelab-ca-issuer.yml
+      register: homelab_ca_issuer_result
+      changed_when: >-
+        'created' in homelab_ca_issuer_result.stdout or
+        'configured' in homelab_ca_issuer_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Wait for homelab-ca-issuer ClusterIssuer to be Ready
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get clusterissuer homelab-ca-issuer
+          -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: homelab_ca_issuer_ready
+      changed_when: false
+      retries: 30
+      delay: 2
+      until: homelab_ca_issuer_ready.stdout == 'True'
+      when: bootstrap_node | default(false)
+
+    - name: Clean up homelab-ca-issuer ClusterIssuer manifest
+      ansible.builtin.file:
+        path: /tmp/cert-manager-homelab-ca-issuer.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
     - name: Write wildcard TLS Certificate manifest
       ansible.builtin.template:
         src: cert-manager-wildcard-cert.yml.j2
@@ -617,6 +734,20 @@
       changed_when: >-
         'created' in wildcard_cert_result.stdout or
         'configured' in wildcard_cert_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Wait for wildcard TLS Certificate to be Ready
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get certificate wildcard-tls
+          -n kube-system
+          -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: wildcard_cert_ready
+      changed_when: false
+      retries: 30
+      delay: 2
+      until: wildcard_cert_ready.stdout == 'True'
       when: bootstrap_node | default(false)
 
     - name: Clean up wildcard TLS Certificate manifest
@@ -1028,3 +1159,156 @@
       ansible.builtin.service:
         name: systemd-resolved
         state: restarted
+
+# ==============================================================================
+# Install the homelab-ca certificate into the operator workstation's
+# OS-level trust store. Runs after the cluster play above has provisioned
+# the wildcard-tls Secret. Targets localhost only — does NOT touch the
+# cluster nodes. Requires kubectl on the operator host to be configured
+# to reach the cluster and a working sudo (the OS trust-store update needs
+# root on both macOS and Linux). The play is idempotent on existence of a
+# cert labeled 'homelab-ca'; remove the existing cert and re-run if the
+# cluster's CA is ever rotated.
+# ==============================================================================
+- name: Install homelab CA in operator workstation trust store
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+  vars:
+    homelab_ca_local_path: '{{ lookup("env", "HOME") }}/.local/state/homelab/homelab-ca.crt'
+    install_ca_root: true
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Opt-Out Gate
+    # The local trust-store install touches files on the Ansible control
+    # host (the operator workstation), not on the cluster nodes. Operators
+    # running the playbook from CI, a shared jump box, or any machine that
+    # should not be modified can disable this play with
+    # `-e install_ca_root=false`. When disabled the play exits
+    # immediately after a one-line notice; the cluster play above has
+    # already completed by the time we get here.
+    # -------------------------------------------------------------------------
+    - name: Notify operator that local trust install is disabled
+      ansible.builtin.debug:
+        msg: >-
+          install_ca_root=false — skipping local trust-store
+          install. The homelab-ca cert was NOT extracted to
+          {{ homelab_ca_local_path }} and NOT installed into the OS trust
+          store. See the "Homelab CA trust install" section of README.md
+          for the manual install commands if you need to add trust on
+          this device later.
+      when: not (install_ca_root | bool)
+
+    - name: End play when local trust install is disabled
+      ansible.builtin.meta: end_play
+      when: not (install_ca_root | bool)
+
+    # -------------------------------------------------------------------------
+    # Cert Extract
+    # Pulls the homelab-ca PEM out of the cluster's wildcard-tls Secret
+    # (the ca.crt field is identical to the root CA's certificate) and
+    # writes it to a cached path under the operator's XDG state directory
+    # so subsequent runs and ad-hoc references can read the same file.
+    # -------------------------------------------------------------------------
+    - name: Ensure local state directory exists for the homelab CA cert
+      ansible.builtin.file:
+        path: '{{ homelab_ca_local_path | dirname }}'
+        state: directory
+        mode: '0700'
+
+    - name: Extract homelab-ca cert from cluster wildcard-tls Secret
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          kubectl -n kube-system get secret wildcard-tls \
+            -o jsonpath='{.data.ca\.crt}' | base64 -d
+        executable: /bin/sh
+      register: cluster_homelab_ca_cert
+      changed_when: false
+
+    - name: Write homelab-ca cert to local cache path
+      ansible.builtin.copy:
+        content: '{{ cluster_homelab_ca_cert.stdout }}'
+        dest: '{{ homelab_ca_local_path }}'
+        mode: '0644'
+
+    # -------------------------------------------------------------------------
+    # macOS Trust Store
+    # The 'security' CLI looks up by certificate common name. The check
+    # exits 0 when a cert with CN 'homelab-ca' is already present in the
+    # System keychain, in which case the install task is skipped. Cert
+    # rotation (rare given the 10-year lifetime) requires the operator
+    # to remove the existing cert manually before re-running.
+    # -------------------------------------------------------------------------
+    - name: Check macOS System keychain for homelab-ca certificate
+      ansible.builtin.command:
+        cmd: security find-certificate -c homelab-ca /Library/Keychains/System.keychain
+      register: macos_keychain_check
+      changed_when: false
+      failed_when: false
+      when: ansible_facts.system == 'Darwin'
+
+    - name: Install homelab-ca certificate into macOS System keychain
+      ansible.builtin.command:
+        cmd: >-
+          security add-trusted-cert -d -r trustRoot
+          -k /Library/Keychains/System.keychain
+          {{ homelab_ca_local_path }}
+      become: true
+      changed_when: true
+      when:
+        - ansible_facts.system == 'Darwin'
+        - macos_keychain_check.rc != 0
+
+    # -------------------------------------------------------------------------
+    # Linux Trust Store
+    # Drops the cert under /usr/local/share/ca-certificates and refreshes
+    # the system bundle via update-ca-certificates so OpenSSL, GnuTLS,
+    # curl, and similar consumers pick it up. Idempotent on file existence;
+    # remove and re-run after rotation.
+    # -------------------------------------------------------------------------
+    - name: Check Linux trust store for homelab-ca certificate
+      ansible.builtin.stat:
+        path: /usr/local/share/ca-certificates/homelab-ca.crt
+      register: linux_homelab_ca_check
+      when: ansible_facts.system == 'Linux'
+
+    - name: Install homelab-ca certificate into Linux trust store
+      ansible.builtin.copy:
+        src: '{{ homelab_ca_local_path }}'
+        dest: /usr/local/share/ca-certificates/homelab-ca.crt
+        owner: root
+        group: root
+        mode: '0644'
+        remote_src: true
+      become: true
+      register: linux_homelab_ca_install
+      when:
+        - ansible_facts.system == 'Linux'
+        - not linux_homelab_ca_check.stat.exists
+
+    - name: Refresh Linux CA certificate bundle
+      ansible.builtin.command:
+        cmd: update-ca-certificates
+      become: true
+      changed_when: true
+      when:
+        - ansible_facts.system == 'Linux'
+        - linux_homelab_ca_install is changed
+
+    # -------------------------------------------------------------------------
+    # Unsupported OS
+    # Other operator OSes are not auto-installed. The PEM is still cached
+    # at homelab_ca_local_path so the operator can install it manually
+    # using whatever mechanism their OS provides.
+    # -------------------------------------------------------------------------
+    - name: Notify operator on unsupported OS
+      ansible.builtin.debug:
+        msg: >-
+          Unsupported operator OS '{{ ansible_facts.system }}' — homelab-ca
+          cert cached at {{ homelab_ca_local_path }} but NOT installed into
+          a system trust store. Install it manually using whatever mechanism
+          this operating system provides.
+      when: ansible_facts.system not in ['Darwin', 'Linux']
