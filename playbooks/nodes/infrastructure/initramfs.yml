@@ -6,9 +6,12 @@
 # within the initramfs environment.
 #
 # This setup involves three parts (the localhost plays run first so the
-# operator has a working unlock-<host> SSH config and a public key on disk
+# operator has a working unlock-<host> SSH config and the unlock key on disk
 # even before the cluster nodes are reachable):
-#   1. On localhost: Generates a dedicated Dropbear SSH keypair.
+#   1. On localhost: Requires the dedicated Dropbear SSH keypair to already
+#      exist in the operator's pass store and materializes it to ~/.ssh so
+#      ssh has a real key file. Generation is opt-in
+#      (-e allow_dropbear_keygen=true) for first bootstrap or rotation.
 #   2. On localhost: drops a per-group SSH client config snippet into
 #      ~/.ssh/config.d/homelab-unlock and ensures the operator's
 #      ~/.ssh/config sources the snippet directory via 'Include
@@ -27,7 +30,8 @@
 #      does not require remote hosts to be reachable.
 #   3. On target hosts:
 #      - Installs the 'dropbear-initramfs' and 'ethtool' packages.
-#      - Authorizes the generated public key for initramfs login.
+#      - Authorizes the keypair's public half, read from the pass store,
+#        for initramfs login.
 #      - Configures Dropbear server options (port, command).
 #      - Sets a static IP address for the initramfs environment.
 #      - Bundles the ethtool binary into the initramfs via a hook and
@@ -56,33 +60,135 @@
 # Variables (set in group_vars/all.yml):
 #   dropbear_identity_file:
 #                          Filename (under ~/.ssh on the Ansible control
-#                          host) of the keypair generated and used to
-#                          authenticate to Dropbear. Rendered into the
-#                          IdentityFile directive of the local SSH client
-#                          config snippet.
+#                          host) of the keypair used to authenticate to
+#                          Dropbear. Rendered into the IdentityFile directive
+#                          of the local SSH client config snippet.
+#   pass_namespace:        Top-level folder in the operator's pass store. The
+#                          Dropbear keypair is stored under
+#                          '<pass_namespace>/dropbear/private-key' and
+#                          '<pass_namespace>/dropbear/public-key'. The public
+#                          half is read into each node's initramfs; the
+#                          private half is materialized to ~/.ssh here.
+#   dropbear_pass_private / dropbear_pass_public:
+#                          Full pass-store entry paths for the keypair,
+#                          derived from pass_namespace.
 #
 # Derived variables:
 #   dropbear_port:         The SSH port Dropbear will listen on in
 #                          initramfs. Derived from
 #                          ufw_allowed_ports.dropbear.port.
 #
+# Overrides (pass with -e on the command line; default shown):
+#   allow_dropbear_keygen (false):
+#                          When true, the keypair is generated into pass if it
+#                          is missing (adopting an existing local key if one is
+#                          present). Left false, a missing keypair is a hard
+#                          error, so only a deliberate bootstrap or rotation
+#                          creates a key.
+#
 
 # ==============================================================================
-# Local key generation
-# Generates the Dropbear ED25519 keypair on the Ansible control host. The
-# public key is authorized in the initramfs on each target host, and the
-# private key is used to connect and unlock the LUKS volume remotely.
+# Local keypair (pass-backed)
+# The operator's pass store is the single source of truth for the Dropbear
+# ED25519 keypair; this play materializes it to ~/.ssh on the Ansible control
+# host so ssh has a real key file to connect with. The keypair must already
+# exist in pass — a machine without the migrated store fails fast rather than
+# minting a divergent key. Pass -e allow_dropbear_keygen=true to generate it
+# on first bootstrap (or after `pass rm`-ing the entries to rotate); on that
+# path an existing local ~/.ssh key is adopted rather than replaced so nodes
+# already baked with its public half keep working. The remote play below
+# authorizes the public half — read straight from pass — in each node's
+# initramfs.
 # ==============================================================================
-- name: Generate Dropbear SSH key on localhost
+- name: Provision the Dropbear unlock keypair from the pass store
   hosts: localhost
   connection: local
   gather_facts: false
   become: false
+  vars:
+    local_dropbear_key: '{{ lookup("env", "HOME") }}/.ssh/{{ dropbear_identity_file }}'
+    allow_dropbear_keygen: false
+
   tasks:
-    - name: Generate Dropbear ED25519 keypair locally
+    # -------------------------------------------------------------------------
+    # Preflight
+    # The keypair must already exist in the pass store. This stops a machine
+    # that has not had the pass store migrated to it from silently minting a
+    # fresh, divergent key. Generation is opt-in via
+    # `-e allow_dropbear_keygen=true`, used only on first bootstrap or a
+    # deliberate rotation.
+    # -------------------------------------------------------------------------
+    - name: Check whether the Dropbear keypair exists in the pass store
       ansible.builtin.command:
-        cmd: "ssh-keygen -t ed25519 -f ~/.ssh/{{ dropbear_identity_file }} -N ''"
-        creates: '~/.ssh/{{ dropbear_identity_file }}'
+        cmd: pass show '{{ dropbear_pass_private }}'
+      register: dropbear_key_check
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Require the Dropbear keypair to pre-exist in the pass store
+      ansible.builtin.assert:
+        that: dropbear_key_check.rc == 0
+        fail_msg: >-
+          No Dropbear key found at '{{ dropbear_pass_private }}' in the pass
+          store. Migrate your pass store to this machine before running, or
+          re-run with -e allow_dropbear_keygen=true to mint a fresh keypair
+          and bake it into every node (this creates a new unlock key).
+        success_msg: 'Dropbear keypair present in the pass store.'
+      when: not (allow_dropbear_keygen | bool)
+
+    # -------------------------------------------------------------------------
+    # Generation (opt-in)
+    # Runs only when explicitly allowed and the keypair is currently missing.
+    # Adopts a pre-existing local key if one is present so bootstrapping off an
+    # older bare-file setup does not rotate a key whose public half is already
+    # baked into nodes. Temporary key material lives under a private mktemp dir
+    # and is removed on exit.
+    # -------------------------------------------------------------------------
+    - name: Generate the Dropbear keypair into the pass store
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+
+          if [ -f '{{ local_dropbear_key }}' ]; then
+            cp '{{ local_dropbear_key }}' "$tmp/key"
+            ssh-keygen -y -f "$tmp/key" > "$tmp/key.pub"
+          else
+            ssh-keygen -t ed25519 -N '' -C 'dropbear-initramfs-unlock' -f "$tmp/key"
+          fi
+
+          pass insert --multiline --force '{{ dropbear_pass_private }}' < "$tmp/key"
+          pass insert --multiline --force '{{ dropbear_pass_public }}' < "$tmp/key.pub"
+        executable: /bin/sh
+      changed_when: true
+      no_log: true
+      when:
+        - allow_dropbear_keygen | bool
+        - dropbear_key_check.rc != 0
+
+    # -------------------------------------------------------------------------
+    # Materialization
+    # Writes the keypair from pass back to ~/.ssh so ssh has a real key file
+    # for the unlock-<host> aliases. Idempotent and self-healing: a deleted or
+    # corrupted local key is restored from pass on the next run. The pass CLI
+    # strips the trailing newline, so one is re-appended to keep the key files
+    # byte-identical to what ssh-keygen produced.
+    # -------------------------------------------------------------------------
+    - name: Install the Dropbear private key on the operator workstation
+      ansible.builtin.copy:
+        content: "{{ lookup('pipe', 'pass show ' ~ dropbear_pass_private) }}\n"
+        dest: '{{ local_dropbear_key }}'
+        mode: '0600'
+      no_log: true
+
+    - name: Install the Dropbear public key on the operator workstation
+      ansible.builtin.copy:
+        content: "{{ lookup('pipe', 'pass show ' ~ dropbear_pass_public) }}\n"
+        dest: '{{ local_dropbear_key }}.pub'
+        mode: '0644'
 
 # ==============================================================================
 # Local SSH client config
@@ -201,7 +307,7 @@
 # ==============================================================================
 # Remote initramfs configuration
 # Installs Dropbear into the initramfs on each cluster node, authorizes the
-# locally generated public key, configures the listen port and unlock
+# public key read from the pass store, configures the listen port and unlock
 # command, sets the static early-boot IP, and rebuilds the initramfs.
 # Requires SSH connectivity to the targets.
 # ==============================================================================
@@ -229,16 +335,17 @@
 
     # -------------------------------------------------------------------------
     # Configuration
-    # Authorizes the locally generated public key, configures Dropbear server
-    # options, and sets a static IP so the host is reachable during early boot.
-    # The initramfs is then rebuilt to apply all changes.
+    # Authorizes the Dropbear public key (read from the pass store on the
+    # control host), configures Dropbear server options, and sets a static IP
+    # so the host is reachable during early boot. The initramfs is then
+    # rebuilt to apply all changes.
     # -------------------------------------------------------------------------
     - name: Authorize Dropbear public key for initramfs
       ansible.builtin.lineinfile:
         path: /etc/dropbear/initramfs/authorized_keys
         line: >-
           no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty
-          {{ lookup('file', '~/.ssh/' ~ dropbear_identity_file ~ '.pub') }}
+          {{ lookup('pipe', 'pass show ' ~ dropbear_pass_public) }}
         create: true
         mode: '0600'
 
