@@ -383,6 +383,19 @@ kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock
   official Helm chart. All access is gated by Traefik ForwardAuth backed by Authentik — no OIDC
   plugin is required. The HTTPRoute and ForwardAuth Middleware are applied by the Jellyfin playbook
   itself.
+- **Home Assistant**: Home Assistant (`service/home-assistant.yml`) is deployed via ArgoCD from
+  native Kubernetes manifests built around the official container image. Access is intentionally
+  NOT gated by Traefik ForwardAuth: the iOS/Android companion apps authenticate against Home
+  Assistant's own login and then call `/api/*` and `/api/websocket` with Bearer tokens, which
+  cannot follow SSO redirects (the same trade-off as vLLM and Zotero). Home Assistant's built-in
+  authentication is the security boundary — enable multi-factor authentication in the user profile
+  after onboarding. The namespace is labeled with the `baseline` Pod Security profile because the
+  official image runs as root. Configuration, the SQLite recorder database, and integrations live
+  on a Longhorn PVC at `/config`; an initContainer seeds `configuration.yaml` on first boot with
+  `trusted_proxies` set to the pod network CIDR so requests proxied by the Traefik gateway are
+  accepted. No radio hardware is attached to the Home Assistant pod: Thread/Matter support (Home
+  Assistant Connect ZBT-2 radio, OpenThread Border Router, Matter server) will be deployed as
+  separate workloads that Home Assistant reaches over the network.
 - **OpenBao secrets engine**: `cluster/secrets.yml` installs OpenBao (single-replica StatefulSet),
   the External Secrets Operator, Stakater Reloader, and a cluster-scoped `openbao` SecretStore.
   Reloader rolls any workload annotated with `reloader.stakater.com/auto: "true"` whenever an

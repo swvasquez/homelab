@@ -1,0 +1,174 @@
+{#
+  Native Kubernetes manifests for the Home Assistant deployment, deployed via
+  ArgoCD. Contains:
+    - PersistentVolumeClaim    Longhorn volume for /config holding the
+                               configuration, the SQLite recorder database,
+                               and installed integrations.
+    - ConfigMap                Seed configuration.yaml consumed by the
+                               initContainer. The actual body lives in a
+                               separate template file
+                               (home-assistant-configuration.yml.j2) and is
+                               inlined into this ConfigMap at render time via
+                               the Ansible template lookup.
+    - Service                  ClusterIP exposing the web server, targeted by
+                               the HTTPRoute applied by home-assistant.yml.
+    - Deployment               Official Home Assistant image plus an
+                               initContainer that seeds /config on first boot.
+
+  The pod runs as root because the official image's s6-overlay init does not
+  support a non-root UID; the namespace is labeled with the 'baseline' Pod
+  Security profile by home-assistant.yml to permit this. No restricted-style
+  securityContext (runAsNonRoot, capability drops) is applied — dropping
+  capabilities breaks the image's own privilege handling. The pod still uses
+  the RuntimeDefault seccomp profile.
+
+  Home Assistant owns and rewrites files under /config, so the seed
+  configuration cannot be mounted read-only over /config directly. The
+  initContainer copies it from the ConfigMap mount on first boot only; when a
+  configuration already exists but lacks an 'http:' block, just that block is
+  appended from the seed (the seed keeps 'http:' as its last section for
+  this). Existing configurations are otherwise never modified.
+
+  The Deployment uses the Recreate strategy: /config is a ReadWriteOnce
+  Longhorn volume holding a SQLite database, so the old pod must fully stop
+  before the replacement starts.
+
+  Variables:
+    home_assistant_namespace:       Kubernetes namespace where Home Assistant
+                                    is deployed.
+    home_assistant_image:           Docker image for Home Assistant.
+    home_assistant_image_tag:       Docker image tag for Home Assistant.
+    home_assistant_port:            Port the web server listens on.
+    home_assistant_storage_class:   StorageClass for the /config PVC.
+    home_assistant_storage_size:    Size of the /config PVC.
+    home_assistant_trusted_proxies: CIDR trusted for X-Forwarded-For headers.
+                                    Consumed by the inlined configuration
+                                    template.
+#}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: home-assistant-config
+  namespace: '{{ home_assistant_namespace }}'
+  labels:
+    app.kubernetes.io/name: home-assistant
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: '{{ home_assistant_storage_class }}'
+  resources:
+    requests:
+      storage: '{{ home_assistant_storage_size }}'
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: home-assistant-config-seed
+  namespace: '{{ home_assistant_namespace }}'
+  labels:
+    app.kubernetes.io/name: home-assistant
+data:
+  configuration.yaml: |
+{{ lookup('template', 'home-assistant-configuration.yml.j2') | indent(4, first=true) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: home-assistant
+  namespace: '{{ home_assistant_namespace }}'
+  labels:
+    app.kubernetes.io/name: home-assistant
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: home-assistant
+  ports:
+    - name: http
+      port: {{ home_assistant_port }}
+      targetPort: {{ home_assistant_port }}
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: home-assistant
+  namespace: '{{ home_assistant_namespace }}'
+  labels:
+    app.kubernetes.io/name: home-assistant
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: home-assistant
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: home-assistant
+    spec:
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: configure-home-assistant
+          image: '{{ home_assistant_image }}:{{ home_assistant_image_tag }}'
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              CONFIG_FILE="/config/configuration.yaml"
+              SEED_FILE="/seed/configuration.yaml"
+              if [ ! -f "$CONFIG_FILE" ]; then
+                  # First boot: seed the default configuration (including the
+                  # http block) and the empty include files Home Assistant
+                  # would otherwise generate itself.
+                  cp "$SEED_FILE" "$CONFIG_FILE"
+                  touch /config/automations.yaml /config/scripts.yaml \
+                      /config/scenes.yaml
+                  mkdir -p /config/themes
+              elif ! grep -q '^http:' "$CONFIG_FILE"; then
+                  # Existing configuration without an http block: append just
+                  # that block from the seed (its last section) so proxied
+                  # requests from the Traefik gateway are not rejected.
+                  printf '\n' >> "$CONFIG_FILE"
+                  sed -n '/^http:/,$p' "$SEED_FILE" >> "$CONFIG_FILE"
+              fi
+          volumeMounts:
+            - name: home-assistant-config
+              mountPath: /config
+            - name: home-assistant-config-seed
+              mountPath: /seed
+              readOnly: true
+      containers:
+        - name: home-assistant
+          image: '{{ home_assistant_image }}:{{ home_assistant_image_tag }}'
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: {{ home_assistant_port }}
+              protocol: TCP
+          volumeMounts:
+            - name: home-assistant-config
+              mountPath: /config
+          readinessProbe:
+            httpGet:
+              path: /
+              port: {{ home_assistant_port }}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: {{ home_assistant_port }}
+            initialDelaySeconds: 60
+            periodSeconds: 20
+      volumes:
+        - name: home-assistant-config
+          persistentVolumeClaim:
+            claimName: home-assistant-config
+        - name: home-assistant-config-seed
+          configMap:
+            name: home-assistant-config-seed

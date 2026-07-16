@@ -1,0 +1,402 @@
+---
+# ==============================================================================
+# Playbook: Deploy Home Assistant via ArgoCD GitOps
+# ==============================================================================
+# This playbook configures and deploys Home Assistant to the Kubernetes cluster
+# via ArgoCD GitOps using native Kubernetes manifests (Deployment, Service,
+# PersistentVolumeClaim) built around the official Home Assistant container
+# image.
+#
+# Note on Authentication: unlike most services in this repository, Home
+# Assistant is NOT gated by Traefik ForwardAuth (Authentik). The iOS/Android
+# companion apps authenticate against Home Assistant's own login flow and then
+# talk to /api/* and /api/websocket with long-lived Bearer tokens; those
+# requests cannot follow a redirect to an SSO provider, so a ForwardAuth gate
+# would break the apps (and exempting the API paths would leave the entire
+# attack surface ungated anyway). Home Assistant's built-in authentication is
+# therefore the security boundary — enable multi-factor authentication in the
+# Home Assistant user profile after onboarding. This mirrors the existing
+# exceptions for vLLM (Bearer-token API clients) and Zotero (WebDAV clients).
+#
+# Note on Pod Security: the official Home Assistant image runs its s6-overlay
+# init and the application as root and does not support a non-root UID, so it
+# cannot satisfy the cluster-wide 'restricted' Pod Security Standard. The
+# namespace is labeled with the 'baseline' profile instead, which permits a
+# root user while still forbidding privileged containers, host namespaces,
+# and hostPath volumes.
+#
+# Note on Thread/Matter: no radio hardware is attached to this pod. The
+# Thread border router (OpenThread Border Router with the USB radio) and the
+# Matter server are separate workloads deployed independently of this
+# playbook; Home Assistant reaches them over the network.
+#
+# Note on Configuration: Home Assistant owns and rewrites files under /config,
+# so its configuration cannot be mounted from a read-only ConfigMap. An
+# initContainer seeds a default configuration.yaml on first boot and ensures
+# an 'http:' block exists that trusts X-Forwarded-For headers from the pod
+# network, where the Traefik gateway pods run. Without trusted_proxies, Home
+# Assistant rejects proxied requests with 400 Bad Request.
+#
+# Storage is a single Longhorn PVC mounted at /config holding the
+# configuration, the SQLite recorder database, and installed integrations.
+# The Deployment uses the Recreate strategy so the replacement pod never
+# contends with the old one for the ReadWriteOnce volume or the SQLite lock.
+#
+# Run order:
+#   1. cluster/authentication.yml
+#   2. cluster/git.yml
+#   3. cluster/gitops.yml
+#   4. service/home-assistant.yml (this playbook — applies its own HTTPRoute,
+#      without ForwardAuth, in the Home Assistant namespace)
+#
+# Input Variables:
+#   bootstrap_node:                Boolean indicating if the host is the
+#                                  control plane bootstrap node. Read from
+#                                  inventory.
+#   dns_zone:                      DNS zone (e.g. homelab.internal). Read from
+#                                  group_vars.
+#   home_assistant_namespace:      Kubernetes namespace for Home Assistant
+#                                  (default: home-assistant).
+#   home_assistant_hostname:       FQDN for the Home Assistant web UI and
+#                                  companion apps
+#                                  (default: homeassistant.<dns_zone>).
+#   home_assistant_image:          Docker image for Home Assistant
+#                                  (default: ghcr.io/home-assistant/home-assistant).
+#   home_assistant_image_tag:      Docker image tag for Home Assistant
+#                                  (default: 2026.7.2).
+#   home_assistant_port:           Port the Home Assistant web server listens
+#                                  on (default: 8123).
+#   home_assistant_storage_size:   Storage size for the /config PVC on
+#                                  Longhorn (default: 5Gi).
+#   home_assistant_storage_class:  Kubernetes StorageClass used to provision
+#                                  the /config PVC (default: longhorn).
+#   home_assistant_trusted_proxies: CIDR trusted for X-Forwarded-For headers.
+#                                  Must match Cilium's cluster-pool IPAM CIDR
+#                                  because the Traefik gateway pods proxy from
+#                                  the pod network (default: 10.0.0.0/8).
+#   home_assistant_gitops_path:    Path within the gitops repository where the
+#                                  Home Assistant manifests are stored
+#                                  (default: apps/home-assistant).
+#   kubectl_config_path:           Full path to the kubectl config file
+#                                  (default: /home/<ansible_user>/.kube/config).
+#   gitea_namespace:               Kubernetes namespace where Gitea is deployed
+#                                  (default: gitea).
+#   gitea_admin_username:          Username of the Gitea admin account used to
+#                                  push to the gitops repository
+#                                  (default: gitea_admin).
+#   gitea_gitops_repo:             Name of the Gitea gitops repository
+#                                  (default: gitops).
+#   argocd_namespace:              Kubernetes namespace where ArgoCD is
+#                                  deployed (default: argocd).
+
+- name: Deploy Home Assistant via ArgoCD GitOps
+  hosts: nodes
+  become: true
+  become_exe: sudo.ws
+  vars:
+    home_assistant_namespace: home-assistant
+    home_assistant_hostname: 'homeassistant.{{ dns_zone }}'
+    home_assistant_image: ghcr.io/home-assistant/home-assistant
+    home_assistant_image_tag: '2026.7.2'
+    home_assistant_port: 8123
+    home_assistant_storage_size: 5Gi
+    home_assistant_storage_class: longhorn
+    # Must match Cilium's cluster-pool IPAM CIDR (cluster-pool-ipv4-cidr in
+    # the cilium-config ConfigMap, default 10.0.0.0/8). Note that Cilium's
+    # IPAM ignores kubeadm's pod_network_cidr from cluster/bootstrap.yml —
+    # actual pod IPs (including the Traefik gateway pods) come from this pool.
+    home_assistant_trusted_proxies: 10.0.0.0/8
+    home_assistant_gitops_path: apps/home-assistant
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    gitea_namespace: gitea
+    gitea_admin_username: gitea_admin
+    gitea_gitops_repo: gitops
+    argocd_namespace: argocd
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Namespace
+    # -------------------------------------------------------------------------
+    # Creates the Home Assistant namespace before any other resources so that
+    # the HTTPRoute and the ArgoCD Application can target it on first run.
+    # -------------------------------------------------------------------------
+    - name: Create Home Assistant namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create namespace {{ home_assistant_namespace }}
+      register: home_assistant_ns_result
+      changed_when: "'created' in home_assistant_ns_result.stdout"
+      failed_when:
+        - home_assistant_ns_result.rc != 0
+        - "'already exists' not in home_assistant_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Pod Security Admission Opt-Out
+    # -------------------------------------------------------------------------
+    # The cluster default Pod Security Standard is 'restricted', which requires
+    # runAsNonRoot. The official Home Assistant image runs its s6-overlay init
+    # and the application as root and does not support a non-root UID, so the
+    # namespace is labeled with the 'baseline' profile instead. Baseline still
+    # forbids privileged containers, host namespaces, and hostPath volumes —
+    # only the root user requirement is relaxed. This keeps the opt-out local
+    # to this playbook without the cluster-level PSA exemption list in
+    # cluster/security.yml having to know about Home Assistant.
+    # -------------------------------------------------------------------------
+    - name: Label Home Assistant namespace with baseline Pod Security profile
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          label --overwrite namespace {{ home_assistant_namespace }}
+          pod-security.kubernetes.io/enforce=baseline
+          pod-security.kubernetes.io/warn=baseline
+          pod-security.kubernetes.io/audit=baseline
+      register: home_assistant_psa_label_result
+      changed_when: "'labeled' in home_assistant_psa_label_result.stdout"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Default ServiceAccount Hardening
+    # -------------------------------------------------------------------------
+    # Disables the default ServiceAccount token automount in this namespace so
+    # ad-hoc pods that don't name a ServiceAccount cannot read a usable API
+    # bearer credential. Workloads that need API access use named
+    # ServiceAccounts and are unaffected.
+    # -------------------------------------------------------------------------
+    - name: Disable default ServiceAccount token automount in Home Assistant namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch serviceaccount default
+          -n {{ home_assistant_namespace }}
+          --type=merge
+          -p '{"automountServiceAccountToken": false}'
+      register: home_assistant_sa_automount_result
+      changed_when: "'patched' in home_assistant_sa_automount_result.stdout"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # HTTPRoute
+    # -------------------------------------------------------------------------
+    # Exposes the Home Assistant UI and API over HTTPS via an HTTPRoute
+    # attached to the traefik-gateway. The route is intentionally NOT gated by
+    # the Authentik ForwardAuth Middleware — the companion apps' Bearer-token
+    # API and websocket requests cannot follow SSO redirects (see the file
+    # header). Home Assistant's built-in authentication is the security
+    # boundary. ExternalDNS registers the hostname in Bind9 once the route is
+    # accepted by the Gateway.
+    # -------------------------------------------------------------------------
+    - name: Write Home Assistant HTTPRoute manifest
+      ansible.builtin.template:
+        src: ../cluster/templates/httproute.yml.j2
+        dest: /tmp/home-assistant-httproute.yml
+        mode: '0644'
+      vars:
+        httproute_name: home-assistant
+        httproute_namespace: '{{ home_assistant_namespace }}'
+        httproute_hostname: '{{ home_assistant_hostname }}'
+        httproute_backend_name: home-assistant
+        httproute_backend_namespace: '{{ home_assistant_namespace }}'
+        httproute_backend_port: '{{ home_assistant_port }}'
+        with_forward_auth: false
+      when: bootstrap_node | default(false)
+
+    - name: Apply Home Assistant HTTPRoute
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/home-assistant-httproute.yml
+      register: home_assistant_httproute_result
+      changed_when: >-
+        'created' in home_assistant_httproute_result.stdout or
+        'configured' in home_assistant_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Home Assistant HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/home-assistant-httproute.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # GitOps - Manifest Management
+    # -------------------------------------------------------------------------
+    # Renders the Home Assistant native Kubernetes manifests (PVC, Service,
+    # Deployment) from a Jinja2 template and commits them to the Gitea gitops
+    # repository. ArgoCD watches this path and automatically syncs the
+    # manifests to the cluster.
+    # -------------------------------------------------------------------------
+    - name: Ensure git is installed
+      ansible.builtin.apt:
+        name: git
+        state: present
+      when: bootstrap_node | default(false)
+
+    - name: Get Gitea pod IP
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get pod -n {{ gitea_namespace }}
+          -l app.kubernetes.io/name=gitea,app.kubernetes.io/instance=gitea
+          -o jsonpath='{.items[0].status.podIP}'
+      register: gitea_pod_ip
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Read Gitea admin password from Kubernetes Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret gitea-credentials -n {{ gitea_namespace }}
+          -o jsonpath='{.data.admin-password}'
+      register: gitea_admin_password_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Gitea admin password fact
+      ansible.builtin.set_fact:
+        gitea_admin_password: '{{ gitea_admin_password_b64.stdout | b64decode }}'
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Clone or update gitops repository in temporary directory
+      ansible.builtin.git:
+        repo: >-
+          http://{{ gitea_admin_username }}:{{ gitea_admin_password }}@{{ gitea_pod_ip.stdout }}:3000/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}
+        dest: /tmp/gitops-home-assistant
+        version: main
+        update: true
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Create Home Assistant directory in gitops repository
+      ansible.builtin.file:
+        path: '/tmp/gitops-home-assistant/{{ home_assistant_gitops_path }}'
+        state: directory
+        mode: '0755'
+      when: bootstrap_node | default(false)
+
+    - name: Write Home Assistant manifests to gitops repository
+      ansible.builtin.template:
+        src: templates/home-assistant-manifests.yml.j2
+        dest: '/tmp/gitops-home-assistant/{{ home_assistant_gitops_path }}/manifests.yml'
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Configure git user email for commit # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-home-assistant config user.email
+          'ansible@{{ dns_zone | default("homelab.internal") }}'
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Configure git user name for commit # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-home-assistant config user.name Ansible
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set gitops repository remote URL with credentials for push # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-home-assistant remote set-url origin
+          http://{{ gitea_admin_username }}:{{ gitea_admin_password }}@{{ gitea_pod_ip.stdout }}:3000/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}
+      no_log: true
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Stage Home Assistant manifests in gitops repository # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-home-assistant add
+          {{ home_assistant_gitops_path }}/manifests.yml
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Check for staged changes in gitops repository # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-home-assistant diff --cached --exit-code
+      register: gitops_diff_result
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Commit Home Assistant manifests to gitops repository # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-home-assistant commit
+          -m 'chore: update home-assistant manifests'
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - gitops_diff_result.rc != 0
+
+    - name: Push Home Assistant manifests commit to Gitea # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-home-assistant push origin main
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - gitops_diff_result.rc != 0
+
+    - name: Clean up gitops temporary directory
+      ansible.builtin.file:
+        path: /tmp/gitops-home-assistant
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ArgoCD Application
+    # -------------------------------------------------------------------------
+    # Applies the ArgoCD Application manifest that tracks the Gitea repository.
+    # This initiates the deployment of the Home Assistant resources to the
+    # cluster.
+    # -------------------------------------------------------------------------
+    - name: Write ArgoCD Application manifest for Home Assistant
+      ansible.builtin.template:
+        src: templates/home-assistant-app.yml.j2
+        dest: /tmp/home-assistant-app.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ArgoCD Application manifest for Home Assistant
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/home-assistant-app.yml
+      register: argocd_app_result
+      changed_when: >-
+        'configured' in argocd_app_result.stdout or
+        'created' in argocd_app_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up ArgoCD Application manifest for Home Assistant
+      ansible.builtin.file:
+        path: /tmp/home-assistant-app.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Trigger ArgoCD hard refresh to detect new gitops commit
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch application home-assistant -n {{ argocd_namespace }}
+          --type merge
+          -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Wait for ArgoCD to sync and deploy Home Assistant
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get application home-assistant -n {{ argocd_namespace }}
+          -o jsonpath='{.status.sync.status},{.status.health.status}'
+      register: argocd_status
+      until: argocd_status.stdout == 'Synced,Healthy'
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: bootstrap_node | default(false)

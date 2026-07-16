@@ -1,0 +1,39 @@
+{#
+  Seed configuration.yaml for Home Assistant, inlined into the
+  home-assistant-config-seed ConfigMap by home-assistant-manifests.yml.j2 and
+  copied to the /config PVC by the Deployment's initContainer on first boot.
+  After first boot Home Assistant owns and rewrites the copy on the PVC; this
+  template only ever seeds it, so later UI- or user-managed edits are never
+  clobbered.
+
+  The body matches the default configuration.yaml Home Assistant generates on
+  a fresh install, plus an 'http:' block trusting X-Forwarded-For headers
+  from the Traefik gateway pods on the pod network. Without trusted_proxies,
+  Home Assistant rejects proxied requests with 400 Bad Request.
+
+  The 'http:' block must remain the LAST section of this file: when an
+  existing /config/configuration.yaml lacks an 'http:' block, the
+  initContainer appends everything from '^http:' to end-of-file.
+
+  Variables:
+    home_assistant_trusted_proxies: CIDR trusted for X-Forwarded-For headers.
+                                    Must cover the Traefik gateway pods (the
+                                    cluster pod network CIDR).
+#}
+# Loads default set of integrations. Do not remove.
+default_config:
+
+# Load frontend themes from the themes folder
+frontend:
+  themes: !include_dir_merge_named themes
+
+automation: !include automations.yaml
+script: !include scripts.yaml
+scene: !include scenes.yaml
+
+# Trust X-Forwarded-For from the Traefik gateway pods so client IPs are
+# logged correctly and proxied requests are not rejected.
+http:
+  use_x_forwarded_for: true
+  trusted_proxies:
+    - {{ home_assistant_trusted_proxies }}
