@@ -42,6 +42,8 @@ Ansible playbooks to configure Ubuntu x86_64 compute nodes, Arch Linux-based IP 
               slurm_controller: <true|false>
               slurm_compute_node: <true|false>
               vllm_host: <true|false>
+              thread_radio_host: <true|false>
+              thread_radio_device_path: <DEVICE_PATH>
               tailscale: <true|false>
               tailscale_exit_node: <true|false>
         ipkvm:
@@ -396,6 +398,44 @@ kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock
   accepted. No radio hardware is attached to the Home Assistant pod: Thread/Matter support (Home
   Assistant Connect ZBT-2 radio, OpenThread Border Router, Matter server) will be deployed as
   separate workloads that Home Assistant reaches over the network.
+- **Thread (OpenThread Border Router)**: `service/thread.yml` deploys the OpenThread Border
+  Router driving the Home Assistant Connect ZBT-2 USB radio (which must first be flashed with the
+  OpenThread RCP firmware via the Open Home Foundation Device Toolbox — it ships with Zigbee
+  firmware). The `thread_radio_host` inventory flag marks the node holding the radio (exactly one
+  node, with its stable serial path in `thread_radio_device_path`); both workloads pin there via
+  nodeSelector in the `thread` namespace. Device access follows least privilege: a
+  `generic-device-plugin` DaemonSet advertises the radio and `/dev/net/tun` to the kubelet as
+  allocatable resources (`squat.ai/zbt2`, `squat.ai/tun`), so the OTBR container runs
+  **unprivileged** with only `NET_ADMIN` + `NET_RAW` + `IPC_LOCK` and hostNetwork — no hostPath
+  device mounts. Only the small device-plugin binary runs privileged (a kubelet device-plugin API
+  requirement), and the playbook applies the IPv6 forwarding sysctls on the radio host that a
+  privileged OTBR would otherwise set itself. The OTBR image is **built on the radio host** from
+  the OpenThread source with the `mDNSResponder` mDNS backend and consumed with
+  `imagePullPolicy: Never` (no registry); this backend port-shares UDP 5353 with the Matter
+  server's embedded mDNS, whereas the stock native-backend image grabs 5353 exclusively and the
+  border router becomes undiscoverable. The Thread network dataset lives on a Longhorn PVC. No
+  HTTPRoute is
+  created: the OTBR REST API listens on the radio host's LAN IP on the `otbr_rest` port from
+  `ufw_allowed_ports`, which `infrastructure/network.yml` also opens from the pod CIDR so the
+  Home Assistant pod can reach it. A ClusterIP Service fronts the endpoint so Home Assistant's
+  OpenThread Border Router integration uses a stable in-cluster name,
+  `http://otbr.thread.svc.cluster.local:<OTBR_REST_PORT>`, that survives a radio-host change;
+  LAN clients use `http://<RADIO_HOST_IP>:<OTBR_REST_PORT>` directly.
+- **Matter server**: `service/thread.yml` also deploys the Matter.js Open Home Foundation server
+  (`matterjs-server`), the Matter controller through which Home Assistant commissions and controls
+  Matter-over-Thread devices (its device traffic transits OTBR as ordinary routed IPv6 — the two
+  never talk at the application level). It is a drop-in for the older `python-matter-server`
+  websocket protocol, so Home Assistant connects unchanged; critically its mDNS sets
+  `SO_REUSEPORT`, so it **port-shares UDP 5353** with the OTBR mDNSResponder on the same host
+  (the older CHIP server bound 5353 exclusively and could not coexist — this is what makes the
+  single-node layout work). It runs unprivileged (all capabilities dropped) with hostNetwork,
+  since commissioning uses mDNS/IPv6 on the real LAN, and is pinned to the radio host because only
+  that node has direct routes to the Thread mesh. Matter fabric credentials live on a Longhorn
+  PVC — losing it means re-commissioning every device. Home Assistant's Matter integration
+  connects through a ClusterIP Service at
+  `ws://matter-server.thread.svc.cluster.local:<MATTER_SERVER_PORT>/ws` (the `matter_server`
+  port from `ufw_allowed_ports`, also opened from the pod CIDR by `infrastructure/network.yml`
+  for LAN/IP access).
 - **OpenBao secrets engine**: `cluster/secrets.yml` installs OpenBao (single-replica StatefulSet),
   the External Secrets Operator, Stakater Reloader, and a cluster-scoped `openbao` SecretStore.
   Reloader rolls any workload annotated with `reloader.stakater.com/auto: "true"` whenever an

@@ -9,10 +9,16 @@
 #   - Removes /etc/netplan/00-installer-config.yaml if present, as it conflicts
 #     with the WoL config by managing the same interface.
 #   - Creates a Netplan configuration file (/etc/netplan/50-wol.yaml) to
-#     enable WoL on the specified interface. IPv6 is explicitly disabled
-#     (dhcp6, ipv6-privacy, link-local) to prevent systemd-networkd from
-#     waiting for an IPv6 Router Advertisement that never arrives, which
-#     causes the interface to remain in 'configuring' state.
+#     enable WoL on the specified interface. DHCPv6, IPv6 privacy extensions,
+#     and accept-ra are all disabled, so systemd-networkd never blocks boot
+#     waiting for an IPv6 Router Advertisement that never arrives — that wait
+#     (not the link-local address itself) is what leaves the interface stuck
+#     in the 'configuring' state and stalls boot. The
+#     IPv6 link-local address is kept ONLY on the Thread radio host, because
+#     the OpenThread Border Router sources its LAN Router Advertisements from
+#     it and border routing never starts without one; because accept-ra is
+#     off, keeping the link-local does not reintroduce the boot hang. All
+#     other nodes keep the link-local disabled.
 #   - Notifies a handler to apply the Netplan configuration.
 #
 # Variables (set in inventory.yml per host):
@@ -20,6 +26,10 @@
 #                       (e.g., eno1).
 #   mac_address:        The MAC address of the network interface
 #                       (e.g., 00:11:22:33:44:55).
+#   thread_radio_host:  Per-host boolean marking the Thread radio host, whose
+#                       LAN interface keeps its IPv6 link-local address for the
+#                       OpenThread Border Router (default: false). Same inventory
+#                       flag used by service/thread.yml.
 #
 # Variables:
 #   wol_packages:       List of APT packages to install for WoL support
@@ -73,7 +83,15 @@
                 dhcp4: true
                 dhcp6: false
                 ipv6-privacy: false
-                link-local: []
+                # The Thread radio host keeps its IPv6 link-local address —
+                # the OpenThread Border Router sources its LAN Router
+                # Advertisements from it and border routing will not start
+                # without one. Other nodes have no use for it, so it stays off.
+                link-local: {{ '[ipv6]' if (thread_radio_host | default(false)) else '[]' }}
+                # accept-ra stays off everywhere so systemd-networkd never
+                # blocks boot waiting for a Router Advertisement (see header);
+                # keeping the link-local above does not reintroduce that wait.
+                accept-ra: false
       notify: Apply Netplan configuration
 
   handlers:

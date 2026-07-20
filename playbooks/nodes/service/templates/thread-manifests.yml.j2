@@ -1,0 +1,528 @@
+{#
+  Native Kubernetes manifests for the Thread infrastructure, deployed via
+  ArgoCD. Contains:
+    - PersistentVolumeClaim    Longhorn volume for /data holding the OpenThread
+                               Border Router state, including the active Thread
+                               network dataset (network key, PAN ID). Losing it
+                               means re-forming the Thread network and
+                               re-commissioning every device.
+    - DaemonSet                generic-device-plugin, which advertises the
+                               ZBT-2 radio and /dev/net/tun to the kubelet as
+                               allocatable resources (squat.ai/zbt2 and
+                               squat.ai/tun).
+    - Deployment               OpenThread Border Router (OTBR) driving the
+                               Home Assistant Connect ZBT-2 radio over serial.
+                               Built locally on the radio host with the
+                               mDNSResponder mDNS backend so it port-shares
+                               UDP 5353 with the Matter server's embedded mDNS
+                               (the native OpenThread backend grabs 5353
+                               exclusively and conflicts). See thread.yml.
+    - PersistentVolumeClaim    Longhorn volume for the Matter server's /data,
+                               holding the Matter fabric credentials and node
+                               database. Losing it means re-commissioning
+                               every Matter device.
+    - Deployment               matterjs-server (Matter.js), the Matter
+                               controller that Home Assistant's Matter
+                               integration connects to over websocket. It
+                               commissions and controls Matter devices over
+                               IPv6; packets to Thread devices transit OTBR
+                               like any routed traffic. Its mDNS sets
+                               SO_REUSEPORT so it port-shares UDP 5353 with
+                               the OTBR mDNSResponder on the same host.
+
+  Security model — least privilege via device plugin:
+  Kubernetes has no equivalent of Docker's `devices:` mapping, so the naive
+  way to hand a pod a serial device is hostPath + privileged, which grants
+  ALL capabilities, ALL host devices, and disables seccomp — far more than
+  OTBR needs. Instead, the generic-device-plugin DaemonSet implements the
+  kubelet device-plugin API: the OTBR pod requests the radio and tun devices
+  through resources.limits, the kubelet adds exactly those two device-cgroup
+  entries, and the OTBR container itself runs unprivileged with only the
+  capabilities it actually uses:
+    - NET_ADMIN  create the wpan0 tunnel interface, install ip6tables rules,
+                 and send IPv6 router advertisements on the LAN
+    - NET_RAW    raw ICMPv6 sockets for neighbor/router discovery
+    - IPC_LOCK   mDNSResponder (mdnsd) memory locking
+  The device plugin container itself must run privileged (it needs /dev and
+  the kubelet's device-plugins socket — a documented requirement of the
+  device-plugin API), but it is a small single-purpose binary with no
+  network exposure, which is a much smaller attack surface than running the
+  whole border router privileged. The IPv6 forwarding sysctls that a
+  privileged OTBR would set itself are instead applied persistently on the
+  radio host by thread.yml.
+
+  The OTBR pod runs with hostNetwork because it routes IPv6 between the
+  Thread mesh (wpan0) and the node's LAN interface and must advertise itself
+  (mDNS, router advertisements) as a real LAN host. The Matter server also
+  runs with hostNetwork: it commissions devices via mDNS/IPv6 on the real
+  LAN, which does not work from behind the pod network. It needs no added
+  capabilities — hostNetwork plus ordinary UDP sockets suffice.
+
+  All workloads pin to the node labeled as the Thread radio host
+  (thread_radio_host inventory flag): OTBR because the ZBT-2 serial device
+  is local, and the Matter server because on the radio host the routes to
+  the Thread mesh (via wpan0) exist directly in the host routing table —
+  on any other node they would have to be learned from OTBR's router
+  advertisements, which the other nodes' sysctls do not accept
+  (accept_ra_rt_info_max_plen defaults to 0). The Recreate strategy
+  prevents two pods from contending for the single radio and the
+  ReadWriteOnce data volumes.
+
+  ClusterIP Services front both control endpoints so in-cluster clients use
+  stable DNS names instead of the radio host's IP: Home Assistant connects
+  to http://otbr.<namespace>.svc.cluster.local:<rest-port> (OTBR
+  integration) and ws://matter-server.<namespace>.svc.cluster.local:<matter-port>/ws
+  (Matter integration). With hostNetwork pods the Service endpoints resolve
+  to the node IP, so if the radio host ever changes, the Services follow the
+  pods and Home Assistant's configuration stays valid. LAN clients (e.g.
+  debugging from a workstation) still use http://<radio-host-ip>:<port>
+  directly; both ports are opened in UFW via the otbr_rest and
+  matter_server entries in ufw_allowed_ports. The Matter server additionally
+  gets a no-auth HTTPRoute (matter_server_hostname) so its dashboard and
+  commissioning websockets are reachable by a stable LAN name; OTBR gets none
+  (its REST API is not a browser UI).
+
+  The device plugin allocates devices into the container at their host path,
+  so OTBR's radio URL uses the stable /dev/serial/by-id path directly, at
+  460800 baud over the spinel+hdlc protocol (the ZBT-2's serial settings).
+
+  Variables:
+    thread_namespace:          Kubernetes namespace where the Thread workloads
+                               are deployed.
+    device_plugin_image:       Docker image for the generic device plugin.
+    device_plugin_image_tag:   Docker image tag for the generic device plugin.
+    otbr_image:                Docker image for the OpenThread Border Router.
+    otbr_image_tag:            Docker image tag for the OpenThread Border
+                               Router.
+    otbr_device_path:          Stable /dev/serial/by-id path of the ZBT-2
+                               radio on the radio host node.
+    otbr_infra_if:             LAN network interface of the radio host that
+                               OTBR routes between the Thread mesh and the
+                               LAN.
+    otbr_rest_port:            Port for the OTBR REST API on the radio host.
+    otbr_log_level:            OpenThread log level (0=emergency .. 7=debug).
+    otbr_storage_class:        StorageClass for the OTBR state PVC.
+    otbr_storage_size:         Size of the OTBR state PVC.
+    matter_server_image:       Docker image for the Matter server.
+    matter_server_image_tag:   Docker image tag for the Matter server.
+    matter_server_port:        Port for the Matter server websocket on the
+                               radio host.
+    matter_server_hostname:    LAN hostname for the Matter server, exposed via a
+                               no-auth HTTPRoute through the traefik-gateway for
+                               commissioning.
+    matter_server_ble_mode:    How Bluetooth is provided for commissioning —
+                               'local' (drive a host Bluetooth adapter via BlueZ
+                               over D-Bus, no /ble slot) or 'proxy' (expose /ble
+                               for a remote matter-ble-proxy bridge).
+    matter_server_uid:         Numeric uid the Matter server container runs as;
+                               pinned via runAsUser and matched by the host BlueZ
+                               D-Bus policy in local mode.
+    matter_apparmor_profile:   Name of the on-host AppArmor profile the Matter
+                               server runs under in local mode (docker-default
+                               plus a D-Bus allow for org.bluez).
+    matter_server_storage_class: StorageClass for the Matter server data PVC.
+    matter_server_storage_size:  Size of the Matter server data PVC.
+#}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: otbr-data
+  namespace: '{{ thread_namespace }}'
+  labels:
+    app.kubernetes.io/name: otbr
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: '{{ otbr_storage_class }}'
+  resources:
+    requests:
+      storage: '{{ otbr_storage_size }}'
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: generic-device-plugin
+  namespace: '{{ thread_namespace }}'
+  labels:
+    app.kubernetes.io/name: generic-device-plugin
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: generic-device-plugin
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: generic-device-plugin
+    spec:
+      # Only the radio host has devices to advertise.
+      nodeSelector:
+        homelab.internal/thread-radio-host: 'true'
+      priorityClassName: system-node-critical
+      containers:
+        - name: generic-device-plugin
+          image: '{{ device_plugin_image }}:{{ device_plugin_image_tag }}'
+          imagePullPolicy: IfNotPresent
+          args:
+            - --domain
+            - squat.ai
+            # The ZBT-2 radio, advertised by its stable by-id path. count
+            # defaults to 1: only one pod may hold the radio at a time.
+            - --device
+            - '{"name": "zbt2", "groups": [{"paths": [{"path": "{{ otbr_device_path }}"}]}]}'
+            # The tun device is shareable; advertise multiple slots so
+            # future workloads (e.g. other tunnel users) are not blocked.
+            - --device
+            - '{"name": "tun", "groups": [{"count": 20, "paths": [{"path": "/dev/net/tun"}]}]}'
+          securityContext:
+            # Required by the kubelet device-plugin API: the plugin serves
+            # gRPC on the kubelet's device-plugins socket and inspects /dev.
+            # It is a small single-purpose binary with no network exposure —
+            # the privilege deliberately lives here instead of in the OTBR
+            # workload container.
+            privileged: true
+          volumeMounts:
+            - name: device-plugins
+              mountPath: /var/lib/kubelet/device-plugins
+            - name: dev
+              mountPath: /dev
+      volumes:
+        - name: device-plugins
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+            type: Directory
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otbr
+  namespace: '{{ thread_namespace }}'
+  labels:
+    app.kubernetes.io/name: otbr
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: otbr
+  ports:
+    - name: http-rest
+      port: {{ otbr_rest_port }}
+      targetPort: {{ otbr_rest_port }}
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otbr
+  namespace: '{{ thread_namespace }}'
+  labels:
+    app.kubernetes.io/name: otbr
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: otbr
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: otbr
+    spec:
+      # Pin to the node holding the ZBT-2 radio (labeled by thread.yml from
+      # the thread_radio_host inventory flag).
+      nodeSelector:
+        homelab.internal/thread-radio-host: 'true'
+      # The border router must live in the host network namespace to route
+      # between the Thread mesh and the LAN and to advertise itself (mDNS,
+      # IPv6 router advertisements) as a real LAN host.
+      hostNetwork: true
+      containers:
+        - name: otbr
+          image: '{{ otbr_image }}:{{ otbr_image_tag }}'
+          # Built locally on the radio host (no registry) — never pull.
+          imagePullPolicy: Never
+          securityContext:
+            # Unprivileged: the radio and tun devices are granted through
+            # the device plugin (resources.limits below), and the container
+            # holds only the capabilities OTBR actually uses. IPC_LOCK is for
+            # mDNSResponder (mdnsd) memory locking — the same capability the
+            # Home Assistant OS OTBR add-on declares. See the file header.
+            privileged: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - NET_ADMIN
+                - NET_RAW
+                - IPC_LOCK
+          resources:
+            limits:
+              squat.ai/zbt2: 1
+              squat.ai/tun: 1
+          # OTBR auto-enables border routing at startup but NOT the SRP
+          # server's auto-enable mode. Without the SRP server, Matter devices
+          # cannot register their operational (_matter._tcp) service, so
+          # commissioning reaches the network step and then fails at operational
+          # discovery (the border router never advertises the device on the
+          # LAN). This mode ties the SRP server to border routing — it enables
+          # once border routing is running — and is (re)applied on every start
+          # because it is not restored from persisted OpenThread settings. The
+          # loop waits for the agent's CLI socket and always exits 0, so a slow
+          # agent never fails the hook (a failed postStart kills the container).
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - >-
+                    for i in $(seq 1 30); do
+                    ot-ctl srp server auto enable && exit 0;
+                    sleep 2;
+                    done; exit 0
+          env:
+            - name: OT_RCP_DEVICE
+              value: 'spinel+hdlc+uart://{{ otbr_device_path }}?uart-baudrate=460800'
+            - name: OT_INFRA_IF
+              value: '{{ otbr_infra_if }}'
+            - name: OT_THREAD_IF
+              value: wpan0
+            - name: OT_LOG_LEVEL
+              value: '{{ otbr_log_level }}'
+            - name: OT_REST_LISTEN_ADDR
+              value: 0.0.0.0
+            - name: OT_REST_LISTEN_PORT
+              value: '{{ otbr_rest_port }}'
+            - name: OT_REST_PORT
+              value: '{{ otbr_rest_port }}'
+          volumeMounts:
+            - name: otbr-data
+              mountPath: /data
+          readinessProbe:
+            tcpSocket:
+              port: {{ otbr_rest_port }}
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: {{ otbr_rest_port }}
+            initialDelaySeconds: 60
+            periodSeconds: 20
+      volumes:
+        - name: otbr-data
+          persistentVolumeClaim:
+            claimName: otbr-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: matter-server-data
+  namespace: '{{ thread_namespace }}'
+  labels:
+    app.kubernetes.io/name: matter-server
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: '{{ matter_server_storage_class }}'
+  resources:
+    requests:
+      storage: '{{ matter_server_storage_size }}'
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: matter-server
+  namespace: '{{ thread_namespace }}'
+  labels:
+    app.kubernetes.io/name: matter-server
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: matter-server
+  ports:
+    - name: ws
+      port: {{ matter_server_port }}
+      targetPort: {{ matter_server_port }}
+      protocol: TCP
+---
+# Exposes the Matter server on the LAN as matter_server_hostname via the
+# traefik-gateway, so commissioning (its dashboard, the /ws control API, and
+# the /ble commissioning bridge) uses a stable name instead of the radio
+# host's IP. No ForwardAuth middleware — the endpoints are websocket/token
+# APIs that cannot follow an SSO redirect, and the dashboard is the same one
+# already reachable directly on the host port. Home Assistant does NOT use
+# this route; it reaches the Matter server by in-cluster Service DNS. The
+# HTTPRoute and its backend share this namespace, so no ReferenceGrant is
+# needed. ExternalDNS registers the hostname from this route automatically.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: matter-server
+  namespace: '{{ thread_namespace }}'
+  labels:
+    app.kubernetes.io/name: matter-server
+spec:
+  parentRefs:
+    - name: traefik-gateway
+      namespace: kube-system
+      sectionName: https
+  hostnames:
+    - '{{ matter_server_hostname }}'
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: matter-server
+          namespace: '{{ thread_namespace }}'
+          port: {{ matter_server_port }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: matter-server
+  namespace: '{{ thread_namespace }}'
+  labels:
+    app.kubernetes.io/name: matter-server
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: matter-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: matter-server
+    spec:
+      # Pin to the radio host: routes to the Thread mesh exist directly in
+      # its routing table (see the placement note in the file header).
+      nodeSelector:
+        homelab.internal/thread-radio-host: 'true'
+      # The Matter controller commissions and reaches devices via mDNS and
+      # IPv6 on the real LAN, which does not work from the pod network.
+      hostNetwork: true
+      # The matterjs-server image runs as uid/gid 1000 (node). runAsUser pins
+      # that uid explicitly so the uid the pod presents to the host D-Bus
+      # matches the BlueZ policy installed for local BLE (see service/thread.yml).
+      # fsGroup makes the /data PVC group-writable by that user; without it the
+      # volume is read-only to node (it was created root-owned by the previous
+      # CHIP server generation) and the server crashes with EACCES on /data.
+      securityContext:
+        runAsUser: {{ matter_server_uid }}
+        fsGroup: 1000
+      containers:
+        - name: matter-server
+          image: '{{ matter_server_image }}:{{ matter_server_image_tag }}'
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: STORAGE_PATH
+              value: /data
+            - name: PORT
+              value: '{{ matter_server_port }}'
+            # Pin mDNS to the real LAN interface. With hostNetwork the node
+            # exposes dozens of virtual interfaces (cilium, veth) that cannot
+            # carry multicast; without this, Matter.js probes them noisily.
+            - name: PRIMARY_INTERFACE
+              value: '{{ otbr_infra_if }}'
+            # Commissioning a factory-new Thread device requires Bluetooth: it
+            # has no network credentials yet, so no IP, and can only receive the
+            # Thread dataset over BLE. matter_server_ble_mode selects how that
+            # Bluetooth is supplied (the two are mutually exclusive in the
+            # server); both commissioning workflows are in docs/home-automation.md.
+{% if matter_server_ble_mode == 'proxy' %}
+            # proxy: expose a /ble websocket that a remote matter-ble-proxy
+            # client bridges to an off-cluster adapter (any LAN machine near the
+            # device). Use when the radio host has no Bluetooth of its own. Home
+            # Assistant grabs the single /ble slot on startup, so it must be
+            # scaled down during commissioning (see the docs).
+            - name: BLE_PROXY
+              value: 'true'
+{% else %}
+            # local: drive a Bluetooth adapter on the radio host directly, so no
+            # /ble slot exists (nothing for Home Assistant to occupy) and no
+            # external bridge is needed. NOBLE_BINDINGS=dbus makes the noble
+            # library reach the host's BlueZ over the mounted D-Bus socket, which
+            # keeps this container unprivileged (the raw-HCI path would need
+            # NET_ADMIN/NET_RAW). BLUETOOTH_ADAPTER is the HCI index (0 = hci0).
+            # Requires bluez plus the D-Bus policy that service/thread.yml
+            # installs on the radio host, both gated on this same mode.
+            - name: BLUETOOTH_ADAPTER
+              value: '0'
+            - name: NOBLE_BINDINGS
+              value: dbus
+            - name: DBUS_SYSTEM_BUS_ADDRESS
+              value: unix:path=/run/dbus/system_bus_socket
+{% endif %}
+            # Force the dashboard into reverse-proxy ("production") mode so it
+            # auto-connects its websocket to the current page URL
+            # (wss://matter_server_hostname/ws through the gateway) instead of
+            # prompting for a server URL. The dashboard otherwise infers this
+            # only when served on the backend's own port; behind the HTTPRoute
+            # it is served on 443, so without this it prompts on every visit.
+            - name: PRODUCTION_MODE
+              value: 'true'
+          securityContext:
+            # Unprivileged: Matter.js mDNS and websocket are ordinary sockets
+            # (>1024), and its mDNS sets SO_REUSEPORT so it port-shares UDP
+            # 5353 with the OTBR mDNSResponder on the same host. hostNetwork
+            # alone is sufficient — no added capabilities.
+            privileged: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+{% if matter_server_ble_mode == 'local' %}
+            # Local BLE reaches the host BlueZ over D-Bus, but the docker-default
+            # AppArmor profile Kubernetes applies BLOCKS D-Bus — the container's
+            # first D-Bus call (Hello) is denied and the server crashes (write
+            # EPIPE). Rather than dropping confinement entirely (Unconfined), this
+            # references a custom on-host profile that IS docker-default plus a
+            # single allow for D-Bus to org.bluez, so every other restriction
+            # stays in force. service/thread.yml installs and loads that profile
+            # on the radio host; it must be loaded there or the pod won't start.
+            # (proxy mode keeps the stock docker-default — no override here.)
+            appArmorProfile:
+              type: Localhost
+              localhostProfile: '{{ matter_apparmor_profile }}'
+{% endif %}
+          volumeMounts:
+            - name: matter-server-data
+              mountPath: /data
+{% if matter_server_ble_mode == 'local' %}
+            # Host D-Bus system socket, so noble's D-Bus binding can reach the
+            # host BlueZ for local Bluetooth. Writable, not read-only: a
+            # read-only mount is reported to break the D-Bus connection
+            # (broken-pipe errors), and access is governed by the host BlueZ
+            # D-Bus policy for this container's uid regardless.
+            - name: dbus-system
+              mountPath: /run/dbus
+              readOnly: false
+{% endif %}
+          readinessProbe:
+            tcpSocket:
+              port: {{ matter_server_port }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: {{ matter_server_port }}
+            initialDelaySeconds: 60
+            periodSeconds: 20
+      volumes:
+        - name: matter-server-data
+          persistentVolumeClaim:
+            claimName: matter-server-data
+{% if matter_server_ble_mode == 'local' %}
+        - name: dbus-system
+          hostPath:
+            path: /run/dbus
+            type: Directory
+{% endif %}

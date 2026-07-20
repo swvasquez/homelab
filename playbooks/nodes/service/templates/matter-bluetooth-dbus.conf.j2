@@ -1,0 +1,29 @@
+{#
+  D-Bus system-bus policy granting the Matter server container's uid access to
+  BlueZ (org.bluez). In local BLE commissioning mode (matter_server_ble_mode:
+  local) the unprivileged matterjs-server pod reaches the radio host's Bluetooth
+  adapter through the host BlueZ over the system D-Bus socket, using the noble
+  D-Bus binding. BlueZ's shipped policy (/usr/share/dbus-1/system.d/bluetooth.conf)
+  only allows root and the 'bluetooth' group to call org.bluez, and the pod
+  connects as its own uid, so without this policy those calls are denied and the
+  server logs "Disabling BLE" at startup. The allows below mirror BlueZ's own
+  policy but scoped to the container uid.
+
+  Rendered by service/thread.yml only on the Thread radio host in local mode.
+
+  Variables:
+    matter_server_uid: Numeric uid the matter-server container runs as (runAsUser).
+#}
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <policy user="{{ matter_server_uid }}">
+    <allow send_destination="org.bluez"/>
+    <allow send_interface="org.bluez.Agent1"/>
+    <allow send_interface="org.bluez.GattCharacteristic1"/>
+    <allow send_interface="org.bluez.GattDescriptor1"/>
+    <allow send_interface="org.bluez.LEAdvertisement1"/>
+    <allow send_interface="org.freedesktop.DBus.ObjectManager"/>
+    <allow send_interface="org.freedesktop.DBus.Properties"/>
+  </policy>
+</busconfig>

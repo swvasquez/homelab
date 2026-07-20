@@ -27,6 +27,11 @@
 #     than being masqueraded to the node IP. Without this rule longhorn-manager
 #     and any other pod scheduled on the apiserver node fail leader-election
 #     and other apiserver calls.
+#   - Allows the OTBR REST API port (otbr_rest) and the Matter server
+#     websocket port (matter_server) from the pod CIDR 10.0.0.0/8 so the
+#     Home Assistant pod can reach the hostNetwork Thread workloads on the
+#     radio host when both land on the same node, where the source IP is the
+#     pod IP rather than a masqueraded node IP.
 #   - Enables UFW.
 #
 # Variables:
@@ -162,6 +167,20 @@
         rule: allow
         port: '{{ ufw_allowed_ports.kubernetes_api.port | string }}'
         proto: '{{ ufw_allowed_ports.kubernetes_api.protocol }}'
+        from_ip: 10.0.0.0/8
+
+    - name: Allow OTBR REST API port from pod CIDR
+      community.general.ufw:
+        rule: allow
+        port: '{{ ufw_allowed_ports.otbr_rest.port | string }}'
+        proto: '{{ ufw_allowed_ports.otbr_rest.protocol }}'
+        from_ip: 10.0.0.0/8
+
+    - name: Allow Matter server websocket port from pod CIDR
+      community.general.ufw:
+        rule: allow
+        port: '{{ ufw_allowed_ports.matter_server.port | string }}'
+        proto: '{{ ufw_allowed_ports.matter_server.protocol }}'
         from_ip: 10.0.0.0/8
 
     # -------------------------------------------------------------------------

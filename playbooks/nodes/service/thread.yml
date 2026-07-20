@@ -1,0 +1,721 @@
+---
+# ==============================================================================
+# Playbook: Deploy Thread Infrastructure via ArgoCD GitOps
+# ==============================================================================
+# This playbook configures and deploys the Thread networking infrastructure to
+# the Kubernetes cluster via ArgoCD GitOps using native Kubernetes manifests:
+# the OpenThread Border Router (OTBR) driving the Home Assistant Connect
+# ZBT-2 USB radio, and the Matter.js Open Home Foundation server
+# (matterjs-server) through which Home Assistant commissions and controls
+# Matter-over-Thread devices.
+#
+# Architecture: Thread is an IPv6 mesh. The ZBT-2 (flashed with OpenThread
+# RCP firmware) is a dumb radio driven over serial by the OTBR container,
+# which creates the wpan0 interface and routes IPv6 between the Thread mesh
+# and the LAN interface of its node. Home Assistant does not talk to the
+# radio: it manages OTBR through its REST API (the OTBR integration) and
+# controls devices via the Matter server websocket (the Matter integration);
+# the Matter server's device traffic transits OTBR as ordinary routed IPv6.
+# The Matter server is pinned to the radio host as well, because only that
+# host has direct routes to the Thread mesh (other nodes ignore route
+# information options in router advertisements by default).
+#
+# Note on Placement: the per-host inventory flag thread_radio_host marks the
+# node whose USB port holds the ZBT-2 radio, following the same pattern as
+# vllm_host. Every node is labeled homelab.internal/thread-radio-host from
+# the flag and the OTBR Deployment pins itself to the flagged node via
+# nodeSelector. Exactly one node must be flagged; the playbook asserts this.
+#
+# Note on Security Model (least privilege via device plugin): Kubernetes has
+# no equivalent of Docker's `devices:` mapping, so the naive way to hand a
+# pod a serial device is hostPath + privileged — which grants ALL
+# capabilities, ALL host devices, and disables seccomp. Instead, a
+# generic-device-plugin DaemonSet (pinned to the radio host) advertises the
+# ZBT-2 and /dev/net/tun to the kubelet as allocatable resources
+# (squat.ai/zbt2, squat.ai/tun). The OTBR container requests them via
+# resources.limits and runs UNPRIVILEGED with only NET_ADMIN, NET_RAW, and
+# IPC_LOCK — the capabilities it actually uses (wpan0 creation, ip6tables,
+# router advertisements, raw ICMPv6, and mDNSResponder memory locking). The
+# device plugin container itself runs privileged (a documented requirement
+# of the kubelet device-plugin API), but it is a small single-purpose binary
+# with no network exposure. The IPv6 forwarding sysctls a privileged OTBR
+# would set as a side effect are instead applied persistently on the radio
+# host by this playbook (/etc/sysctl.d/99-otbr.conf).
+#
+# Note on mDNS coexistence: OTBR and the Matter server both need mDNS on UDP
+# 5353 on the same host — OTBR to publish the border-router service and the
+# Matter server to discover devices. Two embedded responders can only share
+# 5353 if both set SO_REUSEPORT. OTBR is therefore built with the
+# mDNSResponder backend (see the OTBR Image Build section), and the Matter
+# server is the Matter.js server whose sockets set reuseAddr; both are willing
+# sharers and coexist. (The stock native-OpenThread OTBR backend and the older
+# CHIP python-matter-server each grab 5353 exclusively and cannot coexist.)
+#
+# The namespace still carries the 'privileged' Pod Security profile label:
+# hostNetwork and the NET_ADMIN capability already exceed the 'baseline'
+# profile, and the device plugin needs privileged. The label only permits;
+# the pod specs above are what is actually granted.
+#
+# Note on Exposure: the Matter server gets a no-auth HTTPRoute exposing its
+# dashboard and commissioning websockets on the LAN as matter_server_hostname
+# (see the manifest template); OTBR gets none (its REST API is not a browser
+# UI). ClusterIP Services still front both so Home Assistant reaches them by
+# stable in-cluster DNS name
+# (otbr / matter-server .<namespace>.svc) that survives a radio-host change;
+# with hostNetwork the Service endpoints resolve to the node IP. LAN clients
+# use the radio host's IP directly. The otbr_rest, matter_server, and mdns
+# (5353) ports are all present in ufw_allowed_ports, so network.yml's generic
+# loop opens them to the LAN and tailnet — which is all mDNS needs, since its
+# discovery traffic comes from real LAN devices (phones, other Matter nodes)
+# and the hostNetwork pods receive it directly. otbr_rest and matter_server
+# additionally get explicit pod-CIDR rules in network.yml, covering the
+# same-node path where Home Assistant's pod reaches these hostNetwork
+# services and Cilium does not masquerade the pod source IP. mDNS needs no
+# pod-CIDR rule (no pod consumes the host's 5353).
+#
+# Prerequisite: the ZBT-2 must already be flashed with the OpenThread RCP
+# firmware (Open Home Foundation Device Toolbox) — it ships with Zigbee
+# firmware, and nothing in the cluster can flash it.
+#
+# Run order:
+#   1. infrastructure/network.yml (UFW rules: otbr_rest, matter_server, mdns)
+#   2. cluster/git.yml
+#   3. cluster/gitops.yml
+#   4. service/thread.yml (this playbook — builds the OTBR image on the radio
+#      host on first run, then deploys OTBR + Matter server via ArgoCD)
+#
+# Input Variables:
+#   bootstrap_node:        Boolean indicating if the host is the control
+#                          plane bootstrap node. Read from inventory.
+#   thread_radio_host:     Per-host boolean marking the node whose USB port
+#                          holds the ZBT-2 radio. Exactly one node must be
+#                          flagged. Read from inventory (default: false).
+#   thread_radio_device_path: Per-host stable /dev/serial/by-id path of the
+#                          ZBT-2 radio on the radio host (ls
+#                          /dev/serial/by-id/). Read from inventory.
+#   network_interface:     Per-host LAN interface name. The radio host's
+#                          value becomes OTBR's infrastructure interface.
+#                          Read from inventory.
+#   dns_zone:              DNS zone (e.g. homelab.internal). Read from
+#                          group_vars.
+#   thread_namespace:      Kubernetes namespace for the Thread workloads
+#                          (default: thread).
+#   device_plugin_image:   Docker image for the generic device plugin that
+#                          advertises the radio and tun devices to the
+#                          kubelet (default: ghcr.io/squat/generic-device-plugin).
+#   device_plugin_image_tag: Docker image tag for the generic device plugin
+#                          (default: 0.2.0).
+#   otbr_image:            Local Docker image name for the OTBR build with the
+#                          mDNSResponder backend (default: otbr-mdnsresponder).
+#   otbr_image_tag:        Tag for the locally built OTBR image, matching the
+#                          OpenThread source release (default: 2026.07.0).
+#   otbr_src_repo:         Git repository built into the OTBR image
+#                          (default: https://github.com/openthread/ot-br-posix).
+#   otbr_src_version:      Git tag of ot-br-posix to build
+#                          (default: v2026.07.0).
+#   otbr_build_dir:        Temporary clone/build directory on the radio host
+#                          (default: /tmp/ot-br-posix-build).
+#   otbr_device_path:      Stable /dev/serial/by-id path of the ZBT-2 radio,
+#                          derived at runtime from the radio host's
+#                          thread_radio_device_path inventory variable.
+#   otbr_rest_port:        Port for the OTBR REST API. Derived from
+#                          ufw_allowed_ports.otbr_rest.port in group_vars.
+#   otbr_log_level:        OpenThread log level, 0=emergency .. 7=debug
+#                          (default: 5).
+#   otbr_storage_size:     Storage size for the OTBR state PVC on Longhorn.
+#                          Holds the Thread network dataset (default: 1Gi).
+#   otbr_storage_class:    Kubernetes StorageClass used to provision the OTBR
+#                          state PVC (default: longhorn).
+#   matter_server_image:   Docker image for the Matter server (the Matter.js
+#                          Open Home Foundation server)
+#                          (default: ghcr.io/matter-js/matterjs-server).
+#   matter_server_image_tag: Docker image tag for the Matter server
+#                          (default: 1.3.1).
+#   matter_server_port:    Port for the Matter server websocket. Derived from
+#                          ufw_allowed_ports.matter_server.port in group_vars.
+#   matter_server_hostname: LAN hostname for the Matter server dashboard and
+#                          websocket endpoints, exposed via a no-auth HTTPRoute
+#                          for commissioning. Derived from dns_zone
+#                          (default: matter-server.<dns_zone>).
+#   matter_server_ble_mode: How Bluetooth is provided for commissioning —
+#                          'local' (drive a host Bluetooth adapter via BlueZ
+#                          over D-Bus) or 'proxy' (expose /ble for a remote
+#                          matter-ble-proxy bridge) (default: local).
+#   matter_server_uid:     Numeric uid the Matter server container runs as
+#                          (default: 1000).
+#   matter_apparmor_profile: AppArmor profile the Matter server runs under in
+#                          local BLE mode — docker-default plus a D-Bus allow for
+#                          org.bluez (default: matter-bluetooth).
+#   matter_server_storage_size: Storage size for the Matter server data PVC
+#                          on Longhorn. Holds the Matter fabric credentials
+#                          (default: 1Gi).
+#   matter_server_storage_class: Kubernetes StorageClass used to provision
+#                          the Matter server data PVC (default: longhorn).
+#   otbr_infra_if:         LAN interface OTBR routes through, derived at
+#                          runtime from the radio host's network_interface.
+#   thread_gitops_path:    Path within the gitops repository where the Thread
+#                          manifests are stored (default: apps/thread).
+#   kubectl_config_path:   Full path to the kubectl config file
+#                          (default: /home/<ansible_user>/.kube/config).
+#   gitea_namespace:       Kubernetes namespace where Gitea is deployed
+#                          (default: gitea).
+#   gitea_admin_username:  Username of the Gitea admin account used to push
+#                          to the gitops repository (default: gitea_admin).
+#   gitea_gitops_repo:     Name of the Gitea gitops repository
+#                          (default: gitops).
+#   argocd_namespace:      Kubernetes namespace where ArgoCD is deployed
+#                          (default: argocd).
+
+- name: Deploy Thread infrastructure via ArgoCD GitOps
+  hosts: nodes
+  become: true
+  become_exe: sudo.ws
+  vars:
+    thread_namespace: thread
+    device_plugin_image: ghcr.io/squat/generic-device-plugin
+    device_plugin_image_tag: '0.2.0'
+    # OTBR is built locally on the radio host from the OpenThread source with
+    # the mDNSResponder mDNS backend (OTBR_MDNS=mDNSResponder) so it coexists
+    # with the Matter server's embedded mDNS on UDP 5353. The stock
+    # openthread/border-router image uses OpenThread's native backend, which
+    # binds 5353 exclusively and loses the port to the Matter server, leaving
+    # the border router undiscoverable. mDNSResponder (the same backend the
+    # Home Assistant OS add-on uses) port-shares with other responders. The
+    # image stays in the radio host's local Docker store and is consumed with
+    # imagePullPolicy: Never — no registry involved.
+    otbr_image: otbr-mdnsresponder
+    otbr_image_tag: '2026.07.0'
+    otbr_src_repo: https://github.com/openthread/ot-br-posix
+    otbr_src_version: v2026.07.0
+    otbr_build_dir: /tmp/ot-br-posix-build
+    otbr_rest_port: '{{ ufw_allowed_ports.otbr_rest.port }}'
+    otbr_log_level: '5'
+    otbr_storage_size: 1Gi
+    otbr_storage_class: longhorn
+    # The Open Home Foundation Matter server, a Matter.js (TypeScript)
+    # rewrite that replaced the archived CHIP-based python-matter-server. It
+    # is a drop-in for the python-matter-server v8.1.2 websocket protocol
+    # (same port 5580, same /ws path), so Home Assistant connects unchanged.
+    # Critically, its mDNS sets SO_REUSEPORT, so it port-shares UDP 5353 with
+    # the OTBR mDNSResponder on the same host — unlike the old CHIP server,
+    # whose embedded mDNS bound 5353 exclusively and could not coexist.
+    # (Beta / not yet CSA-recertified as of this writing.)
+    # Pinned to 1.3.1: BLE-proxy commissioning (BLE_PROXY on the server plus an
+    # external matter-ble-proxy client, see the manifest template) requires the
+    # server and client to be the same generation. On 0.7.1 the server's BLE
+    # proxy was experimental and mismatched the current client, so PASE never
+    # completed; 1.3.1 fixed it and added RSSI/ProxyBleChannel diagnostics.
+    matter_server_image: ghcr.io/matter-js/matterjs-server
+    matter_server_image_tag: '1.3.1'
+    matter_server_port: '{{ ufw_allowed_ports.matter_server.port }}'
+    # LAN hostname for the Matter server's dashboard and websocket endpoints,
+    # exposed via a no-auth HTTPRoute so commissioning uses a stable name
+    # instead of the radio host's IP. ExternalDNS registers it from the route.
+    matter_server_hostname: 'matter-server.{{ dns_zone }}'
+    # How the Matter server obtains Bluetooth for commissioning a factory-new
+    # device: 'local' drives a Bluetooth adapter on the radio host directly (no
+    # /ble proxy slot, so no Home Assistant freeze) via the host BlueZ over
+    # D-Bus; 'proxy' exposes the /ble websocket for a remote matter-ble-proxy
+    # bridge (use when the radio host has no Bluetooth). Both commissioning
+    # workflows are documented in docs/home-automation.md.
+    matter_server_ble_mode: local
+    # Numeric uid the matterjs-server container runs as (the node user). Pins
+    # runAsUser and, in local BLE mode, the host BlueZ D-Bus policy grants this
+    # uid access to org.bluez.
+    matter_server_uid: 1000
+    # AppArmor profile the Matter server runs under in local BLE mode: Docker's
+    # docker-default plus a single allow for D-Bus to org.bluez (see the
+    # matter-bluetooth.apparmor.j2 template). Loaded on the radio host below and
+    # referenced by the pod's appArmorProfile.localhostProfile — this keeps the
+    # container confined rather than Unconfined while still allowing local BLE.
+    matter_apparmor_profile: matter-bluetooth
+    matter_server_storage_size: 1Gi
+    matter_server_storage_class: longhorn
+    # Hosts flagged as the Thread radio host; exactly one is required. The
+    # radio host's LAN interface becomes OTBR's infrastructure interface.
+    thread_radio_host_names: >-
+      {{ hostvars | dict2items
+         | selectattr('value.thread_radio_host', 'defined')
+         | selectattr('value.thread_radio_host', 'equalto', true)
+         | map(attribute='key') | list }}
+    otbr_infra_if: >-
+      {{ hostvars[thread_radio_host_names | first].network_interface
+         if thread_radio_host_names | length > 0 else '' }}
+    otbr_device_path: >-
+      {{ hostvars[thread_radio_host_names | first].thread_radio_device_path
+         if thread_radio_host_names | length > 0 else '' }}
+    thread_gitops_path: apps/thread
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    gitea_namespace: gitea
+    gitea_admin_username: gitea_admin
+    gitea_gitops_repo: gitops
+    argocd_namespace: argocd
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Radio Host Validation
+    # -------------------------------------------------------------------------
+    # The OTBR Deployment pins itself to the node labeled as the Thread radio
+    # host. With no node flagged the pod would be unschedulable, and with
+    # more than one the placement would be ambiguous, so exactly one is
+    # required before anything is deployed.
+    # -------------------------------------------------------------------------
+    - name: Assert exactly one Thread radio host is flagged in inventory
+      ansible.builtin.assert:
+        that:
+          - thread_radio_host_names | length == 1
+        fail_msg: >-
+          Exactly one host must set thread_radio_host: true in inventory.yml
+          (found {{ thread_radio_host_names | length }}:
+          {{ thread_radio_host_names | join(', ') }}).
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # OTBR Image Build (mDNSResponder backend)
+    # -------------------------------------------------------------------------
+    # Builds the OpenThread Border Router image directly in the radio host's
+    # Docker store using the mDNSResponder mDNS backend (see the otbr_image
+    # note in vars). The cluster runs the Docker runtime (cri-dockerd), so an
+    # image built here is immediately usable by the kubelet with
+    # imagePullPolicy: Never — no registry. The build is gated on the image
+    # not already existing so re-runs are fast. The temporary source clone is
+    # removed afterward. Runs on the radio host so the image is local to the
+    # node the OTBR pod is pinned to.
+    # -------------------------------------------------------------------------
+    - name: Ensure git is installed on the radio host
+      ansible.builtin.apt:
+        name: git
+        state: present
+      when: thread_radio_host | default(false)
+
+    - name: Check whether the OTBR mDNSResponder image already exists
+      ansible.builtin.command:
+        cmd: docker image inspect {{ otbr_image }}:{{ otbr_image_tag }}
+      register: otbr_image_check
+      changed_when: false
+      failed_when: false
+      when: thread_radio_host | default(false)
+
+    - name: Clone the OpenThread Border Router source on the radio host
+      ansible.builtin.git:
+        repo: '{{ otbr_src_repo }}'
+        dest: '{{ otbr_build_dir }}'
+        version: '{{ otbr_src_version }}'
+        recursive: true
+        force: true
+      when:
+        - thread_radio_host | default(false)
+        - otbr_image_check.rc != 0
+
+    - name: Build the OTBR image with the mDNSResponder backend # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          docker build
+          -f etc/docker/border-router/Dockerfile
+          --build-arg OTBR_MDNS=mDNSResponder
+          -t {{ otbr_image }}:{{ otbr_image_tag }}
+          .
+        chdir: '{{ otbr_build_dir }}'
+      register: otbr_build_result
+      changed_when: true
+      when:
+        - thread_radio_host | default(false)
+        - otbr_image_check.rc != 0
+
+    - name: Clean up the OTBR build directory
+      ansible.builtin.file:
+        path: '{{ otbr_build_dir }}'
+        state: absent
+      when: thread_radio_host | default(false)
+
+    # -------------------------------------------------------------------------
+    # Radio Host Sysctls
+    # -------------------------------------------------------------------------
+    # Applies the IPv6 forwarding sysctls on the radio host persistently. A
+    # privileged OTBR container would set these itself as a side effect; since
+    # the OTBR container runs unprivileged (see the file header), the host must
+    # provide them: forwarding turns the node into an IPv6 router so OTBR can
+    # route between the Thread mesh and the LAN.
+    #
+    # RA acceptance is deliberately NOT set here. The LAN interface is managed
+    # by systemd-networkd (see infrastructure/wol.yml), and networkd always
+    # disables the kernel's own RA handling on interfaces it manages, so a
+    # net.ipv6.conf.<if>.accept_ra sysctl is inert (it reads back 0 regardless).
+    # OTBR does its own RA in userspace (NET_RAW) and does not depend on the
+    # kernel accepting RAs — commissioning works with accept_ra=0. The IPv6
+    # link-local address OTBR needs on the LAN interface is provided by
+    # wol.yml (link-local: [ipv6] on the radio host), not by a sysctl here.
+    # -------------------------------------------------------------------------
+    - name: Apply IPv6 forwarding sysctls on the Thread radio host
+      ansible.posix.sysctl:
+        name: '{{ item.name }}'
+        value: '{{ item.value }}'
+        sysctl_file: /etc/sysctl.d/99-otbr.conf
+        sysctl_set: true
+        state: present
+        reload: true
+      loop:
+        - name: net.ipv4.ip_forward
+          value: '1'
+        - name: net.ipv6.conf.all.forwarding
+          value: '1'
+      loop_control:
+        label: '{{ item.name }}'
+      when: thread_radio_host | default(false)
+
+    # -------------------------------------------------------------------------
+    # Radio Host Bluetooth (local BLE commissioning)
+    # -------------------------------------------------------------------------
+    # When matter_server_ble_mode is 'local', the Matter server commissions
+    # devices over a Bluetooth adapter on the radio host instead of a remote
+    # /ble proxy. The unprivileged matter-server pod reaches that adapter
+    # through the host's BlueZ over D-Bus (NOBLE_BINDINGS=dbus in the manifest),
+    # so the host must run bluetoothd and must grant the pod's uid access to
+    # org.bluez — BlueZ's shipped D-Bus policy allows only root and the
+    # bluetooth group, and the pod connects as matter_server_uid. AutoEnable
+    # powers the adapter on at boot so it is ready without a manual
+    # `bluetoothctl power on`. All tasks are gated on 'local' mode; in 'proxy'
+    # mode none of this is needed and the /ble websocket is used instead.
+    # -------------------------------------------------------------------------
+    - name: Install BlueZ on the Thread radio host for local BLE commissioning
+      ansible.builtin.apt:
+        name: bluez
+        state: present
+      when:
+        - thread_radio_host | default(false)
+        - matter_server_ble_mode == 'local'
+
+    - name: Enable and start the Bluetooth service on the radio host
+      ansible.builtin.systemd_service:
+        name: bluetooth
+        enabled: true
+        state: started
+      when:
+        - thread_radio_host | default(false)
+        - matter_server_ble_mode == 'local'
+
+    - name: Power on Bluetooth adapters automatically at boot
+      community.general.ini_file:
+        path: /etc/bluetooth/main.conf
+        section: Policy
+        option: AutoEnable
+        value: 'true'
+        mode: '0644'
+        no_extra_spaces: true
+      register: matter_bt_autoenable
+      when:
+        - thread_radio_host | default(false)
+        - matter_server_ble_mode == 'local'
+
+    - name: Restart the Bluetooth service when AutoEnable changed
+      ansible.builtin.systemd_service:
+        name: bluetooth
+        state: restarted
+      when:
+        - thread_radio_host | default(false)
+        - matter_server_ble_mode == 'local'
+        - matter_bt_autoenable is changed
+
+    - name: Grant the Matter server pod uid D-Bus access to BlueZ
+      ansible.builtin.template:
+        src: templates/matter-bluetooth-dbus.conf.j2
+        dest: /etc/dbus-1/system.d/matter-bluetooth.conf
+        mode: '0644'
+      register: matter_dbus_policy
+      when:
+        - thread_radio_host | default(false)
+        - matter_server_ble_mode == 'local'
+
+    - name: Reload D-Bus when the BlueZ access policy changed
+      ansible.builtin.systemd_service:
+        name: dbus
+        state: reloaded
+      when:
+        - thread_radio_host | default(false)
+        - matter_server_ble_mode == 'local'
+        - matter_dbus_policy is changed
+
+    # The pod references this profile via appArmorProfile.localhostProfile, so it
+    # must be installed and loaded on the radio host BEFORE the manifest is
+    # applied (later in this play) — hence regular tasks, not handlers (handlers
+    # run at play end, after the pod). apparmor_parser -r fails loudly on a bad
+    # profile, surfacing authoring errors at deploy time; profiles under
+    # /etc/apparmor.d/ also reload at boot, so reloading only on change is enough.
+    - name: Install the Matter server AppArmor profile on the radio host
+      ansible.builtin.template:
+        src: templates/matter-bluetooth.apparmor.j2
+        dest: '/etc/apparmor.d/{{ matter_apparmor_profile }}'
+        mode: '0644'
+      register: matter_apparmor_file
+      when:
+        - thread_radio_host | default(false)
+        - matter_server_ble_mode == 'local'
+
+    - name: Load the Matter server AppArmor profile when it changed
+      ansible.builtin.command:
+        cmd: 'apparmor_parser -r /etc/apparmor.d/{{ matter_apparmor_profile }}'
+      changed_when: true
+      when:
+        - thread_radio_host | default(false)
+        - matter_server_ble_mode == 'local'
+        - matter_apparmor_file is changed
+
+    # -------------------------------------------------------------------------
+    # Namespace
+    # -------------------------------------------------------------------------
+    # Creates the Thread namespace before any other resources so that the
+    # ArgoCD Application can target it on first run.
+    # -------------------------------------------------------------------------
+    - name: Create Thread namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create namespace {{ thread_namespace }}
+      register: thread_ns_result
+      changed_when: "'created' in thread_ns_result.stdout"
+      failed_when:
+        - thread_ns_result.rc != 0
+        - "'already exists' not in thread_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Pod Security Admission Opt-Out
+    # -------------------------------------------------------------------------
+    # The cluster default Pod Security Standard is 'restricted', which forbids
+    # the privileged container, hostNetwork, and hostPath device mounts the
+    # OTBR pod needs to drive the radio and route between the Thread mesh and
+    # the LAN. Label this namespace 'privileged' to opt out of the cluster
+    # default for this single namespace, without requiring the cluster-level
+    # PSA exemption list in cluster/security.yml to know about Thread.
+    # -------------------------------------------------------------------------
+    - name: Label Thread namespace with privileged Pod Security profile
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          label --overwrite namespace {{ thread_namespace }}
+          pod-security.kubernetes.io/enforce=privileged
+          pod-security.kubernetes.io/warn=privileged
+          pod-security.kubernetes.io/audit=privileged
+      register: thread_psa_label_result
+      changed_when: "'labeled' in thread_psa_label_result.stdout"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Default ServiceAccount Hardening
+    # -------------------------------------------------------------------------
+    # Disables the default ServiceAccount token automount in this namespace so
+    # ad-hoc pods that don't name a ServiceAccount cannot read a usable API
+    # bearer credential. Workloads that need API access use named
+    # ServiceAccounts and are unaffected.
+    # -------------------------------------------------------------------------
+    - name: Disable default ServiceAccount token automount in Thread namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch serviceaccount default
+          -n {{ thread_namespace }}
+          --type=merge
+          -p '{"automountServiceAccountToken": false}'
+      register: thread_sa_automount_result
+      changed_when: "'patched' in thread_sa_automount_result.stdout"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Node Labeling
+    # -------------------------------------------------------------------------
+    # Labels each node from the thread_radio_host inventory flag so the OTBR
+    # Deployment's nodeSelector pins the pod to the node holding the ZBT-2
+    # radio. Follows the vllm_host labeling pattern.
+    # -------------------------------------------------------------------------
+    - name: Set Thread radio host label on each node
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          label node {{ item }}
+          homelab.internal/thread-radio-host={{
+            hostvars[item].thread_radio_host | default(false) | string | lower
+          }} --overwrite
+      register: thread_radio_label_result
+      changed_when: "'labeled' in thread_radio_label_result.stdout"
+      loop: "{{ groups['nodes'] }}"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # GitOps - Manifest Management
+    # -------------------------------------------------------------------------
+    # Renders the Thread native Kubernetes manifests (PVC, Deployment) from a
+    # Jinja2 template and commits them to the Gitea gitops repository. ArgoCD
+    # watches this path and automatically syncs the manifests to the cluster.
+    # -------------------------------------------------------------------------
+    - name: Ensure git is installed
+      ansible.builtin.apt:
+        name: git
+        state: present
+      when: bootstrap_node | default(false)
+
+    - name: Get Gitea pod IP
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get pod -n {{ gitea_namespace }}
+          -l app.kubernetes.io/name=gitea,app.kubernetes.io/instance=gitea
+          -o jsonpath='{.items[0].status.podIP}'
+      register: gitea_pod_ip
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Read Gitea admin password from Kubernetes Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret gitea-credentials -n {{ gitea_namespace }}
+          -o jsonpath='{.data.admin-password}'
+      register: gitea_admin_password_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Gitea admin password fact
+      ansible.builtin.set_fact:
+        gitea_admin_password: '{{ gitea_admin_password_b64.stdout | b64decode }}'
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Clone or update gitops repository in temporary directory
+      ansible.builtin.git:
+        repo: >-
+          http://{{ gitea_admin_username }}:{{ gitea_admin_password }}@{{ gitea_pod_ip.stdout }}:3000/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}
+        dest: /tmp/gitops-thread
+        version: main
+        update: true
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Create Thread directory in gitops repository
+      ansible.builtin.file:
+        path: '/tmp/gitops-thread/{{ thread_gitops_path }}'
+        state: directory
+        mode: '0755'
+      when: bootstrap_node | default(false)
+
+    - name: Write Thread manifests to gitops repository
+      ansible.builtin.template:
+        src: templates/thread-manifests.yml.j2
+        dest: '/tmp/gitops-thread/{{ thread_gitops_path }}/manifests.yml'
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Configure git user email for commit # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-thread config user.email
+          'ansible@{{ dns_zone | default("homelab.internal") }}'
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Configure git user name for commit # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-thread config user.name Ansible
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set gitops repository remote URL with credentials for push # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-thread remote set-url origin
+          http://{{ gitea_admin_username }}:{{ gitea_admin_password }}@{{ gitea_pod_ip.stdout }}:3000/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}
+      no_log: true
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Stage Thread manifests in gitops repository # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-thread add
+          {{ thread_gitops_path }}/manifests.yml
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Check for staged changes in gitops repository # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-thread diff --cached --exit-code
+      register: gitops_diff_result
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Commit Thread manifests to gitops repository # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-thread commit
+          -m 'chore: update thread manifests'
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - gitops_diff_result.rc != 0
+
+    - name: Push Thread manifests commit to Gitea # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-thread push origin main
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - gitops_diff_result.rc != 0
+
+    - name: Clean up gitops temporary directory
+      ansible.builtin.file:
+        path: /tmp/gitops-thread
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ArgoCD Application
+    # -------------------------------------------------------------------------
+    # Applies the ArgoCD Application manifest that tracks the Gitea repository.
+    # This initiates the deployment of the Thread resources to the cluster.
+    # -------------------------------------------------------------------------
+    - name: Write ArgoCD Application manifest for Thread
+      ansible.builtin.template:
+        src: templates/thread-app.yml.j2
+        dest: /tmp/thread-app.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ArgoCD Application manifest for Thread
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/thread-app.yml
+      register: argocd_app_result
+      changed_when: >-
+        'configured' in argocd_app_result.stdout or
+        'created' in argocd_app_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up ArgoCD Application manifest for Thread
+      ansible.builtin.file:
+        path: /tmp/thread-app.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Trigger ArgoCD hard refresh to detect new gitops commit
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch application thread -n {{ argocd_namespace }}
+          --type merge
+          -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Wait for ArgoCD to sync and deploy Thread
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get application thread -n {{ argocd_namespace }}
+          -o jsonpath='{.status.sync.status},{.status.health.status}'
+      register: argocd_status
+      until: argocd_status.stdout == 'Synced,Healthy'
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: bootstrap_node | default(false)

@@ -1,0 +1,59 @@
+{#
+  AppArmor profile for the Matter server container in local BLE mode. A faithful
+  copy of Docker's built-in `docker-default` profile (the confinement Kubernetes
+  normally applies) with ONE addition: permission to talk to BlueZ over the
+  system D-Bus. That is the single thing docker-default blocks that local
+  Bluetooth commissioning needs — the container's D-Bus `Hello` call is otherwise
+  denied and the server crashes (write EPIPE). Using this rather than
+  `Unconfined` keeps every other docker-default restriction (the /proc, /sys,
+  mount, and firmware denials below) in force.
+
+  Loaded on the Thread radio host by service/thread.yml (local BLE mode only) and
+  referenced by the pod via appArmorProfile.localhostProfile; the profile name
+  must match matter_apparmor_profile.
+
+  Variables:
+    matter_apparmor_profile: AppArmor profile name (also the localhostProfile).
+#}
+#include <tunables/global>
+
+profile {{ matter_apparmor_profile }} flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  network,
+  capability,
+  file,
+  umount,
+
+  # The only addition over docker-default: allow the container to drive the host
+  # Bluetooth adapter through BlueZ on the system bus (method calls + replies +
+  # signals), and to speak to the bus daemon itself (Hello, AddMatch). Every
+  # other D-Bus destination stays denied.
+  dbus (send, receive) bus=system peer=(name=org.bluez),
+  dbus (send, receive) bus=system peer=(name=org.freedesktop.DBus),
+
+  # Host (privileged) processes may send signals to container processes.
+  signal (receive) peer=unconfined,
+  signal (send,receive) peer={{ matter_apparmor_profile }},
+
+  deny @{PROC}/* w,   # deny write for all files directly in /proc (not in a subdir)
+  # deny write to files not in /proc/<number>/** or /proc/sys/**
+  deny @{PROC}/{[^1-9],[^1-9][^0-9],[^1-9s][^0-9y][^0-9s],[^1-9][^0-9][^0-9][^0-9]*}/** w,
+  deny @{PROC}/sys/[^k]** w,  # deny /proc/sys except /proc/sys/k* (effectively /proc/sys/kernel)
+  deny @{PROC}/sys/kernel/{?,??,[^s][^h][^m]**} w,  # deny everything except shm* properties
+  deny @{PROC}/sysrq-trigger rwklx,
+  deny @{PROC}/kcore rwklx,
+
+  deny mount,
+
+  deny /sys/[^f]*/** wklx,
+  deny /sys/f[^s]*/** wklx,
+  deny /sys/fs/[^c]*/** wklx,
+  deny /sys/fs/c[^g]*/** wklx,
+  deny /sys/fs/cg[^r]*/** wklx,
+  deny /sys/firmware/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+
+  # suppress ptrace denials when using 'docker ps' or using 'ps' inside a container
+  ptrace (trace,read,tracedby,readby) peer={{ matter_apparmor_profile }},
+}
