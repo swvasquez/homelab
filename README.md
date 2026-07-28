@@ -1,229 +1,64 @@
 # Homelab
 
-Ansible playbooks to configure Ubuntu x86_64 compute nodes, Arch Linux-based IP KVM devices, and manage a Kubernetes homelab cluster.
+This repository contains code to deploy and manage a homelab cluster consisting of compute nodes, client nodes, and an IP KVM.
 
+As part of this homelab, a self-managed Kubernetes cluster hosts various services such as those for file syncing, Git repository hosting, media serving, and home automation. Client nodes can access these services from within the LAN or remotely via Tailscale.
+
+Code is deployed to the cluster via Ansible Playbooks. Common management tasks are accessible via the project's `justfile`.
+
+> [!NOTE]
 > This code was generated with AI assistance.
 
 ## Prerequisites
 
-- [just](https://github.com/casey/just)
-- [uv](https://github.com/astral-sh/uv)
-- [bao](https://openbao.org/)
-- [gnupg](https://gnupg.org/)
-- [pass](https://www.passwordstore.org/)
+The following tools should be installed before deploying any of the Playbooks
+
+| Tool | Purpose |
+|------|---------|
+| [just](https://github.com/casey/just) | Task runner that wraps the deploy, lint, and helper commands |
+| [uv](https://github.com/astral-sh/uv) | Python environment manager; `just venv` uses it to install Ansible |
+| [bao](https://openbao.org/) | OpenBao CLI for secret management within the cluster |
+| [gnupg](https://gnupg.org/) | GPG, which encrypts the `pass` store |
+| [pass](https://www.passwordstore.org/) | Password store that holds various keys to access and manage cluster resources |
 
 ## Setup
 
-1.  Create a virtual environment with required dependencies:
+1.  Create a virtual environment with required dependencies (namely Ansible)
 
     ```sh
     just venv
     ```
 
-2.  Create an `inventory.yml` file with the following structure:
+2.  Define cluster configuration via a top-level `inventory.yml` file and `group_vars/{all,nodes,ipkvm}.yml` files. These configuration files provide the Playbooks with information about the local setup (router IP, desired local DNS zone, etc.) and assign roles to certain nodes. The specification for these configuration files can be found at [`docs/configuration.md`](docs/configuration.md).
 
-    ```yaml
-    all:
-      children:
-        nodes:
-          vars:
-            ansible_port: <SSH_PORT>
-            ansible_python_interpreter: <PYTHON_PATH>
-            ansible_user: <USER>
-          hosts:
-            <HOSTNAME>:
-              private_ip: <IP>
-              network_interface: <INTERFACE>
-              mac_address: <MAC>
-              control_plane: <true|false>
-              bootstrap_node: <true|false>
-              worker_node: <true|false>
-              nfs_server: <true|false>
-              slurm_controller: <true|false>
-              slurm_compute_node: <true|false>
-              vllm_host: <true|false>
-              thread_radio_host: <true|false>
-              thread_radio_device_path: <DEVICE_PATH>
-              tailscale: <true|false>
-              tailscale_exit_node: <true|false>
-        ipkvm:
-          vars:
-            ansible_python_interpreter: <PYTHON_PATH>
-            ansible_user: <USER>
-            ansible_remote_tmp: <TMP_PATH>
-          hosts:
-            <HOSTNAME>:
-              private_ip: <IP>
-    ```
+3. Ensure Ubuntu Server 24.04 LTS or newer is already installed on your compute nodes.
 
-3.  Create a `group_vars/all.yml` file for variables shared across all inventory groups:
+4. Ensure you can SSH into compute nodes from the machine that will run the Ansible Playbooks.
 
-    ```yaml
-    pass_namespace: <PASS_NAMESPACE>
-    dns_zone: <DNS_ZONE>
-    bind9_lb_ip: <BIND9_LB_IP>
-    lan_cidr: <CIDR>
-    tailscale_tailnet: <TAILSCALE_TAILNET>
-    tailscale_exit_node_tag: <TAILSCALE_EXIT_NODE_TAG>
-    tailscale_client_tag: <TAILSCALE_CLIENT_TAG>
-    tailscale_ssh_server_tag: <TAILSCALE_SSH_SERVER_TAG>
-    ssh_identity_file: <SSH_IDENTITY_FILENAME>
-    dropbear_identity_file: <DROPBEAR_IDENTITY_FILENAME>
-    dropbear_pass_private: '{{ pass_namespace }}/dropbear/private-key'
-    dropbear_pass_public: '{{ pass_namespace }}/dropbear/public-key'
-    ```
+## Deploy
 
-4.  Create a `group_vars/nodes.yml` file for cluster-node group variables:
+Use the provided Ansible Playbooks to deploy the homelab.
 
-    ```yaml
-    ssh_users:
-      - <USER>
-      - <ANSIBLE_USER>
-    nfs_export_path: <NFS_EXPORT_PATH>
-    nfs_mount_point: <NFS_MOUNT_POINT>
-    nfs_k8s_path: <NFS_K8S_PATH>
-    nfs_group: <NFS_GROUP>
-    nfs_group_gid: <NFS_GROUP_GID>
-    nonroot_uid: <NONROOT_UID>
-    lb_ip_pool_cidr: <CIDR>
-    router_private_ip: <ROUTER_IP>
-    shutdown_schedule: <SHUTDOWN_SCHEDULE>
-    admin_email: <ADMIN_EMAIL>
-    falco_sensitive_file_container_only: <true|false>
-    ufw_allowed_ports:
-      ssh:
-        port: <PORT>
-        protocol: tcp
-      dropbear:
-        port: <PORT>
-        protocol: tcp
-      kubernetes_api:
-        port: <PORT>
-        protocol: tcp
-      kubelet:
-        port: <PORT>
-        protocol: tcp
-        node_only: true
-      etcd_client:
-        port: <PORT>
-        protocol: tcp
-        node_only: true
-      etcd_peer:
-        port: <PORT>
-        protocol: tcp
-        node_only: true
-      cilium_vxlan:
-        port: <PORT>
-        protocol: udp
-        node_only: true
-      cilium_health:
-        port: <PORT>
-        protocol: tcp
-        node_only: true
-      hubble_peer:
-        port: <PORT>
-        protocol: tcp
-        node_only: true
-      traefik_http:
-        port: <PORT>
-        protocol: tcp
-      traefik_https:
-        port: <PORT>
-        protocol: tcp
-      bind9_dns_tcp:
-        port: <PORT>
-        protocol: tcp
-      bind9_dns_udp:
-        port: <PORT>
-        protocol: udp
-      gitea_ssh:
-        port: <PORT>
-        protocol: tcp
-      vllm_api:
-        port: <PORT>
-        protocol: tcp
-      nfs:
-        port: <PORT>
-        protocol: tcp
-      tailscale:
-        port: <PORT>
-        protocol: udp
-      slurm_ctld:
-        port: <PORT>
-        protocol: tcp
-        node_only: true
-      slurm_d:
-        port: <PORT>
-        protocol: tcp
-        node_only: true
-      syncthing_sync_tcp:
-        port: <PORT>
-        protocol: tcp
-      syncthing_sync_udp:
-        port: <PORT>
-        protocol: udp
-      syncthing_discovery:
-        port: <PORT>
-        protocol: udp
-    tailscale_key_expiry_disabled: <true|false>
-    tailscale_ssh: <true|false>
-    ```
+Playbooks live under `playbooks/`, organized by Ansible inventory group, then by category. Each category maintains its own `templates/` folder (if applicable) to keep Playbooks and their dependencies tightly coupled. Paths below are relative to `playbooks/`.
 
-5.  Create a `group_vars/ipkvm.yml` file for IP KVM group variables:
+| Directory | Contains |
+|-----------|----------|
+| `nodes/infrastructure` | Host configuration applied to an already-installed OS (e.g. remote access, firewall rules, shared storage) |
+| `nodes/cluster` | Kubernetes cluster bootstrapping and core platform components, including the Git server (`git.yml`) and GitOps controller (`gitops.yml`) |
+| `nodes/development` | Language toolchains and common CLI utilities |
+| `nodes/service` | Cluster-hosted user services (e.g. Syncthing, Jellyfin, Vaultwarden) |
+| `ipkvm/infrastructure` | OS-level configurations for IP KVM devices |
+| `shared/infrastructure` | Tailnet- and other cross-group config that targets `localhost` rather than a specific inventory group (e.g. the Tailscale ACL) |
 
-    ```yaml
-    tailscale_port: <TAILSCALE_PORT>
-    tailscale_exit_node: <true|false>
-    tailscale_key_expiry_disabled: <true|false>
-    tailscale_ssh: <true|false>
-    tailscale_hostname: <TAILSCALE_HOSTNAME>
-    ssh_users:
-      - <USER>
-    firewall_allowed_ports:
-      ssh:
-        port: <PORT>
-        protocol: tcp
-      pikvm_http:
-        port: <PORT>
-        protocol: tcp
-      pikvm_https:
-        port: <PORT>
-        protocol: tcp
-      tailscale:
-        port: <PORT>
-        protocol: udp
-      pikvm_webrtc:
-        port: <PORT_RANGE>
-        protocol: udp
-    ```
-
-## Directory Structure
-
-Playbooks are organized by Ansible inventory group, then by category. Each category maintains its
-own `templates/` folder (if applicable) to keep playbooks and their dependencies tightly coupled:
-
-- `playbooks/nodes/infrastructure/`: OS-level configurations and bare-metal setup.
-- `playbooks/nodes/cluster/`: Kubernetes cluster bootstrapping and core platform components,
-  including the Git server (`git.yml`) and GitOps controller (`gitops.yml`).
-- `playbooks/nodes/development/`: Language toolchains, development environments, and common CLI
-  utilities.
-- `playbooks/nodes/service/`: Cluster-hosted user services (e.g. Syncthing, Jellyfin,
-  Vaultwarden).
-- `playbooks/ipkvm/infrastructure/`: OS-level configurations for IP KVM devices.
-- `playbooks/shared/infrastructure/`: Tailnet- and other cross-group config that targets
-  `localhost` rather than a specific inventory group (e.g. the Tailscale ACL).
-
-## Usage
-
-### Run a Playbook
-
-To run a specific playbook, specify the inventory group, category, and playbook name:
+To run a Playbook, specify the inventory group, category, and Playbook name
 
 ```sh
 just deploy <GROUP> <CATEGORY> <PLAYBOOK>
 ```
 
-**Examples:**
+The structure of the commands should mirror the Playbook directory layout.
+
+**Examples**
 
 ```sh
 just deploy nodes infrastructure docker
@@ -232,254 +67,45 @@ just deploy shared infrastructure tailscale
 just deploy ipkvm infrastructure tailscale
 ```
 
-### Verify Connectivity
+## Documentation
 
-To ping a subset of machines:
+The Playbooks themselves contain fine-grained commentary; refer to them when trying to understand if and why specific options are set.
 
-```sh
-just ping <SUBSET>
-```
+For a high-level overview, refer to the documentation in `docs/`
+
+| Document | Covers |
+|----------|--------|
+| [`architecture.md`](docs/architecture.md) | The physical machines, what each is responsible for, and how they relate |
+| [`configuration.md`](docs/configuration.md) | The schema for `inventory.yml` and `group_vars/`, and the constraints coupling them |
+| [`operations.md`](docs/operations.md) | Playbook run order, one-time operator setup, and recurring procedures |
+| [`k8-cluster-components.md`](docs/k8-cluster-components.md) | Every component installed on the cluster, as a layered stack |
+| [`k8-cluster-network.md`](docs/k8-cluster-network.md) | Pod networking, LAN exposure, ingress, TLS, and DNS |
+| [`k8-cluster-authentication.md`](docs/k8-cluster-authentication.md) | The identity provider and how each service integrates with it |
+| [`systemd.md`](docs/systemd.md) | Boot and shutdown ordering where systemd, NFS, and Kubernetes storage collide |
+| [`home-automation.md`](docs/home-automation.md) | Working notes on the Home Assistant / Thread / Matter stack |
+
+## Development
 
 ### Linting
 
-To lint all playbooks, or optionally a specific playbook or directory:
+To lint an Ansible Playbook, run
 
 ```sh
 just lint [TARGET]
 ```
 
-**Example:**
+**Example**
 
 ```sh
 just lint playbooks/nodes/cluster/bootstrap.yml
 ```
 
-## Kubernetes
+## AI Assistance
 
-### Deploy a New Cluster
+As noted, this codebase has been developed with AI assistance. Guidelines for the AI coding agents are provided in the following files
 
-Requires `ssh`, `network`, `docker`, and optionally `nfs` from `playbooks/nodes/infrastructure/`
-to be installed first. Then run the cluster playbooks in this order:
-
-1. `kubernetes`
-2. `bootstrap`
-3. `network`
-4. `storage`
-5. `database`
-6. `observability`
-7. `secrets`
-8. `authentication`
-9. `git`
-10. `gitops`
-11. `security`
-
-Once complete, services in `playbooks/nodes/service/` are self-contained and can be installed in
-any order.
-
-### Destroy the Cluster
-
-Run on each node to tear down Kubernetes and reset cluster state:
-
-```sh
-kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock
-```
-
-## Notes
-
-- **Fixed-port services**: The following `ufw_allowed_ports` entries have standard ports that are
-  not consumed by any playbook configuration — the port values defined here are used only by the
-  UFW firewall rules and must match what the service actually listens on: `ssh`, `kubelet`,
-  `etcd_client`, `etcd_peer`, `cilium_vxlan`, `cilium_health`, `hubble_peer`, and `nfs`.
-- **SSH port**: `ufw_allowed_ports.ssh.port` in `group_vars/nodes.yml` must match `ansible_port`
-  in `inventory.yml`.
-- **`become_exe` configuration**: `become_exe` must be set to `sudo.ws` on cluster nodes to resolve
-  an issue with Ansible. See [Ansible Issue #85837](https://github.com/ansible/ansible/issues/85837)
-  for details. IP KVM playbooks use standard `sudo` as `sudo.ws` is not available on Arch Linux.
-- **Service playbook run order**: Once the cluster playbooks (`bootstrap`, `network`, `storage`,
-  `database`, `observability`, `secrets`, `authentication`, `git`, `gitops`, `security`) have all been run,
-  services in `playbooks/nodes/service/` are self-contained. Each service playbook applies its
-  own HTTPRoute, Traefik ForwardAuth Middleware, and namespace hardening, so adding a new service
-  does NOT require re-running any cluster playbook:
-  ```sh
-  just deploy nodes service <SERVICE>
-  ```
-- **Homelab CA trust install**: `cluster/network.yml` creates a private root CA (`homelab-ca`)
-  that signs the wildcard TLS certificate used by every `*.<DNS_ZONE>` service. To trust homelab
-  services in browsers, native apps, `curl`, and similar TLS clients without per-call flags or
-  clickthrough warnings, the CA cert must be installed on each operator device once. The same
-  `cluster/network.yml` playbook runs a `localhost` play at the end that extracts the cert from
-  the cluster's `wildcard-tls` Secret, caches it under `~/.local/state/homelab/homelab-ca.crt`,
-  and installs it into the System keychain (macOS) or `/usr/local/share/ca-certificates` plus
-  `update-ca-certificates` (Linux). Other operator devices (iOS, Windows, etc.) need a manual
-  install:
-  ```sh
-  kubectl -n kube-system get secret wildcard-tls \
-      -o jsonpath='{.data.ca\.crt}' | base64 -d > homelab-ca.crt
-  ```
-  Then add it to the device trust store (on iOS: install as a Configuration Profile via AirDrop
-  or email, then enable under Settings → General → About → Certificate Trust Settings).
-  See [`tls-hardening.md`](tls-hardening.md) for the threat model around the unconstrained CA and
-  the `nameConstraints` hardening procedure.
-- **Tailscale playbook run order**: `playbooks/shared/infrastructure/tailscale.yml` owns the
-  tailnet ACL (tagOwners, exit-node auto-approver, and subnet-route auto-approver) and must be
-  run before the per-host Tailscale playbooks (`nodes/infrastructure/tailscale.yml`,
-  `ipkvm/infrastructure/tailscale.yml`) so the tags they assign via the API are recognized and
-  any advertised LAN subnet routes are auto-approved on first advertisement. Running out of order
-  leaves routes pending in the admin console; the next push of the shared playbook re-evaluates
-  and approves them.
-  ```sh
-  just deploy shared infrastructure tailscale
-  just deploy nodes infrastructure tailscale
-  just deploy ipkvm infrastructure tailscale
-  ```
-- **Cluster master credentials in the pass store**: every cluster-level master key — the etcd
-  encryption-at-rest key plus the OpenBao unseal keys + root token — lives in the operator's
-  `pass` store (`~/.password-store/`). Secrets are namespaced under `pass_namespace` to avoid
-  collision
-  with other pass entries. The store must be initialized before running cluster playbooks:
-  `pass init <PASS_GPG_KEY_ID>`. `cluster/bootstrap.yml` generates and stores the etcd key at
-  `<pass_namespace>/kubernetes/etcd-encryption-key`. `cluster/secrets.yml` populates
-  `<pass_namespace>/openbao/unseal-key-1..5` and `<pass_namespace>/openbao/root-token`. A backup
-  of `~/.password-store/` covers the cluster's entire master-key set.
-- **etcd encryption at rest**: `cluster/bootstrap.yml` enables AES-CBC encryption for all
-  Kubernetes Secret resources. The 32-byte AES key is generated on the Ansible host on first
-  install and stored in the pass store at `kubernetes/etcd-encryption-key` (see above); the
-  playbook then renders `/etc/kubernetes/encryption/encryption-config.yaml` from that pass entry,
-  mounts the directory read-only into the kube-apiserver pod, and patches the static pod manifest
-  to consume it via `--encryption-provider-config`. After the apiserver picks the config up, the
-  playbook re-encrypts every existing Secret with a `kubectl get secrets -A -o json | kubectl
-  replace -f -` pass. The key never leaves the pass store or that single config file on the
-  control plane, and never goes to git. If the control-plane file is ever lost, re-running
-  `bootstrap.yml` reads the existing key from the pass store and restores the file (no ciphertext
-  rotation needed). To rotate, edit the config file on the control plane by hand and update the
-  pass entry (`pass edit kubernetes/etcd-encryption-key`), add the new key as the FIRST entry
-  under `keys:`, leave the old one as the second, and re-run `bootstrap.yml`.
-- **Pod Security Admission**: `cluster/security.yml` configures the kube-apiserver with a
-  cluster-wide default Pod Security Standard (`restricted`) so every namespace is protected by
-  default. Only true infrastructure namespaces (`kube-system`, `longhorn-system`, `cnpg-system`,
-  `cert-manager`, `observability`, `falco`, `kyverno`) are listed in the apiserver-level
-  `psa_exempt_namespaces` list. App service namespaces stay on the `restricted` default; if a
-  service needs to opt out (e.g. `vllm` for hostPath GPU access), the service playbook applies a
-  `pod-security.kubernetes.io/enforce=privileged` label on its own namespace. Adding a new service
-  therefore does not require editing `cluster/security.yml`. The playbook patches the static
-  `kube-apiserver.yaml` pod manifest; the kubelet reloads the apiserver automatically. Run after
-  `cluster/authentication.yml`:
-  ```sh
-  just deploy nodes cluster security
-  ```
-- **Falco**: `cluster/security.yml` also deploys Falco as a DaemonSet via the
-  `falcosecurity/falco` Helm chart. Falco monitors kernel syscalls using the modern eBPF driver
-  (CO-RE, no kernel module required) and evaluates events against the default ruleset plus custom
-  homelab rules. Falcosidekick forwards alerts to Alertmanager (`observability.yml` must be
-  deployed first). The `falco` namespace is exempt from PSA enforcement because Falco pods require
-  elevated kernel capabilities. To trigger a test detection:
-  ```sh
-  kubectl -n default run falco-test --image=alpine --restart=Never --rm -it -- sh
-  ```
-- **Open WebUI and vLLM**: Open WebUI (`service/openwebui.yml`) connects to vLLM
-  (`service/vllm.yml`) using the vLLM API key from the `vllm-credentials` Secret. vLLM must be
-  deployed first. Open WebUI's built-in authentication is disabled — access is gated entirely by
-  Traefik ForwardAuth (Authentik). The `vllm_host` inventory variable controls which nodes run a
-  vLLM instance.
-- **Jellyfin**: Jellyfin (`service/jellyfin.yml`) is a self-hosted media server deployed via the
-  official Helm chart. All access is gated by Traefik ForwardAuth backed by Authentik — no OIDC
-  plugin is required. The HTTPRoute and ForwardAuth Middleware are applied by the Jellyfin playbook
-  itself.
-- **Home Assistant**: Home Assistant (`service/home-assistant.yml`) is deployed via ArgoCD from
-  native Kubernetes manifests built around the official container image. Access is intentionally
-  NOT gated by Traefik ForwardAuth: the iOS/Android companion apps authenticate against Home
-  Assistant's own login and then call `/api/*` and `/api/websocket` with Bearer tokens, which
-  cannot follow SSO redirects (the same trade-off as vLLM and Zotero). Home Assistant's built-in
-  authentication is the security boundary — enable multi-factor authentication in the user profile
-  after onboarding. The namespace is labeled with the `baseline` Pod Security profile because the
-  official image runs as root. Configuration, the SQLite recorder database, and integrations live
-  on a Longhorn PVC at `/config`; an initContainer seeds `configuration.yaml` on first boot with
-  `trusted_proxies` set to the pod network CIDR so requests proxied by the Traefik gateway are
-  accepted. No radio hardware is attached to the Home Assistant pod: Thread/Matter support (Home
-  Assistant Connect ZBT-2 radio, OpenThread Border Router, Matter server) will be deployed as
-  separate workloads that Home Assistant reaches over the network.
-- **Thread (OpenThread Border Router)**: `service/thread.yml` deploys the OpenThread Border
-  Router driving the Home Assistant Connect ZBT-2 USB radio (which must first be flashed with the
-  OpenThread RCP firmware via the Open Home Foundation Device Toolbox — it ships with Zigbee
-  firmware). The `thread_radio_host` inventory flag marks the node holding the radio (exactly one
-  node, with its stable serial path in `thread_radio_device_path`); both workloads pin there via
-  nodeSelector in the `thread` namespace. Device access follows least privilege: a
-  `generic-device-plugin` DaemonSet advertises the radio and `/dev/net/tun` to the kubelet as
-  allocatable resources (`squat.ai/zbt2`, `squat.ai/tun`), so the OTBR container runs
-  **unprivileged** with only `NET_ADMIN` + `NET_RAW` + `IPC_LOCK` and hostNetwork — no hostPath
-  device mounts. Only the small device-plugin binary runs privileged (a kubelet device-plugin API
-  requirement), and the playbook applies the IPv6 forwarding sysctls on the radio host that a
-  privileged OTBR would otherwise set itself. The OTBR image is **built on the radio host** from
-  the OpenThread source with the `mDNSResponder` mDNS backend and consumed with
-  `imagePullPolicy: Never` (no registry); this backend port-shares UDP 5353 with the Matter
-  server's embedded mDNS, whereas the stock native-backend image grabs 5353 exclusively and the
-  border router becomes undiscoverable. The Thread network dataset lives on a Longhorn PVC. No
-  HTTPRoute is
-  created: the OTBR REST API listens on the radio host's LAN IP on the `otbr_rest` port from
-  `ufw_allowed_ports`, which `infrastructure/network.yml` also opens from the pod CIDR so the
-  Home Assistant pod can reach it. A ClusterIP Service fronts the endpoint so Home Assistant's
-  OpenThread Border Router integration uses a stable in-cluster name,
-  `http://otbr.thread.svc.cluster.local:<OTBR_REST_PORT>`, that survives a radio-host change;
-  LAN clients use `http://<RADIO_HOST_IP>:<OTBR_REST_PORT>` directly.
-- **Matter server**: `service/thread.yml` also deploys the Matter.js Open Home Foundation server
-  (`matterjs-server`), the Matter controller through which Home Assistant commissions and controls
-  Matter-over-Thread devices (its device traffic transits OTBR as ordinary routed IPv6 — the two
-  never talk at the application level). It is a drop-in for the older `python-matter-server`
-  websocket protocol, so Home Assistant connects unchanged; critically its mDNS sets
-  `SO_REUSEPORT`, so it **port-shares UDP 5353** with the OTBR mDNSResponder on the same host
-  (the older CHIP server bound 5353 exclusively and could not coexist — this is what makes the
-  single-node layout work). It runs unprivileged (all capabilities dropped) with hostNetwork,
-  since commissioning uses mDNS/IPv6 on the real LAN, and is pinned to the radio host because only
-  that node has direct routes to the Thread mesh. Matter fabric credentials live on a Longhorn
-  PVC — losing it means re-commissioning every device. Home Assistant's Matter integration
-  connects through a ClusterIP Service at
-  `ws://matter-server.thread.svc.cluster.local:<MATTER_SERVER_PORT>/ws` (the `matter_server`
-  port from `ufw_allowed_ports`, also opened from the pod CIDR by `infrastructure/network.yml`
-  for LAN/IP access).
-- **OpenBao secrets engine**: `cluster/secrets.yml` installs OpenBao (single-replica StatefulSet),
-  the External Secrets Operator, Stakater Reloader, and a cluster-scoped `openbao` SecretStore.
-  Reloader rolls any workload annotated with `reloader.stakater.com/auto: "true"` whenever an
-  ESO-materialized Secret changes, completing the OpenBao -> ESO -> K8s Secret -> running pod
-  rotation pipeline. The five unseal keys plus the initial root token are persisted to the pass
-  store on the Ansible host (see *Cluster master credentials* above) — nothing is written to
-  `group_vars` or rendered Helm values. The pass store is only accessed when OpenBao is sealed or
-  `openbao_force_reconfigure=true` is passed; on healthy already-unsealed clusters the playbook is
-  a fast no-op. Local tooling
-  required: `bao`, `kubectl`, `helm`, `jq`, `curl`; the host resolver must point at bind9 (see
-  *Local DNS Resolution* below). The API is exposed at `openbao.<DNS_ZONE>/v1/*`
-  (token-authenticated, no ForwardAuth). After every cluster reboot OpenBao comes up sealed;
-  re-running the same command unseals it:
-  ```sh
-  just deploy nodes cluster secrets
-  ```
-  The web UI is enabled in the pod but only reachable after `cluster/authentication.yml` runs,
-  which adds a `/`-prefix HTTPRoute gated by Authentik ForwardAuth (so `openbao.<DNS_ZONE>/ui/`
-  requires SSO, then OpenBao's own login). `authentication.yml` also sources the Authentik
-  bootstrap password from OpenBao via ESO instead of `group_vars`. For ad-hoc CLI work:
-  ```sh
-  just bao-shell             # subshell with BAO_ADDR, BAO_SKIP_VERIFY, BAO_TOKEN preset
-  just bao-token | pbcopy    # copy the root token for the UI Token auth method
-  ```
-- **Local DNS Resolution**: To resolve homelab services (e.g., `*.homelab.internal`) from your
-  local machine, configure your OS to use the cluster's Bind9 LoadBalancer IP as its nameserver.
-  Note that Syncthing sync traffic uses a **dedicated LoadBalancer IP** (separate from the web GUI)
-  to ensure high-performance data transfer. Cluster nodes are configured automatically by
-  `cluster/network.yml`; the snippets below are for additional client machines.
-  - **macOS Setup**:
-    ```sh
-    sudo mkdir -p /etc/resolver
-    echo "nameserver <BIND9_LB_IP>" | sudo tee /etc/resolver/<DNS_ZONE>
-    ```
-  - **Linux Setup (systemd-resolved)**:
-    ```sh
-    sudo mkdir -p /etc/systemd/resolved.conf.d
-    printf '[Resolve]\nDNS=<BIND9_LB_IP>\nDomains=~<DNS_ZONE>\n' \
-      | sudo tee /etc/systemd/resolved.conf.d/<DNS_ZONE>.conf
-    sudo systemctl restart systemd-resolved
-    ```
-- **Flushing the local DNS cache**: If a service is unreachable or resolves to a stale IP after a
-  cluster change, flush the local DNS cache. Common triggers include deploying a new service,
-  changing a LoadBalancer IP, or redeploying Bind9:
-  ```sh
-  just flush-dns
-  ```
+| Location | Contains |
+|----------|----------|
+| `CLAUDE.md` | Standing rules that apply to every session — conventions, working style, and what an agent may do directly versus what it must ask for |
+| `.claude/rules/` | Conventions scoped to particular files through a `paths:` field in each rule's front matter. A rule loads only when a matching file is read, keeping file-specific guidance out of sessions that never touch those files |
+| `.claude/skills/` | Procedures invoked on demand rather than applied continuously — `polish` cleans up a session's changes, and `finalize` prepares them for a commit |
