@@ -15,11 +15,14 @@ venv:
 # +----------------------------------------------------------------------------+
 
 # Run a specific Ansible playbook on a subset of machines
-deploy group category playbook:
+# Trailing arguments are passed through to ansible-playbook, e.g.
+#   just deploy ipkvm infrastructure tailscale -e tailscale_upgrade=true
+deploy group category playbook *extra:
     uv run ansible-playbook \
         --ask-become-pass \
         -i inventory.yml \
-        "playbooks/{{ group }}/{{ category }}/{{ playbook }}.yml"
+        "playbooks/{{ group }}/{{ category }}/{{ playbook }}.yml" \
+        {{ extra }}
 
 # +----------------------------------------------------------------------------+
 # | Lint — validate Ansible playbooks with ansible-lint                        |

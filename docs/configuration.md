@@ -118,6 +118,8 @@ tailscale_tailnet: <TAILSCALE_TAILNET>
 tailscale_exit_node_tag: <TAILSCALE_EXIT_NODE_TAG>
 tailscale_client_tag: <TAILSCALE_CLIENT_TAG>
 tailscale_ssh_server_tag: <TAILSCALE_SSH_SERVER_TAG>
+tailscale_upgrade: <true|false>
+tailscale_min_version: <TAILSCALE_MIN_VERSION>
 ssh_identity_file: <SSH_IDENTITY_FILENAME>
 dropbear_identity_file: <DROPBEAR_IDENTITY_FILENAME>
 dropbear_pass_private: '{{ pass_namespace }}/dropbear/private-key'
@@ -133,6 +135,8 @@ dropbear_pass_public: '{{ pass_namespace }}/dropbear/public-key'
 | `lan_broadcast` | The LAN broadcast address, used by the `just wake` recipe to send Wake-on-LAN packets. |
 | `tailscale_tailnet` | Tailnet name, used for API calls against the tailnet's ACL. |
 | `tailscale_exit_node_tag`, `tailscale_client_tag`, `tailscale_ssh_server_tag` | ACL tags assigned to hosts. `shared/infrastructure/tailscale.yml` owns the tag definitions and must run before any per-host Tailscale playbook assigns them. |
+| `tailscale_upgrade` | Whether a Tailscale playbook run may upgrade an already installed client. Kept `false` so routine deploys never move the version — the IP KVM is the only always-on exit node, so a regression there costs remote access. Overridden per run with `-e tailscale_upgrade=true`, deploying the `ipkvm` and `nodes` playbooks together: neither package source can be pinned to a chosen version, so upgrading in step is what bounds the drift between them. |
+| `tailscale_min_version` | Lowest Tailscale client version accepted on any host, asserted after install and before joining the tailnet. A security floor rather than a freshness check — Tailscale publishes no support window, so the only floors that bind are the retroactive ones an advisory creates. |
 | `ssh_identity_file` | Filename (within `~/.ssh`) of the key used for normal node access. |
 | `dropbear_identity_file` | Filename of the *separate* key used to unlock LUKS from the initramfs. Deliberately distinct from `ssh_identity_file`: the initramfs environment is a minimal, pre-boot context, so its key is scoped to that job alone. |
 | `dropbear_pass_private`, `dropbear_pass_public` | `pass` store paths for that keypair, templated off `pass_namespace` so the namespace is set in one place. |

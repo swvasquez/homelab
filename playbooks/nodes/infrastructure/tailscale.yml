@@ -35,7 +35,9 @@
 #     Ansible control node.
 #   - Enables IP forwarding so the host can route exit-node traffic.
 #   - Adds the official Tailscale GPG key and APT repository.
-#   - Installs the Tailscale package.
+#   - Installs the Tailscale package, upgrading an existing install only when
+#     tailscale_upgrade is true.
+#   - Asserts the installed client is at or above tailscale_min_version.
 #   - Enables and starts the tailscaled service.
 #   - Connects the host to the Tailscale network, advertising it as an exit
 #     node and advertising lan_cidr as a subnet route when
@@ -55,6 +57,16 @@
 #   tailscale_ssh:       Whether to enable Tailscale SSH on this host,
 #                        allowing SSH access via the tailnet without a
 #                        separate SSH key.
+#   tailscale_upgrade:   Whether this run may upgrade an already installed
+#                        Tailscale client. False by default so a routine
+#                        deploy never moves the version. Run this playbook and
+#                        the IP KVM one together with it set so both groups
+#                        move at once; their versions still differ, since Arch
+#                        Linux ARM trails the Tailscale APT repository. Set in
+#                        group_vars/all.yml.
+#   tailscale_min_version:
+#                        Lowest Tailscale client version accepted on this host.
+#                        Set in group_vars/all.yml.
 #   lan_cidr:            CIDR of the homelab LAN, advertised as a subnet
 #                        route alongside the exit node so clients can reach
 #                        LAN destinations through this host. Set in
@@ -188,11 +200,19 @@
         # Installs the Tailscale package from the official APT repository and
         # configures the daemon listen port.
         # -----------------------------------------------------------------------
+        # This repository does accept a named version, but Tailscale prunes older
+        # .debs and the IP KVM's pacman source cannot install a named version at
+        # all, so a single tailscale_version pin would be unusable across the two
+        # groups. Upgrading both in one deliberate run is what bounds the drift
+        # between them, hence the tailscale_upgrade gate rather than a pin. The
+        # cache is refreshed only when upgrading, since 'present' would not act
+        # on a newer candidate anyway.
         - name: Install Tailscale package
           ansible.builtin.apt:
             name: tailscale
-            state: present
-            update_cache: false
+            state: "{{ 'latest' if tailscale_upgrade | bool else 'present' }}"
+            update_cache: '{{ tailscale_upgrade | bool }}'
+          notify: Restart tailscaled
 
         - name: Set Tailscale WireGuard listen port in daemon configuration
           ansible.builtin.lineinfile:
@@ -210,8 +230,31 @@
             state: started
 
         # Flush so any pending Restart tailscaled fires before 'tailscale up'.
+        # Otherwise an upgrade leaves the new binary on disk while the running
+        # daemon stays the old version, and 'tailscale up' talks to a stale
+        # tailscaled.
         - name: Flush handlers so tailscaled restart precedes tailscale up
           ansible.builtin.meta: flush_handlers
+
+        # Checked after the handler flush so the reported version is the one the
+        # restarted daemon is running, and before 'tailscale up' so a client
+        # below the floor never joins the tailnet.
+        - name: Read installed Tailscale version
+          ansible.builtin.command:
+            cmd: tailscale version --json
+          register: tailscale_version_result
+          changed_when: false
+
+        - name: Assert Tailscale meets the minimum version
+          ansible.builtin.assert:
+            that:
+              - (tailscale_version_result.stdout | from_json).short
+                is version(tailscale_min_version, '>=')
+            fail_msg: >-
+              Tailscale {{ (tailscale_version_result.stdout | from_json).short }}
+              is below tailscale_min_version ({{ tailscale_min_version }}).
+              Re-run with -e tailscale_upgrade=true to pull the current release
+              from the Tailscale APT repository.
 
         # -----------------------------------------------------------------------
         # Network Connection

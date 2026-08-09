@@ -41,7 +41,10 @@
 #     Ansible control node.
 #   - Remounts the root filesystem as read-write (PiKVM is read-only by default).
 #   - Enables IP forwarding so the host can route exit-node traffic.
-#   - Installs the Tailscale package from the official Arch Linux repository.
+#   - Installs the Tailscale package from the official Arch Linux ARM
+#     repository, upgrading an existing install only when tailscale_upgrade
+#     is true.
+#   - Asserts the installed client is at or above tailscale_min_version.
 #   - Enables and starts the tailscaled service.
 #   - Connects the host to the Tailscale network, advertising it as an exit
 #     node when tailscale_exit_node is true.
@@ -80,6 +83,13 @@
 #   tailscale_ssh:                Whether to enable Tailscale SSH on this host,
 #                                 allowing SSH access via the tailnet without a
 #                                 separate SSH key.
+#   tailscale_upgrade:            Whether this run may upgrade an already
+#                                 installed Tailscale client. False by default so
+#                                 a routine deploy never moves the version on the
+#                                 only always-on exit node. Set in
+#                                 group_vars/all.yml.
+#   tailscale_min_version:        Lowest Tailscale client version accepted on
+#                                 this host. Set in group_vars/all.yml.
 #   pass_namespace:               Top-level folder in the pass store. The auth
 #                                 and API keys are read from
 #                                 '<pass_namespace>/tailscale/auth-key' and
@@ -215,11 +225,18 @@
             - Reload systemd
             - Restart tailscaled
 
+        # Arch Linux ARM carries only the current version of a package and has
+        # no official archive, so a named version cannot be installed here:
+        # 'present' leaves whatever is installed alone, and 'latest' takes
+        # whatever the repository currently holds. The package database is
+        # synced only when upgrading, so a routine run cannot leave a refreshed
+        # database against un-upgraded packages — a partial-upgrade state Arch
+        # does not support.
         - name: Install Tailscale package
           community.general.pacman:
             name: tailscale
-            state: latest
-            update_cache: true
+            state: "{{ 'latest' if tailscale_upgrade | bool else 'present' }}"
+            update_cache: '{{ tailscale_upgrade | bool }}'
           notify: Restart tailscaled
 
         # ---------------------------------------------------------------------
@@ -248,6 +265,26 @@
         # to a stale tailscaled (caught us with the 1.92.3 routing regression).
         - name: Flush handlers so tailscaled restart precedes tailscale up
           ansible.builtin.meta: flush_handlers
+
+        # Checked after the handler flush so the reported version is the one the
+        # restarted daemon is running, and before 'tailscale up' so a client
+        # below the floor never joins the tailnet.
+        - name: Read installed Tailscale version
+          ansible.builtin.command:
+            cmd: tailscale version --json
+          register: tailscale_version_result
+          changed_when: false
+
+        - name: Assert Tailscale meets the minimum version
+          ansible.builtin.assert:
+            that:
+              - (tailscale_version_result.stdout | from_json).short
+                is version(tailscale_min_version, '>=')
+            fail_msg: >-
+              Tailscale {{ (tailscale_version_result.stdout | from_json).short }}
+              is below tailscale_min_version ({{ tailscale_min_version }}).
+              Re-run with -e tailscale_upgrade=true, or if this host is already
+              upgraded, the Arch Linux ARM repository has not yet caught up.
 
         - name: Connect to Tailscale network
           ansible.builtin.command:

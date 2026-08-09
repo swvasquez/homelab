@@ -191,6 +191,49 @@ change — a new service, a changed LoadBalancer IP, a redeployed Bind9:
 just flush-dns
 ```
 
+### Upgrade the Tailscale clients
+
+Routine Tailscale runs never change the installed version — `tailscale_upgrade`
+is `false` in `group_vars/all.yml`, so both playbooks install the client if it is
+missing and otherwise leave it alone. Upgrade deliberately, from home, with both
+groups in one sitting:
+
+```bash
+just deploy ipkvm infrastructure tailscale -e tailscale_upgrade=true
+just deploy nodes infrastructure tailscale -e tailscale_upgrade=true
+```
+
+Neither source can be pinned to a chosen version. The IP KVM installs from Arch
+Linux ARM, which carries only the current version of a package and has no
+official archive, so it cannot be told to install a named version; the nodes
+install from Tailscale's APT repository, which accepts a named version but prunes
+old `.deb`s. A single `tailscale_version` pin is therefore unusable across the
+two groups, and upgrading in step stands in for one.
+
+That does not produce identical versions. Arch Linux ARM packages Tailscale well
+behind Tailscale's own APT repository, so the IP KVM normally trails the nodes by
+a stable release or two even immediately after both playbooks run. Upgrading
+together bounds the gap rather than closing it; `tailscale_min_version` below is
+what actually guarantees no host sits on a version you have not accepted.
+
+Upgrading is gated rather than automatic because the IP KVM is the only exit node
+that is always powered on — the two cluster-node exit nodes are shut down on a
+schedule and woken by WoL — so a regression on it costs remote access while away.
+That is not hypothetical: Tailscale 1.92.3 shipped a routing regression, and
+upstream pulled 1.86.0 across every platform for the same reason. Tailscale's own
+auto-updater soaks a release for roughly a week before rolling it out; a playbook
+run offers no soak at all, which is why the freshest release is the wrong default
+for this host.
+
+Both playbooks assert the installed client is at or above `tailscale_min_version`
+before joining the tailnet. That floor is a security bound, not a freshness
+check: Tailscale publishes no support window or minimum version, and old clients
+keep working against the coordination server indefinitely, so the only floors
+that ever bind are the retroactive ones an advisory creates. Raise the value in
+`group_vars/all.yml` when an advisory raises the bar. A failure on a host you
+have not upgraded in a long while is the assert doing its job — re-run that group
+with `tailscale_upgrade=true`.
+
 ### Rotate the etcd encryption key
 
 `cluster/bootstrap.yml` encrypts all Kubernetes Secret resources at rest with

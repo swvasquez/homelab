@@ -5,8 +5,8 @@
 # Pushes the Tailscale tailnet ACL via the REST API. The ACL defines the
 # exit-node and client tagOwners, marks the exit-node tag as auto-approved
 # both as an exit node and for advertising the homelab LAN as a subnet
-# route, and restricts exit-node use and Tailscale SSH to nodes carrying
-# the client tag.
+# route, and restricts exit-node use and Tailscale SSH to devices carrying
+# the client tag or owned by a tailnet admin.
 #
 # The subnet-route auto-approver is what lets a remote client reach LAN
 # IPs (router, cluster nodes, LoadBalancer VIPs) through the exit node.
@@ -29,9 +29,12 @@
 #
 # Variables (set in group_vars/all.yml unless noted):
 #   tailscale_exit_node_tag:  Tag carried by exit-node hosts.
-#   tailscale_client_tag:     Tag carried by clients (laptops, phones)
-#                             permitted to use the exit node and SSH into
-#                             ssh-server hosts.
+#   tailscale_client_tag:     Tag carried by clients permitted to use the
+#                             exit node and SSH into ssh-server hosts. Only
+#                             usable for devices that never authenticate
+#                             interactively, since a user login strips tags;
+#                             personal devices are matched by the
+#                             'autogroup:admin' entry alongside it instead.
 #   tailscale_ssh_server_tag: Tag carried by hosts that accept Tailscale
 #                             SSH connections.
 #   lan_cidr:                 CIDR of the homelab LAN, auto-approved as a
@@ -85,7 +88,21 @@
     # ranges; without an explicit grant the controller filters the LAN
     # subnet out of the client's network map and the client daemon
     # silently drops RFC1918-bound traffic. The ssh block permits
-    # Tailscale SSH from the same clients.
+    # Tailscale SSH from the same sources.
+    #
+    # Both blocks list 'autogroup:admin' alongside the client tag because a
+    # tag cannot survive an interactive login: Tailscale treats a device as
+    # carrying tags or a user account but never both, so authenticating with
+    # a user account strips every tag. Personal devices — the laptop and
+    # phones — re-authenticate through SSO whenever the app is signed in
+    # again, which silently drops them out of a tag-scoped rule and cuts
+    # exit-node, internet, and LAN access with no error anywhere. Matching
+    # them by identity instead is the only durable grant. The client tag is
+    # kept for devices that are deliberately tagged and never logged into.
+    # The ssh block needs the entry for the same reason and independently: an
+    # acls grant does not authorize Tailscale SSH, which is evaluated against
+    # the ssh block alone, so omitting the autogroup there would leave every
+    # host running an SSH server (tailscale_ssh) no personal device could use.
     # -------------------------------------------------------------------------
     - name: Build Tailscale ACL body
       ansible.builtin.set_fact:
@@ -103,6 +120,7 @@
             - action: accept
               src:
                 - '{{ tailscale_client_tag }}'
+                - 'autogroup:admin'
               dst:
                 - '{{ tailscale_exit_node_tag }}:*'
                 - 'autogroup:internet:*'
@@ -111,6 +129,7 @@
             - action: accept
               src:
                 - '{{ tailscale_client_tag }}'
+                - 'autogroup:admin'
               dst:
                 - '{{ tailscale_ssh_server_tag }}'
               users:

@@ -53,10 +53,12 @@ Playbooks live under `playbooks/`, organized by Ansible inventory group, then by
 To run a Playbook, specify the inventory group, category, and Playbook name
 
 ```sh
-just deploy <GROUP> <CATEGORY> <PLAYBOOK>
+just deploy <GROUP> <CATEGORY> <PLAYBOOK> [ANSIBLE_ARGS...]
 ```
 
-The structure of the commands should mirror the Playbook directory layout.
+The structure of the commands should mirror the Playbook directory layout. Any
+trailing arguments are passed through to `ansible-playbook`, which is how one-off
+overrides are applied.
 
 **Examples**
 
@@ -65,6 +67,7 @@ just deploy nodes infrastructure docker
 just deploy nodes cluster observability
 just deploy shared infrastructure tailscale
 just deploy ipkvm infrastructure tailscale
+just deploy ipkvm infrastructure tailscale -e tailscale_upgrade=true
 ```
 
 ## Documentation
