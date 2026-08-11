@@ -10,6 +10,12 @@
 !playbooks/*/*/scripts/*
 !docs
 !docs/*.md
+!.devcontainer
+!.devcontainer/devcontainer.json
+!.devcontainer/devcontainer-lock.json
+!.devcontainer/Dockerfile
+!.devcontainer/firewall.sh
+!.devcontainer/managed-settings.json
 !.claude
 !.claude/rules
 !.claude/rules/*.md

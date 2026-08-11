@@ -20,6 +20,8 @@ The following tools should be installed before deploying any of the Playbooks
 | [bao](https://openbao.org/) | OpenBao CLI for secret management within the cluster |
 | [gnupg](https://gnupg.org/) | GPG, which encrypts the `pass` store |
 | [pass](https://www.passwordstore.org/) | Password store that holds various keys to access and manage cluster resources |
+| [docker](https://www.docker.com/) | Container runtime that hosts the dev container |
+| [npm](https://www.npmjs.com/) | Node package manager; `just devcontainer-up` uses `npx` to run the `devcontainer` CLI |
 
 ## Setup
 
@@ -112,3 +114,27 @@ As noted, this codebase has been developed with AI assistance. Guidelines for th
 | `CLAUDE.md` | Standing rules that apply to every session — conventions, working style, and what an agent may do directly versus what it must ask for |
 | `.claude/rules/` | Conventions scoped to particular files through a `paths:` field in each rule's front matter. A rule loads only when a matching file is read, keeping file-specific guidance out of sessions that never touch those files |
 | `.claude/skills/` | Procedures invoked on demand rather than applied continuously — `polish` cleans up a session's changes, and `finalize` prepares them for a commit |
+
+## Devcontainer
+
+`.devcontainer/` defines a sandboxed container where Claude Code can access source code and run tasks. The dev container does not have access to the LAN or Kubernetes cluster, but does have access to the WAN. The assumption is that the user will interact with the agent, run commands on its behalf, and share the output for it to assess.
+
+Dev containers are long-running containers. You start the dev container via
+
+```sh
+just devcontainer-up
+```
+
+You then connect to the running container for development via
+
+```sh
+just devcontainer-shell
+```
+
+| Input | Source |
+|-------|--------|
+| Repository | Bind-mounted from the host at `/workspaces/homelab` |
+| Ansible | Installed on first start by `just venv`, into a volume separate from the host's `.venv` |
+| Agent credentials | Entered once on first use and kept in a volume |
+
+Note that `just devcontainer-up` rebuilds the dev container image and terminates any existing dev containers.
