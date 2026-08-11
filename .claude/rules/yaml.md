@@ -17,6 +17,6 @@ paths:
   clearer option rather than restructuring the value to fit.
 
 `yamllint`'s `quoted-strings` rule enforces this and is deliberately left off: it
-reports 400+ findings across the existing playbooks, and `just lint` runs on
-pre-push. Don't enable it outside a dedicated cleanup pass — and note that adding a
-`.yamllint` replaces ansible-lint's bundled defaults rather than extending them.
+reports 400+ findings across the existing playbooks. Don't enable it outside a
+dedicated cleanup pass — and note that adding a `.yamllint` replaces
+ansible-lint's bundled defaults rather than extending them.

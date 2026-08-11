@@ -24,7 +24,6 @@
 !.claude/skills/*/*.md
 !.gitignore
 !.gitattributes
-!.pre-commit-config.yaml
 !CLAUDE.md
 !justfile
 !README.md

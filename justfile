@@ -9,7 +9,7 @@ set script-interpreter := ["bash", "-eu"]
 # Create a virtual environment and install dependencies
 venv:
     uv venv
-    uv pip install ansible-dev-tools pre-commit
+    uv pip install ansible-dev-tools
 
 # +----------------------------------------------------------------------------+
 # | Devcontainer — run tooling inside an isolated container                    |
