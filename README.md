@@ -22,6 +22,7 @@ The following tools should be installed before deploying any of the Playbooks
 | [pass](https://www.passwordstore.org/) | Password store that holds various keys to access and manage cluster resources |
 | [docker](https://www.docker.com/) | Container runtime that hosts the dev container |
 | [npm](https://www.npmjs.com/) | Node package manager; `just devcontainer-up` uses `npx` to run the `devcontainer` CLI |
+| [sbx](https://docs.docker.com/ai/sandboxes/) | Docker Sandboxes CLI; `just sbx-up` uses it to run the agent sandbox |
 
 ## Setup
 
@@ -136,5 +137,35 @@ just devcontainer-shell
 | Repository | Bind-mounted from the host at `/workspaces/homelab` |
 | Ansible | Installed on first start by `just venv`, into a volume separate from the host's `.venv` |
 | Agent credentials | Entered once on first use and kept in a volume |
+| Egress rules | The reserved ranges named in `.devcontainer/firewall.sh`, reapplied on every start |
+
+The `.venv`, the uv cache, and the agent's credentials are persisted in named volumes keyed to `${devcontainerId}`, which is stable across rebuilds; everything else in the container is not.
 
 Note that `just devcontainer-up` rebuilds the dev container image and terminates any existing dev containers.
+
+## Sandbox
+
+`.sbx/` defines a Docker Sandboxes microVM serving the same purpose as the dev container, kept alongside it for comparison. The sandbox does not have access to the LAN, the Kubernetes cluster, or the tailnet, but does have access to the WAN. It carries no SSH keys and no cluster credentials, so the operator remains the only path to the homelab.
+
+Sandboxes are long-running microVMs. You build and start one via
+
+```sh
+just sbx-up
+```
+
+You then connect to the running sandbox for development via
+
+```sh
+just sbx-shell
+```
+
+| Input | Source |
+|-------|--------|
+| Repository | Bind-mounted from the host |
+| Ansible | Installed at creation by `just venv`, into `/opt/venv` outside the mount |
+| Agent credentials | Entered once via `just sbx-login` and held in the host's credential store, never inside the sandbox |
+| Egress rules | Reserved ranges named in the `justfile`; the LAN and DNS zone read from `group_vars/all.yml` |
+
+Claude's session history and the uv cache are persisted under `.sbx/` in the repository, which is bind-mounted and therefore on the host; credentials are persisted in the host's operating system credential store. Both are ignored by `.gitignore`. Everything else, `/opt/venv` included, lives in the sandbox and is rebuilt with it.
+
+Note that `just sbx-up` replaces the sandbox and terminates any existing one.

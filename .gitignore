@@ -16,6 +16,9 @@
 !.devcontainer/Dockerfile
 !.devcontainer/firewall.sh
 !.devcontainer/managed-settings.json
+!.sbx
+!.sbx/kit
+!.sbx/kit/spec.yaml
 !.claude
 !.claude/rules
 !.claude/rules/*.md
