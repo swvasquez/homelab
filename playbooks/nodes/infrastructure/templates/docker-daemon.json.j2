@@ -1,0 +1,22 @@
+{#
+  Docker daemon configuration.
+
+  live-restore keeps containers running while dockerd restarts. It matters here
+  because the kubelet reaches containerd through the cri-dockerd shim, which
+  means every cluster container is a Docker container: without this setting, a
+  routine 'apt upgrade' that happens to pull a new Docker version stops every
+  pod on the node. containerd itself needs no equivalent — its per-container
+  shim processes survive a daemon restart by design.
+
+  This defers the restart rather than removing it. Containers keep using the
+  runtime they were started with, so an upgraded runtime does not apply to them
+  (including its security fixes) until they are recreated — drain the node to
+  do that at a time of your choosing. Deferring is the whole point: installing
+  the update stops being the same event as disrupting the cluster.
+
+  Docker supports live restore across patch-level daemon upgrades. A larger
+  version jump may stop containers regardless, so it is not a guarantee.
+#}
+{
+  "live-restore": {{ docker_live_restore | bool | to_json }}
+}

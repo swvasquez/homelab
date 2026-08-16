@@ -17,7 +17,7 @@ The hardware and operating systems underneath Layer 0 are described in
 
 | Layer | Purpose | Components |
 |-------|---------|-----------|
-| **0 — Node foundation** | Turn bare hosts into cluster members | kubelet, kubeadm, kubectl, cri-dockerd, Helm, k9s, chrony |
+| **0 — Node foundation** | Turn bare hosts into cluster members | kubelet, kubeadm, kubectl, containerd, Docker Engine, cri-dockerd, Helm, k9s, chrony |
 | **1 — Cluster core** | Make the cluster schedulable and safe by default | Metrics Server, Pod Security Admission |
 | **2 — Infrastructure** | Networking, storage, and the ingress front door | Cilium, Hubble, Cilium CLI, Gateway API CRDs, Traefik, cert-manager, Bind9, ExternalDNS, Longhorn, open-iscsi, nfs-common |
 | **3 — Platform services** | Shared backends that applications consume | CloudNativePG, OpenBao, External Secrets Operator, Stakater Reloader, Authentik, Prometheus, Alertmanager, Grafana, node-exporter, kube-state-metrics |
@@ -29,8 +29,10 @@ The hardware and operating systems underneath Layer 0 are described in
 ## Layer 0 — Node Foundation
 
 The base tooling that turns each bare host into a Kubernetes cluster member: the
-node agent, the runtime bridge, and the CLIs used to build and operate the
-cluster. Installed by `cluster/kubernetes.yml`.
+node agent, the container runtime and the bridge Kubernetes reaches it through,
+and the CLIs used to build and operate the cluster. Installed by
+`cluster/kubernetes.yml`, except containerd and Docker Engine, which come from
+`infrastructure/docker.yml`.
 
 ### kubelet
 The primary Kubernetes node agent, installed as a system package on every node.
@@ -45,6 +47,25 @@ certificates and join tokens.
 ### kubectl
 The standard Kubernetes command-line client for interacting with the cluster
 API. It is used for inspecting, creating, and managing all cluster resources.
+
+### containerd
+The container runtime that actually runs every container on the node. It pulls
+and stores images, unpacks their layers, and supervises container processes
+through runc. It arrives as a dependency of the `containerd.io` package but is
+not Docker's private component: Docker and Kubernetes both run their containers
+through this one daemon, kept apart by containerd namespaces — Docker works in
+`moby`, Kubernetes in `k8s.io`. Because containerd's garbage collection only
+considers references within a single namespace, `docker system prune` cannot
+reach cluster images. Placing an image where the kubelet can see it therefore
+means targeting that namespace explicitly, with `ctr -n k8s.io`.
+
+### Docker Engine
+The container platform comprising the `dockerd` daemon, the `docker` CLI, and
+the Buildx and Compose plugins. It is kept on the nodes both for direct use and
+because Kubernetes reaches containerd through it. It runs with `live-restore`
+enabled so that upgrading the Docker package does not stop running containers —
+without it, an `apt upgrade` that happens to include a new Docker version would
+stop every pod on the node as a side effect of unrelated OS patching.
 
 ### cri-dockerd
 A Container Runtime Interface (CRI) shim that bridges Kubernetes to the Docker

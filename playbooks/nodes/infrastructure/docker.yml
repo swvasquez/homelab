@@ -2,7 +2,22 @@
 # ==============================================================================
 # Playbook: Install and Configure Docker
 # ==============================================================================
-# Installs and configures Docker Engine and Docker Compose.
+# Installs and configures Docker Engine and Docker Compose, and manages the
+# containerd runtime that both Docker and the cluster depend on.
+#
+# containerd arrives here as a Docker dependency (the containerd.io package),
+# but it is not Docker's private component — it is the container runtime for
+# the whole node. The kubelet reaches it through the cri-dockerd shim, so every
+# cluster container is ultimately run by the same daemon that runs Docker's.
+# The two are kept apart by containerd namespaces: Docker works in 'moby' and
+# Kubernetes in 'k8s.io', and containerd's garbage collection only ever
+# considers references within a single namespace. That is why one daemon can
+# serve both without 'docker system prune' being able to reach cluster images.
+#
+# Nothing separate is installed for the cluster's benefit. Anything that needs
+# to place an image where the kubelet can see it uses 'ctr -n k8s.io', which
+# ships with containerd.io — deliberately, rather than adding a second
+# toolchain alongside the one Docker already provides.
 #
 # This playbook performs the following actions:
 #   - Installs prerequisite packages (ca-certificates, curl).
@@ -10,14 +25,21 @@
 #   - Installs Docker Engine, CLI, containerd, and Docker Compose plugin.
 #   - Adds the current user to the 'docker' group to manage Docker as a
 #     non-root user.
-#   - Starts and enables the Docker service.
+#   - Writes the Docker daemon configuration, enabling live restore so that
+#     upgrading Docker does not stop running containers.
+#   - Starts and enables the containerd and Docker services.
 #
 # Variables:
-#   docker_prereq_packages:  List of APT packages required to add Docker's
-#                            repository (default: [ca-certificates, curl]).
-#   docker_packages:         List of Docker APT packages to install
-#                            (default: [docker-ce, docker-ce-cli, containerd.io,
-#                            docker-buildx-plugin, docker-compose-plugin]).
+#   docker_prereq_packages:    List of APT packages required to add Docker's
+#                              repository (default: [ca-certificates, curl]).
+#   docker_packages:           List of Docker APT packages to install
+#                              (default: [docker-ce, docker-ce-cli,
+#                              containerd.io, docker-buildx-plugin,
+#                              docker-compose-plugin]).
+#   docker_daemon_config_path: Path to the Docker daemon configuration file
+#                              (default: /etc/docker/daemon.json).
+#   docker_live_restore:       Whether containers keep running across a Docker
+#                              daemon restart (default: true).
 
 - name: Install and configure Docker
   hosts: nodes
@@ -33,6 +55,8 @@
       - containerd.io
       - docker-buildx-plugin
       - docker-compose-plugin
+    docker_daemon_config_path: /etc/docker/daemon.json
+    docker_live_restore: true
 
   tasks:
     # -------------------------------------------------------------------------
@@ -42,14 +66,14 @@
     # -------------------------------------------------------------------------
     - name: Install prerequisite packages for Docker repository
       ansible.builtin.apt:
-        name: "{{ docker_prereq_packages }}"
+        name: '{{ docker_prereq_packages }}'
         state: present
 
     - name: Ensure /etc/apt/keyrings directory exists
       ansible.builtin.file:
         path: /etc/apt/keyrings
         state: directory
-        mode: "0755"
+        mode: '0755'
 
     # -------------------------------------------------------------------------
     # Repository Configuration
@@ -60,7 +84,7 @@
       ansible.builtin.get_url:
         url: https://download.docker.com/linux/ubuntu/gpg
         dest: /etc/apt/keyrings/docker.asc
-        mode: "0644"
+        mode: '0644'
 
     - name: Add the official Docker APT repository
       ansible.builtin.apt_repository:
@@ -72,24 +96,74 @@
         update_cache: true
 
     # -------------------------------------------------------------------------
-    # Installation and Service Configuration
-    # Installs Docker Engine and its plugins, grants the current user non-root
-    # access via the 'docker' group, and starts the Docker daemon on boot.
+    # Installation and User Access
+    # Installs Docker Engine and its plugins, and grants the current user
+    # non-root access via the 'docker' group.
     # -------------------------------------------------------------------------
     - name: Install Docker Engine, CLI, and plugins
       ansible.builtin.apt:
-        name: "{{ docker_packages }}"
+        name: '{{ docker_packages }}'
         state: present
         update_cache: true
 
     - name: Add user to the 'docker' group
       ansible.builtin.user:
-        name: "{{ ansible_user_id }}"
+        name: '{{ ansible_user_id }}'
         groups: docker
         append: true
+
+    # -------------------------------------------------------------------------
+    # Daemon Configuration
+    # Enables live restore, which keeps containers running while dockerd itself
+    # restarts. Every cluster container runs through dockerd on these nodes, so
+    # without it an 'apt upgrade' that happens to include a new Docker version
+    # stops every pod as a side effect of unrelated OS patching. See the
+    # template for why this defers the restart rather than removing it.
+    #
+    # The packages are deliberately NOT held at their installed version. A hold
+    # would trade an unscheduled outage for Docker silently dropping out of
+    # security patching, which is the worse failure on a node running the
+    # cluster's secrets. containerd needs neither treatment: its per-container
+    # shim processes survive a daemon restart by design.
+    #
+    # daemon.json is managed in full, not merged: any setting added by hand on
+    # a node is removed on the next run. Add it to the template instead.
+    # -------------------------------------------------------------------------
+    - name: Configure the Docker daemon
+      ansible.builtin.template:
+        src: docker-daemon.json.j2
+        dest: '{{ docker_daemon_config_path }}'
+        mode: '0644'
+        owner: root
+        group: root
+      notify: Reload Docker
+
+    # -------------------------------------------------------------------------
+    # Services
+    # containerd is started and enabled on its own footing rather than only as
+    # a dependency of docker.service. The containerd.io package already enables
+    # it, so this is normally a no-op — it is stated explicitly because the
+    # cluster's runtime should not be running as a side effect of Docker's unit
+    # when Docker is not what depends on it most.
+    # -------------------------------------------------------------------------
+    - name: Start and enable the containerd service
+      ansible.builtin.systemd:
+        name: containerd
+        state: started
+        enabled: true
 
     - name: Start and enable the Docker service
       ansible.builtin.systemd:
         name: docker
         state: started
         enabled: true
+
+  handlers:
+    # Reload rather than restart. live-restore is picked up by a daemon reload,
+    # and restarting dockerd to enable it would cause exactly the outage the
+    # setting exists to prevent — the protection is not yet in effect during
+    # the restart that turns it on.
+    - name: Reload Docker
+      ansible.builtin.systemd:
+        name: docker
+        state: reloaded
