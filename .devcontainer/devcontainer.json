@@ -38,9 +38,14 @@
     "UV_VENV_CLEAR": "1"
   },
 
+  // The settings are installed here rather than COPYed into the image because the
+  // build context is .devcontainer/, which cannot reach a file at the repository
+  // root; by this point the repository is mounted. /etc/claude-code is the highest
+  // settings precedence, so a checked-out branch cannot edit it away.
+  //
   // Volumes mount root-owned. -R because a volume ever written to as root keeps
   // root-owned subdirectories, which fail Claude Code's writes with EACCES.
-  "postCreateCommand": "sudo chown -R vscode:vscode .venv ~/.cache/uv ~/.claude && just venv",
+  "postCreateCommand": "sudo install -D -m 0644 .claude/managed-settings.json /etc/claude-code/managed-settings.json && sudo chown -R vscode:vscode .venv ~/.cache/uv ~/.claude && just venv",
 
   "postStartCommand": "sudo /usr/local/bin/firewall.sh",
 

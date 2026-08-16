@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(ansible:*)",
+      "Bash(ansible-playbook:*)",
+      "Bash(ansible-console:*)",
+      "Bash(ansible-pull:*)",
+      "Bash(uv run ansible:*)",
+      "Bash(uv run ansible-playbook:*)",
+      "Bash(ssh:*)",
+      "Bash(scp:*)",
+      "Bash(sftp:*)",
+      "Bash(rsync:*)",
+      "Read(//**/.ssh/**)",
+      "Edit(//**/.ssh/**)",
+      "Bash(just ping:*)",
+      "Bash(just deploy:*)",
+      "Bash(just reboot:*)",
+      "Bash(just wake:*)",
+      "Bash(just suspend:*)",
+      "Bash(just shutdown:*)",
+      "Bash(just destroy-cluster:*)"
+    ]
+  }
+}

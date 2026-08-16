@@ -108,11 +108,13 @@ just lint playbooks/nodes/cluster/bootstrap.yml
 
 ## AI Assistance
 
-As noted, this codebase has been developed with AI assistance. Guidelines for the AI coding agents are provided in the following files
+As noted, this codebase has been developed with AI assistance. Guidelines and configuration for the AI coding agents are provided in the following files
 
 | Location | Contains |
 |----------|----------|
 | `CLAUDE.md` | Standing rules that apply to every session — conventions, working style, and what an agent may do directly versus what it must ask for |
+| `.claude/settings.json` | Permission rules the agent harness enforces rather than leaving to the agent's judgment — denying the Ansible, SSH, and `just` invocations only the operator runs. Read from the mount, so the dev container and the sandbox share it |
+| `.claude/managed-settings.json` | The same, at a precedence a checked-out branch cannot override: remote-access denials, and the auto mode both environments run in. The dev container and the sandbox each install it to `/etc/claude-code/`, which is the only place Claude Code reads managed settings from — where the file sits in the repository it is inert |
 | `.claude/rules/` | Conventions scoped to particular files through a `paths:` field in each rule's front matter. A rule loads only when a matching file is read, keeping file-specific guidance out of sessions that never touch those files |
 | `.claude/skills/` | Procedures invoked on demand rather than applied continuously — `polish` cleans up a session's changes, and `finalize` prepares them for a commit |
 
@@ -137,6 +139,7 @@ just devcontainer-shell
 | Repository | Bind-mounted from the host at `/workspaces/homelab` |
 | Ansible | Installed on first start by `just venv`, into a volume separate from the host's `.venv` |
 | Agent credentials | Entered once on first use and kept in a volume |
+| Agent settings | `.claude/settings.json` from the mount, under `.claude/managed-settings.json`, installed to `/etc/claude-code/` on first start |
 | Egress rules | The reserved ranges named in `.devcontainer/firewall.sh`, reapplied on every start |
 
 The `.venv`, the uv cache, and the agent's credentials are persisted in named volumes keyed to `${devcontainerId}`, which is stable across rebuilds; everything else in the container is not.
@@ -164,6 +167,7 @@ just sbx-shell
 | Repository | Bind-mounted from the host |
 | Ansible | Installed at creation by `just venv`, into `/opt/venv` outside the mount |
 | Agent credentials | Entered once via `just sbx-login` and held in the host's credential store, never inside the sandbox |
+| Agent settings | `.claude/settings.json` from the mount, under `.claude/managed-settings.json`, installed to `/etc/claude-code/` at creation |
 | Egress rules | Reserved ranges named in the `justfile`; the LAN and DNS zone read from `group_vars/all.yml` |
 
 Claude's session history and the uv cache are persisted under `.sbx/` in the repository, which is bind-mounted and therefore on the host; credentials are persisted in the host's operating system credential store. Both are ignored by `.gitignore`. Everything else, `/opt/venv` included, lives in the sandbox and is rebuilt with it.

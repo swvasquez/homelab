@@ -57,8 +57,4 @@ RUN case "$(dpkg --print-architecture)" in \
 
 COPY --from=uv /uv /uvx /usr/local/bin/
 
-# Highest settings precedence, so a checked-out branch cannot edit it away.
-RUN install -d -m 0755 /etc/claude-code
-COPY managed-settings.json /etc/claude-code/managed-settings.json
-
 COPY --chmod=0755 firewall.sh /usr/local/bin/

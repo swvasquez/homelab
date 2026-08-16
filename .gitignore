@@ -15,11 +15,12 @@
 !.devcontainer/devcontainer-lock.json
 !.devcontainer/Dockerfile
 !.devcontainer/firewall.sh
-!.devcontainer/managed-settings.json
 !.sbx
 !.sbx/kit
 !.sbx/kit/spec.yaml
 !.claude
+!.claude/settings.json
+!.claude/managed-settings.json
 !.claude/rules
 !.claude/rules/*.md
 !.claude/skills

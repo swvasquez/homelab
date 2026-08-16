@@ -82,28 +82,19 @@ setup:
         export UV_CACHE_DIR="$WORKSPACE_DIR/.sbx/uv-cache"
         just venv
         chown -R agent:agent "${VIRTUAL_ENV:?virtual environment path not set}" "$UV_CACHE_DIR"
-    # Highest settings precedence, so a checked-out branch cannot edit it away.
+    # /etc/claude-code is the highest settings precedence, so a checked-out branch
+    # cannot edit it away. The source file is shared with the dev container so the
+    # two cannot drift; where it sits in the repository it is inert, Claude Code
+    # reading managed settings only from /etc/claude-code.
     #
-    # Written from an install command rather than setup.files: file writes do not
-    # run as root, so creating /etc/claude-code failed with "mkdir: Permission
-    # denied". Install commands default to user 0.
+    # Installed by a command rather than setup.files: file writes do not run as
+    # root, so creating /etc/claude-code failed with "mkdir: Permission denied".
+    # Install commands default to user 0.
     - command: |
         set -eu
-        mkdir -p /etc/claude-code
-        cat > /etc/claude-code/managed-settings.json <<'JSON'
-        {
-          "permissions": {
-            "deny": [
-              "Bash(ssh:*)",
-              "Bash(scp:*)",
-              "Bash(sftp:*)",
-              "Bash(rsync:*)",
-              "Read(//**/.ssh/**)",
-              "Edit(//**/.ssh/**)"
-            ]
-          }
-        }
-        JSON
+        install -D -m 0644 \
+            "${WORKSPACE_DIR:?workspace directory not set}/.claude/managed-settings.json" \
+            /etc/claude-code/managed-settings.json
       user: "0"
   startup:
     # The repository is bind-mounted, so a directory inside it is storage on the
