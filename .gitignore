@@ -10,11 +10,6 @@
 !playbooks/*/*/scripts/*
 !docs
 !docs/*.md
-!.devcontainer
-!.devcontainer/devcontainer.json
-!.devcontainer/devcontainer-lock.json
-!.devcontainer/Dockerfile
-!.devcontainer/firewall.sh
 !.sbx
 !.sbx/kit
 !.sbx/kit/spec.yaml

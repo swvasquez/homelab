@@ -20,8 +20,6 @@ The following tools should be installed before deploying any of the Playbooks
 | [bao](https://openbao.org/) | OpenBao CLI for secret management within the cluster |
 | [gnupg](https://gnupg.org/) | GPG, which encrypts the `pass` store |
 | [pass](https://www.passwordstore.org/) | Password store that holds various keys to access and manage cluster resources |
-| [docker](https://www.docker.com/) | Container runtime that hosts the dev container |
-| [npm](https://www.npmjs.com/) | Node package manager; `just devcontainer-up` uses `npx` to run the `devcontainer` CLI |
 | [sbx](https://docs.docker.com/ai/sandboxes/) | Docker Sandboxes CLI; `just sbx-up` uses it to run the agent sandbox |
 
 ## Setup
@@ -113,42 +111,14 @@ As noted, this codebase has been developed with AI assistance. Guidelines and co
 | Location | Contains |
 |----------|----------|
 | `CLAUDE.md` | Standing rules that apply to every session — conventions, working style, and what an agent may do directly versus what it must ask for |
-| `.claude/settings.json` | Permission rules the agent harness enforces rather than leaving to the agent's judgment — denying the Ansible, SSH, and `just` invocations only the operator runs. Read from the mount, so the dev container and the sandbox share it |
-| `.claude/managed-settings.json` | The same, at a precedence a checked-out branch cannot override: remote-access denials, and the auto mode both environments run in. The dev container and the sandbox each install it to `/etc/claude-code/`, which is the only place Claude Code reads managed settings from — where the file sits in the repository it is inert |
+| `.claude/settings.json` | Permission rules the agent harness enforces rather than leaving to the agent's judgment — denying the Ansible, SSH, and `just` invocations only the operator runs. Read from the mount |
+| `.claude/managed-settings.json` | The same, at a precedence a checked-out branch cannot override: remote-access denials, and the auto mode the sandbox runs in. The sandbox installs it to `/etc/claude-code/`, which is the only place Claude Code reads managed settings from — where the file sits in the repository it is inert |
 | `.claude/rules/` | Conventions scoped to particular files through a `paths:` field in each rule's front matter. A rule loads only when a matching file is read, keeping file-specific guidance out of sessions that never touch those files |
 | `.claude/skills/` | Procedures invoked on demand rather than applied continuously — `polish` cleans up a session's changes, and `finalize` prepares them for a commit |
 
-## Devcontainer
-
-`.devcontainer/` defines a sandboxed container where Claude Code can access source code and run tasks. The dev container does not have access to the LAN or Kubernetes cluster, but does have access to the WAN. The assumption is that the user will interact with the agent, run commands on its behalf, and share the output for it to assess.
-
-Dev containers are long-running containers. You start the dev container via
-
-```sh
-just devcontainer-up
-```
-
-You then connect to the running container for development via
-
-```sh
-just devcontainer-shell
-```
-
-| Input | Source |
-|-------|--------|
-| Repository | Bind-mounted from the host at `/workspaces/homelab` |
-| Ansible | Installed on first start by `just venv`, into a volume separate from the host's `.venv` |
-| Agent credentials | Entered once on first use and kept in a volume |
-| Agent settings | `.claude/settings.json` from the mount, under `.claude/managed-settings.json`, installed to `/etc/claude-code/` on first start |
-| Egress rules | The reserved ranges named in `.devcontainer/firewall.sh`, reapplied on every start |
-
-The `.venv`, the uv cache, and the agent's credentials are persisted in named volumes keyed to `${devcontainerId}`, which is stable across rebuilds; everything else in the container is not.
-
-Note that `just devcontainer-up` rebuilds the dev container image and terminates any existing dev containers.
-
 ## Sandbox
 
-`.sbx/` defines a Docker Sandboxes microVM serving the same purpose as the dev container, kept alongside it for comparison. The sandbox does not have access to the LAN, the Kubernetes cluster, or the tailnet, but does have access to the WAN. It carries no SSH keys and no cluster credentials, so the operator remains the only path to the homelab.
+`.sbx/` defines a Docker Sandboxes microVM where Claude Code can access source code and run tasks. The sandbox does not have access to the LAN, the Kubernetes cluster, or the tailnet, but does have access to the WAN. It carries no SSH keys and no cluster credentials, so the operator remains the only path to the homelab.
 
 Sandboxes are long-running microVMs. You build and start one via
 

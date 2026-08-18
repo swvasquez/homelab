@@ -14,30 +14,6 @@ venv path=env_var_or_default("VIRTUAL_ENV", ".venv"):
     uv pip install --python "{{ path }}/bin/python" ansible-dev-tools
 
 # +----------------------------------------------------------------------------+
-# | Devcontainer — run tooling inside an isolated container                    |
-# +----------------------------------------------------------------------------+
-
-devcontainer_cli := "npx --yes @devcontainers/cli@0.88.0"
-
-# Must match `workspaceFolder` in devcontainer.json
-devcontainer_workspace := "/workspaces/homelab"
-
-# Build and start the devcontainer, replacing any existing one
-devcontainer-up:
-    {{ devcontainer_cli }} up --workspace-folder . --remove-existing-container
-
-# Open a shell in the running devcontainer
-[script]
-devcontainer-shell:
-    filter="label=devcontainer.local_folder={{ justfile_directory() }}"
-    container="$(docker ps -q --filter "$filter")"
-    if [ -z "$container" ]; then
-        echo "No running devcontainer for this repository. Run 'just devcontainer-up' first." >&2
-        exit 1
-    fi
-    docker exec -it -u vscode -w "{{ devcontainer_workspace }}" "$container" bash
-
-# +----------------------------------------------------------------------------+
 # | Sandbox — run tooling inside a Docker Sandboxes microVM                    |
 # +----------------------------------------------------------------------------+
 

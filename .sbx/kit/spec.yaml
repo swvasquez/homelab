@@ -1,5 +1,4 @@
-# Kit for running Claude Code against this repository in a Docker Sandboxes
-# microVM — the counterpart of .devcontainer/, kept alongside it for comparison.
+# Kit for running Claude Code in a Docker Sandboxes microVM.
 #
 # The sandbox has no cluster credentials and no SSH keys: the agent reads and
 # edits code, and anything that touches the cluster is run by the operator.
@@ -10,14 +9,14 @@ schemaVersion: "2"
 kind: mixin
 name: homelab
 
-# Open egress so the agent can research freely, matching .devcontainer/firewall.sh
-# rather than the allowlist in anthropics/claude-code. The LAN is closed by two
-# things this file does not express: sbx blocks private, loopback and link-local
-# addresses by default and blocks non-HTTP protocols outright, and the CIDR denies
-# `just sbx-up` passes at creation narrow it further. Those live there because
-# CIDR is enforced by `sbx policy` but not by a kit (SPEC-v2 §5.2 lists it as
-# declared and not applied), so writing the ranges here would read as protection
-# while doing nothing. Deny always beats allow, including this wildcard.
+# Open egress so the agent can research freely, rather than the allowlist in
+# anthropics/claude-code. The LAN is closed by two things this file does not
+# express: sbx blocks private, loopback and link-local addresses by default and
+# blocks non-HTTP protocols outright, and the CIDR denies `just sbx-up` passes
+# at creation narrow it further. Those live there because CIDR is enforced by
+# `sbx policy` but not by a kit (SPEC-v2 §5.2 lists it as declared and not
+# applied), so writing the ranges here would read as protection while doing
+# nothing. Deny always beats allow, including this wildcard.
 permissions:
   network:
     allow:
@@ -83,9 +82,8 @@ setup:
         just venv
         chown -R agent:agent "${VIRTUAL_ENV:?virtual environment path not set}" "$UV_CACHE_DIR"
     # /etc/claude-code is the highest settings precedence, so a checked-out branch
-    # cannot edit it away. The source file is shared with the dev container so the
-    # two cannot drift; where it sits in the repository it is inert, Claude Code
-    # reading managed settings only from /etc/claude-code.
+    # cannot edit it away. Where the source file sits in the repository it is
+    # inert, Claude Code reading managed settings only from /etc/claude-code.
     #
     # Installed by a command rather than setup.files: file writes do not run as
     # root, so creating /etc/claude-code failed with "mkdir: Permission denied".
@@ -98,10 +96,10 @@ setup:
       user: "0"
   startup:
     # The repository is bind-mounted, so a directory inside it is storage on the
-    # host and outlives the sandbox — the counterpart of the dev container's
-    # named volumes. Written at startup rather than set in environment.variables
-    # because the workspace path is only known at runtime, and read back from
-    # /etc/sandbox-persistent.sh, which every login shell in the sandbox sources.
+    # host and outlives the sandbox. Written at startup rather than set in
+    # environment.variables because the workspace path is only known at runtime,
+    # and read back from /etc/sandbox-persistent.sh, which every login shell in
+    # the sandbox sources.
     - command:
         - sh
         - -c
