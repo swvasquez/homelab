@@ -1,0 +1,46 @@
+{#
+  Defines the agent's cluster identity, a ServiceAccount and the
+  ClusterRoleBinding that attaches it to the agent ClusterRole.
+
+  Kept out of agent-cluster-role.yml.j2 so the file the operator opens to
+  adjust access contains only access rules. This file does not change when
+  permissions do.
+
+  A ServiceAccount rather than a client certificate because Kubernetes has no
+  certificate revocation — a leaked cert is revocable only by rotating the
+  cluster CA, taking every other credential with it. Deleting this account
+  invalidates every token issued for it and nothing else, since tokens carry
+  its UID.
+
+  automountServiceAccountToken is false because nothing runs as this identity;
+  the account exists only to mint tokens for a client outside the cluster. This
+  also follows the convention security.yml sets, where each playbook disables
+  automount in its own namespace.
+
+  Variables:
+    agent_name:       Name shared by the agent's namespace, ServiceAccount,
+                      ClusterRole, and ClusterRoleBinding. Defined in
+                      playbooks/nodes/cluster/agent.yml.
+    agent_namespace:  Namespace holding the agent's ServiceAccount. Defined in
+                      playbooks/nodes/cluster/agent.yml.
+#}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: '{{ agent_name }}'
+  namespace: '{{ agent_namespace }}'
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: '{{ agent_name }}'
+subjects:
+  - kind: ServiceAccount
+    name: '{{ agent_name }}'
+    namespace: '{{ agent_namespace }}'
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: '{{ agent_name }}'

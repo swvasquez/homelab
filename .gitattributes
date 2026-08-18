@@ -1,2 +1,3 @@
 playbooks/nodes/infrastructure/templates/sshd_hardening.conf.j2 filter=git-crypt diff=git-crypt
 playbooks/ipkvm/infrastructure/templates/sshd_hardening.conf.j2 filter=git-crypt diff=git-crypt
+playbooks/nodes/cluster/templates/agent-cluster-role.yml.j2 filter=git-crypt diff=git-crypt

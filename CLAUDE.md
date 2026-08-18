@@ -17,6 +17,20 @@ self-explanatory without cross-referencing others.
 - The test: if an agent couldn't recover the reason from a single tool's own docs,
   write it down. Err toward more.
 
+## Writing docs and comments
+
+Write for someone looking something up, not someone reading start to finish.
+
+- State what something does, not what it guarantees or what it means. Prefer a
+  fact I could verify over a characterization of it — "there are no SSH keys"
+  rather than "the operator remains the only path to the nodes".
+- Don't editorialize. Cut words that tell me how to regard a fact rather than
+  adding one: "worth knowing", "importantly", "notably", "and nothing else",
+  "exactly", "the real point is". If a sentence stays true after deleting a
+  phrase, that phrase was doing rhetorical rather than technical work.
+- No summarizing maxims. "A read-only role that cannot be shown to refuse
+  something is not demonstrated" is prose performing, not informing.
+
 ## Debugging
 
 - You can run commands on this machine directly — `kubectl`, Ansible, and `sudo`

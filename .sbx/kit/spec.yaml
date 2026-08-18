@@ -1,7 +1,8 @@
 # Kit for running Claude Code in a Docker Sandboxes microVM.
 #
-# The sandbox has no cluster credentials and no SSH keys: the agent reads and
-# edits code, and anything that touches the cluster is run by the operator.
+# The sandbox carries no SSH keys. It reaches the Kubernetes API only when
+# started with `just sbx-up cluster`, using the read-only identity that
+# playbooks/nodes/cluster/agent.yml creates. The rest of the LAN stays denied.
 
 # The loader forks the grammar on schemaVersion: without it the file is decoded
 # as v1, whose struct has no `permissions` or `setup`, and loading fails.
@@ -32,15 +33,16 @@ environment:
 setup:
   install:
     # libonig-dev, gcc, libc6-dev and python3-dev are here for `just venv`:
-    # ansible-dev-tools pulls in onigurumacffi, which publishes no wheel for this
-    # Python on arm64 and so compiles _onigurumacffi.c against oniguruma.h. The
-    # agent image carries no C toolchain — the build fails on a missing
-    # aarch64-linux-gnu-gcc before it ever looks for a header — and
+    # ansible-dev-tools pulls in onigurumacffi, which publishes no wheel for
+    # this Python on arm64 and so compiles _onigurumacffi.c against
+    # oniguruma.h. The agent image carries no C toolchain — the build fails on
+    # a missing aarch64-linux-gnu-gcc before it ever looks for a header — and
     # --no-install-recommends means gcc does not drag in libc6-dev on its own.
     # git-crypt is required by the filters .gitattributes declares on the sshd
-    # hardening templates — without the binary, git refuses to run those filters
-    # and ordinary commands like `git status` fail. The sandbox has no decryption
-    # key, so those two files stay encrypted — which is the intent.
+    # hardening templates and the agent ClusterRole — without the binary, git
+    # refuses to run those filters and ordinary commands like `git status`
+    # fail. The sandbox has no decryption key, so those files stay encrypted,
+    # which is the intent.
     - command: >-
         apt-get update &&
         apt-get install -y --no-install-recommends
@@ -49,21 +51,42 @@ setup:
     # architecture has to be translated — the sandbox is arm64 on Apple Silicon.
     - command: |
         set -eu
-        case "$(dpkg --print-architecture)" in
+        arch="$(dpkg --print-architecture)"
+        case "$arch" in
             amd64) just_target=x86_64-unknown-linux-musl
                 just_sha256=4a5cc2f53e6f0f8c59092a6cc38291eb729d46a7dd95d3ae582008881b84931d ;;
             arm64) just_target=aarch64-unknown-linux-musl
                 just_sha256=748237128c4c40cbdabc65e841d05ceba13cc23a91eaba395495894c1d9764df ;;
-            *) echo "unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1 ;;
+            *) echo "unsupported architecture: $arch" >&2; exit 1 ;;
         esac
         just_url="https://github.com/casey/just/releases/download/1.58.0"
-        curl -fsSL -o /tmp/just.tar.gz "$just_url/just-1.58.0-$just_target.tar.gz"
+        curl -fsSL -o /tmp/just.tar.gz \
+            "$just_url/just-1.58.0-$just_target.tar.gz"
         echo "$just_sha256  /tmp/just.tar.gz" | sha256sum -c -
         tar -xzf /tmp/just.tar.gz -C /usr/local/bin just
         rm /tmp/just.tar.gz
     - command: >-
         curl -LsSf https://astral.sh/uv/0.12.3/install.sh
         | env UV_UNMANAGED_INSTALL=/usr/local/bin sh
+    # kubectl, pinned to the cluster's own minor — kubectl supports one minor
+    # of skew either way, so this tracks whatever the apiserver reports rather
+    # than kube_version in cluster/kubernetes.yml, which is only the install
+    # floor and lags the running cluster. dl.k8s.io serves a .sha256 beside
+    # each binary, but over the same channel, so it verifies transport rather
+    # than content; the digests are inlined as just's are.
+    - command: |
+        set -eu
+        arch="$(dpkg --print-architecture)"
+        case "$arch" in
+            amd64) sha256=12e97f9d23a9f6cbb87b89becd6bd291e1a858a3379a4e11e2c822c4c1530052 ;;
+            arm64) sha256=5103d45b8881434d417694057b8ccb5ae79fd310a5c5c13e403c5e62e15909be ;;
+            *) echo "unsupported architecture: $arch" >&2; exit 1 ;;
+        esac
+        curl -fsSL -o /tmp/kubectl \
+            "https://dl.k8s.io/release/v1.35.7/bin/linux/$arch/kubectl"
+        echo "$sha256  /tmp/kubectl" | sha256sum -c -
+        install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+        rm /tmp/kubectl
     # Ansible is deliberately not baked into a template — running the
     # repository's own recipe here exercises the documented setup path on every
     # rebuild instead of a parallel one that can drift. The recipe reads
@@ -80,18 +103,21 @@ setup:
         cd "${WORKSPACE_DIR:?workspace directory not set}"
         export UV_CACHE_DIR="$WORKSPACE_DIR/.sbx/uv-cache"
         just venv
-        chown -R agent:agent "${VIRTUAL_ENV:?virtual environment path not set}" "$UV_CACHE_DIR"
-    # /etc/claude-code is the highest settings precedence, so a checked-out branch
-    # cannot edit it away. Where the source file sits in the repository it is
-    # inert, Claude Code reading managed settings only from /etc/claude-code.
+        chown -R agent:agent "$UV_CACHE_DIR" \
+            "${VIRTUAL_ENV:?virtual environment path not set}"
+    # /etc/claude-code is the highest settings precedence, so a checked-out
+    # branch cannot edit it away. Where the source file sits in the repository
+    # it is inert, Claude Code reading managed settings only from
+    # /etc/claude-code.
     #
     # Installed by a command rather than setup.files: file writes do not run as
     # root, so creating /etc/claude-code failed with "mkdir: Permission denied".
     # Install commands default to user 0.
     - command: |
         set -eu
+        workspace="${WORKSPACE_DIR:?workspace directory not set}"
         install -D -m 0644 \
-            "${WORKSPACE_DIR:?workspace directory not set}/.claude/managed-settings.json" \
+            "$workspace/.claude/managed-settings.json" \
             /etc/claude-code/managed-settings.json
       user: "0"
   startup:
@@ -108,4 +134,19 @@ setup:
           chown agent:agent "$WORKSPACE_DIR/.sbx/claude" &&
           echo "export CLAUDE_CONFIG_DIR=$WORKSPACE_DIR/.sbx/claude"
           > /etc/sandbox-persistent.sh
+      user: "0"
+    # Points kubectl at the kubeconfig `just agent-kube-config` writes into the
+    # mount. Nothing is generated here — that recipe runs on the operator's
+    # machine, which holds the admin kubeconfig that mints the token. The file
+    # is absent until it runs, and kubectl is unconfigured until then.
+    #
+    # Must run after the hook above, which truncates the persistent env.
+    - command:
+        - sh
+        - -c
+        - |
+          set -eu
+          config="$WORKSPACE_DIR/.sbx/agent.kubeconfig"
+          echo "export KUBECONFIG=$config" >> /etc/sandbox-persistent.sh
+          [ -f "$config" ] || echo "no $config; run just agent-kube-config" >&2
       user: "0"

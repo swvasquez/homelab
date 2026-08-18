@@ -13,6 +13,7 @@
 !.sbx
 !.sbx/kit
 !.sbx/kit/spec.yaml
+!.sbx/config.py
 !.claude
 !.claude/settings.json
 !.claude/managed-settings.json

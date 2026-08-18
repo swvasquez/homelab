@@ -1,0 +1,156 @@
+---
+# ==============================================================================
+# Playbook: Read-Only Cluster Identity for the Coding Agent
+# ==============================================================================
+# Creates a ServiceAccount the coding agent authenticates as, and a ClusterRole
+# limiting it to reading. It writes no credential. `just agent-kube-config`
+# mints a token and builds the agent kubeconfig from the operator's own
+# machine, so refreshing an expired one needs neither this playbook nor node
+# access.
+#
+# That kubeconfig holds the token in plaintext, in the repository. Credential
+# injection through the sbx proxy would keep it out of the sandbox, but cannot
+# work here. Injection only happens on the proxy's `forward` path, which
+# terminates TLS, and the proxy then verifies the apiserver against a public
+# trust bundle that cannot contain a private cluster CA. Registering a custom
+# secret for the API server address moves it onto that path and breaks access.
+#
+# The agent cannot be given the operator's kubeconfig. bootstrap.yml distributes
+# /etc/kubernetes/admin.conf, which grants cluster-admin — every verb on every
+# resource, including secrets and pod creation. Since Kubernetes 1.29 that file
+# is bound to the 'kubeadm:cluster-admins' group through ordinary RBAC rather
+# than carrying 'system:masters' (kubeadm moved the authorization-bypassing
+# credential to super-admin.conf), so it is at least constrainable in principle
+# — but as distributed it is still full control of the cluster, and every action
+# taken with it is attributed to the operator in the audit log.
+#
+# TO CHANGE WHAT THE AGENT MAY DO, edit templates/agent-cluster-role.yml.j2
+# and re-run. That file is the permission specification and carries the
+# reasoning for what is granted and what is deliberately withheld. It is
+# encrypted with git-crypt like the sshd hardening templates, because it maps
+# what a leaked agent token reaches. Neither sandbox holds a key, so adjusting
+# the agent's permissions is an operator-side task.
+#
+# Deleting the ServiceAccount revokes access. Tokens embed its UID, so every
+# token ever minted for it stops working at once, and re-running this playbook
+# recreates the account with a new UID.
+#
+#   kubectl delete serviceaccount agent -n agent
+#   rm .sbx/agent.kubeconfig
+#
+# Run after bootstrap.yml. Nothing depends on this playbook and it depends on
+# nothing beyond a reachable apiserver, so it can run at any point afterwards.
+#
+# Validation (from any machine with the admin kubeconfig):
+#
+#   kubectl auth can-i --list --as=system:serviceaccount:agent:agent
+#   kubectl get pods -A --as=system:serviceaccount:agent:agent
+#   kubectl get secrets -A --as=system:serviceaccount:agent:agent
+#
+# The three should report get/list/watch on the resources the ClusterRole
+# names, every pod in the cluster, and 'Error from server (Forbidden): secrets
+# is forbidden'. The third is there because the first two pass on a role that
+# grants more than intended. Impersonation rather than a token, so testing the
+# role needs no credential to exist.
+#
+# Rollback:
+#
+#   kubectl delete clusterrolebinding agent
+#   kubectl delete clusterrole agent
+#   kubectl delete namespace agent
+#
+# Variables:
+#   bootstrap_node:       Boolean indicating if the host is the control plane
+#                         bootstrap node where kubectl commands run. Read from
+#                         inventory host vars.
+#   agent_name:           Name shared by the agent's ServiceAccount,
+#                         ClusterRole, and ClusterRoleBinding (default: agent).
+#   agent_namespace:      Namespace holding the ServiceAccount
+#                         (default: agent).
+#   kubectl_config_path:  Admin kubeconfig on the cluster nodes, used to apply
+#                         the manifests below
+#                         (default: /home/<ansible_user>/.kube/config).
+
+- name: Provision a read-only cluster identity for the coding agent
+  hosts: nodes
+  become: true
+  become_exe: sudo.ws
+  vars:
+    agent_name: agent
+    agent_namespace: agent
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Namespace
+    # No workload runs here, so the cluster-wide 'restricted' Pod Security
+    # Admission default from security.yml needs no exemption.
+    # -------------------------------------------------------------------------
+    - name: Create agent namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create namespace {{ agent_namespace }}
+      register: agent_ns_result
+      changed_when: "'created' in agent_ns_result.stdout"
+      failed_when:
+        - agent_ns_result.rc != 0
+        - "'already exists' not in agent_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ClusterRole
+    # Applied before the binding so a failed run cannot leave a binding whose
+    # roleRef resolves to nothing, which Kubernetes accepts and silently grants
+    # no access for.
+    # -------------------------------------------------------------------------
+    - name: Write agent ClusterRole manifest
+      ansible.builtin.template:
+        src: agent-cluster-role.yml.j2
+        dest: /tmp/agent-cluster-role.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply agent ClusterRole
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/agent-cluster-role.yml
+      register: agent_cluster_role_result
+      changed_when: >-
+        'created' in agent_cluster_role_result.stdout or
+        'configured' in agent_cluster_role_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up agent ClusterRole manifest
+      ansible.builtin.file:
+        path: /tmp/agent-cluster-role.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ServiceAccount and ClusterRoleBinding
+    # -------------------------------------------------------------------------
+    - name: Write agent identity manifest
+      ansible.builtin.template:
+        src: agent-identity.yml.j2
+        dest: /tmp/agent-identity.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply agent identity
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/agent-identity.yml
+      register: agent_identity_result
+      changed_when: >-
+        'created' in agent_identity_result.stdout or
+        'configured' in agent_identity_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up agent identity manifest
+      ansible.builtin.file:
+        path: /tmp/agent-identity.yml
+        state: absent
+      when: bootstrap_node | default(false)

@@ -20,6 +20,7 @@ The following tools should be installed before deploying any of the Playbooks
 | [bao](https://openbao.org/) | OpenBao CLI for secret management within the cluster |
 | [gnupg](https://gnupg.org/) | GPG, which encrypts the `pass` store |
 | [pass](https://www.passwordstore.org/) | Password store that holds various keys to access and manage cluster resources |
+| [jq](https://jqlang.github.io/jq/) | JSON processor; `just wake` and the `sbx` recipes read values out of `ansible-inventory` and `.sbx/config.py` with it |
 | [sbx](https://docs.docker.com/ai/sandboxes/) | Docker Sandboxes CLI; `just sbx-up` uses it to run the agent sandbox |
 
 ## Setup
@@ -116,19 +117,24 @@ As noted, this codebase has been developed with AI assistance. Guidelines and co
 | `.claude/rules/` | Conventions scoped to particular files through a `paths:` field in each rule's front matter. A rule loads only when a matching file is read, keeping file-specific guidance out of sessions that never touch those files |
 | `.claude/skills/` | Procedures invoked on demand rather than applied continuously — `polish` cleans up a session's changes, and `finalize` prepares them for a commit |
 
-## Sandbox
+## Agent Sandbox
 
-`.sbx/` defines a Docker Sandboxes microVM where Claude Code can access source code and run tasks. The sandbox does not have access to the LAN, the Kubernetes cluster, or the tailnet, but does have access to the WAN. It carries no SSH keys and no cluster credentials, so the operator remains the only path to the homelab.
+Homelab setups require users to manage access to various compute resources. This increases the need to limit what an agent can or cannot do.
 
-Sandboxes are long-running microVMs. You build and start one via
+In addition to Claude Code's built-in sandboxing mechanism (configured via `settings.json`), an isolated development environment is provided via a Docker Sandboxes microVM (`sbx`). It mounts the repository and allows Claude Code to run while limiting filesystem and network access.
+
+Sandboxes are long-running microVMs that you can attach multiple sessions to. To use the sandbox, run
 
 ```sh
-just sbx-up
+just sbx-up # build and start sandbox
+just sbx-shell # connect to sandbox
 ```
 
-You then connect to the running sandbox for development via
+Occasionally you may want the agent to debug issues on the installed Kubernetes cluster. The playbook `playbooks/nodes/cluster/agent.yml` defines a dedicated ClusterRole that specifies what `kubectl` actions an agent can run. To grant the sandbox access to the Kubernetes cluster, first generate the associated kubeconfig file. Then start the sandbox with the `cluster` argument.
 
 ```sh
+just agent-kube-config # write .sbx/agent.kubeconfig
+just sbx-up cluster
 just sbx-shell
 ```
 
@@ -136,10 +142,8 @@ just sbx-shell
 |-------|--------|
 | Repository | Bind-mounted from the host |
 | Ansible | Installed at creation by `just venv`, into `/opt/venv` outside the mount |
-| Agent credentials | Entered once via `just sbx-login` and held in the host's credential store, never inside the sandbox |
-| Agent settings | `.claude/settings.json` from the mount, under `.claude/managed-settings.json`, installed to `/etc/claude-code/` at creation |
-| Egress rules | Reserved ranges named in the `justfile`; the LAN and DNS zone read from `group_vars/all.yml` |
+| Agent credentials | Entered once via `just sbx-login` and held in the host's credential store, never inside the sandbox. `just sbx-up` prompts for them only on a first run, which it detects by matching the service name in `sbx secret ls` empty-result text — the command reports no secrets through its output rather than its exit status |
+| Kubeconfig | `.sbx/agent.kubeconfig` from the mount, written by `just agent-kube-config`. The kit exports `KUBECONFIG` to that path at startup, whether or not the file exists |
+| Egress rules | Computed by `.sbx/config.py` from `inventory.yml` and `group_vars`, and passed at creation |
 
-Claude's session history and the uv cache are persisted under `.sbx/` in the repository, which is bind-mounted and therefore on the host; credentials are persisted in the host's operating system credential store. Both are ignored by `.gitignore`. Everything else, `/opt/venv` included, lives in the sandbox and is rebuilt with it.
-
-Note that `just sbx-up` replaces the sandbox and terminates any existing one.
+Claude's session history and the uv cache are persisted under `.sbx/` in the repository and bind-mounted to the host. `just sbx-up` replaces the sandbox and terminates any existing one. 

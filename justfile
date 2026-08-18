@@ -1,3 +1,4 @@
+# -x traces every command, so recipes handling a secret `set +x` first
 set shell := ["bash", "-euxo", "pipefail", "-c"]
 set unstable
 set script-interpreter := ["bash", "-eu"]
@@ -6,8 +7,7 @@ set script-interpreter := ["bash", "-eu"]
 # | Setup — create and configure the local Python virtual environment          |
 # +----------------------------------------------------------------------------+
 
-# VIRTUAL_ENV keeps the environment out of the repository when the repository is
-# mounted into a sandbox, where a shared .venv would mix Darwin and Linux binaries
+# VIRTUAL_ENV keeps a sandbox's Linux environment out of the host's .venv
 # Create a virtual environment and install dependencies
 venv path=env_var_or_default("VIRTUAL_ENV", ".venv"):
     uv venv "{{ path }}"
@@ -19,42 +19,19 @@ venv path=env_var_or_default("VIRTUAL_ENV", ".venv"):
 
 sbx_name := "homelab"
 
-# Reserved ranges the sandbox is kept off regardless of what the inventory says.
-# The three RFC 1918 blocks every LAN is numbered from:
-private_10 := "10.0.0.0/8"
-private_172 := "172.16.0.0/12"
-private_192 := "192.168.0.0/16"
-
-# RFC 3927 link-local, where cloud metadata endpoints such as 169.254.169.254 sit
-link_local := "169.254.0.0/16"
-
-# RFC 6598 shared address space, which Tailscale assigns tailnet addresses from
-tailscale_cgnat := "100.64.0.0/10"
-
-# Recreated rather than reused because a kit only takes effect at creation; the
-# session history and uv cache the kit puts under .sbx/ are on the host and outlive
-# it. With a branch, the agent works in a worktree under .sbx/, not the working tree
-# Build and start the sandbox, replacing any existing one
+# Recreated rather than reused, since a kit takes effect only at creation
+# Build and start the sandbox; pass "cluster" to let the agent reach kubectl
 [script]
-sbx-up branch="":
+sbx-up access="sealed":
     sbx rm --force {{ sbx_name }} || true
+    cfg=$(.sbx/config.py)
     args=(--name {{ sbx_name }} --kit ./.sbx/kit)
-    # Narrows the kit's open egress back off the LAN. CIDR is enforced here but not
-    # in a kit; the zone and LAN follow group_vars so they cannot drift from it
-    dns_zone=$(awk '/^dns_zone:/ {print $2}' group_vars/all.yml)
-    lan_cidr=$(awk '/^lan_cidr:/ {print $2}' group_vars/all.yml)
-    : "${dns_zone:?not found in group_vars/all.yml}"
-    : "${lan_cidr:?not found in group_vars/all.yml}"
-    ranges=({{ private_10 }} {{ private_172 }} {{ private_192 }} {{ link_local }} {{ tailscale_cgnat }})
-    ranges+=("$lan_cidr" "*.$dns_zone")
-    for range in "${ranges[@]}"; do
-        args+=(--deny-network "$range")
-    done
-    if [ -n "{{ branch }}" ]; then
-        args+=(--branch="{{ branch }}")
-    fi
+    # -e: an unknown access mode must fail, not yield an empty deny list
+    denies=$(jq -er '.deny_ranges["{{ access }}"][]' <<<"$cfg")
+    while read -r resource; do
+        args+=(--deny-network "$resource")
+    done <<<"$denies"
     sbx create "${args[@]}" claude "{{ justfile_directory() }}"
-    # The service name appears in the empty-result message, so match on that
     if sbx secret ls --service anthropic | grep -q "No secrets found"; then
         sbx run --name {{ sbx_name }} -- auth login
     fi
@@ -69,8 +46,7 @@ sbx-login:
     fi
     sbx run --name {{ sbx_name }} -- auth login
 
-# .sbx/env holds KEY=VALUE lines and stays uncommitted, the .gitignore allowlist
-# ignoring anything it does not name. Reaches this shell only, never the agent
+# .sbx/env (uncommitted KEY=VALUE lines) reaches this shell, not the agent
 # Open a shell in the running sandbox
 [script]
 sbx-shell:
@@ -84,8 +60,7 @@ sbx-shell:
 # | Deploy — run Ansible playbooks against inventory hosts                     |
 # +----------------------------------------------------------------------------+
 
-# Trailing arguments are passed through to ansible-playbook, e.g.
-#   just deploy ipkvm infrastructure tailscale -e tailscale_upgrade=true
+# Trailing arguments pass through to ansible-playbook, e.g. -e key=value
 # Run a specific Ansible playbook on a subset of machines
 deploy group category playbook *extra:
     uv run ansible-playbook \
@@ -121,7 +96,7 @@ reboot subset="nodes":
         -e ansible_become_exe=sudo.ws \
         -B 1 -P 0
 
-# Wake all nodes in a group via Wake-on-LAN (MAC and broadcast addresses read from inventory.yml)
+# Wake all nodes in a group via Wake-on-LAN (addresses from inventory.yml)
 wake subset="nodes":
     uv run ansible-inventory -i inventory.yml --list \
         | jq -r '.{{ subset }}.hosts[] as $h | ._meta.hostvars[$h] \
@@ -153,10 +128,36 @@ shutdown subset="nodes":
 # | Kubernetes — manage the Kubernetes cluster                                 |
 # +----------------------------------------------------------------------------+
 
+# Needs the agent ServiceAccount that `just deploy nodes cluster agent` creates
+# Write the agent kubeconfig the sandbox reads, holding a freshly minted token
+[script]
+agent-kube-config duration="8h":
+    set +x
+    config=.sbx/agent.kubeconfig
+    ca=$(mktemp)
+    trap 'rm -f "$ca"' EXIT
+    cluster=$(kubectl config view --minify -o jsonpath='{.clusters[0].name}')
+    api=$(.sbx/config.py | jq -r .api_endpoint)
+    kubectl config view --raw --minify \
+        -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' \
+        | base64 -d > "$ca"
+    rm -f "$config"
+    kubectl config --kubeconfig="$config" set-cluster "$cluster" \
+        --server="https://$api" \
+        --certificate-authority="$ca" --embed-certs
+    kubectl config --kubeconfig="$config" set-credentials agent \
+        --token="$(kubectl create token agent --namespace agent \
+                   --duration {{ duration }})"
+    kubectl config --kubeconfig="$config" set-context "agent@$cluster" \
+        --cluster="$cluster" --user=agent
+    kubectl config --kubeconfig="$config" use-context "agent@$cluster"
+    chmod 600 "$config"
+    echo "Wrote $config, valid {{ duration }}."
+
 # Destroy the Kubernetes cluster on all nodes — IRREVERSIBLE, deletes all data
 [script]
 destroy-cluster subset="nodes":
-    printf 'WARNING: This will permanently destroy the Kubernetes cluster and all data on "%s".\n' \
+    printf 'WARNING: destroys the cluster and all data on "%s".\n' \
         '{{ subset }}'
     printf 'Type "destroy" to confirm: '
     read -r confirmation
@@ -196,16 +197,16 @@ tailscale-set-keys pass_namespace=env_var('PASS_NAMESPACE'):
             printf '%s\n' "$value" | pass insert --echo --force "$path"
         fi
     }
-    update_key 'Tailscale auth key (tskey-auth-...)' '{{ pass_namespace }}/tailscale/auth-key'
-    update_key 'Tailscale API key (tskey-api-...)' '{{ pass_namespace }}/tailscale/api-key'
+    update_key 'Tailscale auth key (tskey-auth-...)' \
+        '{{ pass_namespace }}/tailscale/auth-key'
+    update_key 'Tailscale API key (tskey-api-...)' \
+        '{{ pass_namespace }}/tailscale/api-key'
 
-# Reads PASS_NAMESPACE from the environment; override with: just bao-token pass_namespace=<name>
-# Print the OpenBao root token from the pass store (paste into the UI Token method)
+# Print the OpenBao root token from the pass store (for the UI Token method)
 bao-token pass_namespace=env_var('PASS_NAMESPACE'):
     @pass show "{{ pass_namespace }}/openbao/root-token"
 
-# Reads PASS_NAMESPACE from the environment; override with: just bao-shell pass_namespace=<name>
-# Drop into a subshell with BAO_ADDR + BAO_SKIP_VERIFY + BAO_TOKEN set for ad-hoc bao CLI work
+# Drop into a subshell with BAO_ADDR, BAO_SKIP_VERIFY and BAO_TOKEN set
 [script]
 bao-shell openbao_hostname="openbao.homelab.internal" pass_namespace=env_var('PASS_NAMESPACE'):
     set +x

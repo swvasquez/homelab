@@ -31,6 +31,7 @@ The cluster playbooks then run in this order, each via
 9. `git`
 10. `gitops`
 11. `security`
+12. `agent`
 
 Two dependencies inside that sequence are worth calling out, because the failure
 they produce doesn't point back at the ordering:
@@ -41,6 +42,11 @@ they produce doesn't point back at the ordering:
 - **`observability` before `security`.** Falcosidekick forwards alerts to
   Alertmanager, which `observability.yml` provides. Deploy Falco first and it has
   nowhere to send anything.
+
+`agent` is listed last but depends on nothing beyond a reachable apiserver, so
+it can run at any point after `bootstrap`. It creates a ServiceAccount and
+ClusterRole and writes no credential; `just agent-kube-config` mints the token
+the sandbox authenticates with.
 
 ### Service playbooks are self-contained
 
