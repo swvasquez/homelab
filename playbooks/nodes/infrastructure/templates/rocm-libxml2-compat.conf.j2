@@ -1,0 +1,14 @@
+{#
+# Managed by Ansible - do not edit manually.
+#
+# Dynamic linker configuration adding the ROCm libxml2 compatibility directory
+# to the search path, rendered by rocm.yml. Only rendered on hosts where ROCm's
+# bundled lld has no RUNPATH reaching its own library directory; where it has
+# one, the library goes there instead and this file is never created.
+#
+# Variables consumed by this template:
+#   libxml2_compat_dir: Directory holding the libxml2.so.2 compatibility library.
+#}
+# libxml2.so.2 for ROCm's bundled lld, which this Ubuntu release no longer
+# provides. Written by playbooks/nodes/infrastructure/rocm.yml; see ROCm#6046.
+{{ libxml2_compat_dir }}

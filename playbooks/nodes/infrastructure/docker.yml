@@ -23,7 +23,7 @@
 #   - Installs prerequisite packages (ca-certificates, curl).
 #   - Adds Docker's official GPG key and APT repository.
 #   - Installs Docker Engine, CLI, containerd, and Docker Compose plugin.
-#   - Adds the current user to the 'docker' group to manage Docker as a
+#   - Adds docker_users to the 'docker' group to manage Docker as a
 #     non-root user.
 #   - Writes the Docker daemon configuration, enabling live restore so that
 #     upgrading Docker does not stop running containers.
@@ -36,6 +36,8 @@
 #                              (default: [docker-ce, docker-ce-cli,
 #                              containerd.io, docker-buildx-plugin,
 #                              docker-compose-plugin]).
+#   docker_users:              Accounts placed in the 'docker' group
+#                              (default: [the inventory connection user]).
 #   docker_daemon_config_path: Path to the Docker daemon configuration file
 #                              (default: /etc/docker/daemon.json).
 #   docker_live_restore:       Whether containers keep running across a Docker
@@ -55,6 +57,8 @@
       - containerd.io
       - docker-buildx-plugin
       - docker-compose-plugin
+    docker_users:
+      - '{{ ansible_user }}'
     docker_daemon_config_path: /etc/docker/daemon.json
     docker_live_restore: true
 
@@ -97,8 +101,16 @@
 
     # -------------------------------------------------------------------------
     # Installation and User Access
-    # Installs Docker Engine and its plugins, and grants the current user
-    # non-root access via the 'docker' group.
+    # Installs Docker Engine and its plugins, and grants docker_users non-root
+    # access via the 'docker' group.
+    #
+    # The accounts come from docker_users rather than from a gathered fact. The
+    # earlier version used ansible_user_id, which is the user Ansible's modules
+    # run as — and since this play sets become at play level, fact gathering
+    # runs as root too, so the task added root to the group rather than the
+    # inventory user. Nothing fails when that happens: an account outside the
+    # 'docker' group falls back to sudo for each docker command instead of
+    # erroring, so the play stays green and the membership is never questioned.
     # -------------------------------------------------------------------------
     - name: Install Docker Engine, CLI, and plugins
       ansible.builtin.apt:
@@ -106,11 +118,12 @@
         state: present
         update_cache: true
 
-    - name: Add user to the 'docker' group
+    - name: Add Docker users to the 'docker' group
       ansible.builtin.user:
-        name: '{{ ansible_user_id }}'
+        name: '{{ item }}'
         groups: docker
         append: true
+      loop: '{{ docker_users }}'
 
     # -------------------------------------------------------------------------
     # Daemon Configuration

@@ -41,9 +41,14 @@ any single node is a matter of inventory, not of hardware.
 
 **AMD GPUs.** Each node carries an AMD Ryzen AI APU, so the GPU is integrated
 rather than a discrete accelerator card. `infrastructure/rocm.yml` installs the
-AMDGPU kernel driver and the ROCm stack on every node, and puts users into the
-`video` and `render` groups (via `/etc/adduser.conf`, so new users inherit
-access automatically) rather than gating GPU use behind root.
+AMDGPU kernel driver and the ROCm stack on every node, and puts the accounts in
+`gpu_users` into the `video` and `render` groups (via `/etc/adduser.conf`, so
+new users inherit access automatically) rather than gating GPU use behind root.
+`render` owns `/dev/kfd` and `/dev/dri/renderD*`, which is what ROCm opens;
+`video` owns `/dev/dri/card*`. The playbook ends by running `rocminfo` as each
+of those accounts, since `usermod` returning 0 does not mean the account can
+open the device. The `rocm` use case installs no Vulkan driver, so Mesa's comes
+from Ubuntu alongside it.
 
 That the GPUs are APUs rather than data-center parts has a direct architectural
 consequence: **the Kubernetes AMD GPU Operator does not support them** — it
@@ -216,8 +221,8 @@ putting an operating system on it in the first place.
 
 ### Ubuntu Server — compute nodes
 
-The nodes run an LTS release of Ubuntu Server on x86_64. Everything about the
-node playbooks assumes the Debian/Ubuntu shape of the world: `apt` for packages,
+The nodes run Ubuntu Server 25.10 on x86_64. Everything about the node
+playbooks assumes the Debian/Ubuntu shape of the world: `apt` for packages,
 Netplan and `systemd-networkd` for interface configuration, `ufw` for the host
 firewall, and LVM for the volume groups backing scratch and NFS storage.
 
@@ -229,8 +234,14 @@ Two consequences are worth naming:
   `ansible_distribution_release`. This is what keeps the fleet on a *single*
   Ubuntu release in practice — an OS upgrade is not just an in-place
   `do-release-upgrade`, it requires confirming that every upstream publishes
-  packages for the new codename first. ROCm is the tightest of these: its
-  installer package URL is pinned to a specific release and version.
+  packages for the new codename first. ROCm is the tightest of these: AMD
+  publishes `amdgpu-install` repositories for two Ubuntu codenames at 7.1.1,
+  jammy and noble, and `infrastructure/rocm.yml` falls back to the closest one
+  when the running release is not among them. The fallback installs binaries
+  linked against the older release's libraries — ROCm's `lld` needs a
+  `libxml2.so.2` that Ubuntu no longer ships after 25.04, which the playbook
+  supplies itself (see
+  [ROCm#6046](https://github.com/ROCm/ROCm/issues/6046)).
 - **`become_exe` is `sudo.ws`, not `sudo`.** This is a workaround for an Ansible
   bug ([ansible#85837](https://github.com/ansible/ansible/issues/85837)) rather
   than a preference, and it applies to every privileged task on the nodes.

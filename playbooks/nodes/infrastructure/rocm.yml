@@ -6,61 +6,182 @@
 # for AMD GPUs.
 #
 # This playbook performs the following actions:
-#   - Ensures 'video' and 'render' groups exist and adds the user to them.
-#   - Downloads and installs the 'amdgpu-install' utility.
+#   - Ensures the 'video' and 'render' groups exist and adds gpu_users to them.
+#   - Downloads and installs the 'amdgpu-install' utility from the AMD
+#     repository for the running Ubuntu release, falling back to the closest
+#     release AMD publishes for.
 #   - Runs 'amdgpu-install' with the 'rocm' use case to set up the driver
 #     and ROCm components.
 #   - Installs additional ROCm and Python development packages.
+#   - Installs a Vulkan driver so graphics workloads reach the GPU.
+#   - Installs a libxml2.so.2 compatibility library when ROCm's bundled 'lld'
+#     cannot resolve its shared libraries, which is the case when the ROCm
+#     build came from an older Ubuntu release than the one running.
+#   - Verifies that the GPU is reachable, that 'lld' starts, and that a Vulkan
+#     driver enumerates the GPU.
 #
 # Variables:
-#   amdgpu_install_version:  Version string for the amdgpu-install .deb package
-#                            (default: 7.1.1.70101-1).
-#   amdgpu_deb_url:          Full URL to download the amdgpu-install .deb package.
-#   amdgpu_deb_path:         Temporary path to store the downloaded .deb file
-#                            (default: /tmp/amdgpu-install.deb).
+#   gpu_users:                  Accounts placed in the GPU access groups
+#                               (default: [the inventory connection user]).
+#   gpu_groups:                 Groups owning the GPU device nodes
+#                               (default: [video, render]).
+#   amdgpu_rocm_version:        ROCm release to install (default: 7.1.1).
+#   amdgpu_install_version:     Version string for the amdgpu-install .deb package
+#                               (default: 7.1.1.70101-1).
+#   amdgpu_supported_releases:  Ubuntu codenames AMD publishes an amdgpu-install
+#                               repository for at amdgpu_rocm_version.
+#   amdgpu_fallback_release:    Codename used when the host runs a release AMD
+#                               does not publish for (default: noble).
+#   amdgpu_repo_release:        Codename actually used, derived from the two above.
+#   amdgpu_deb_url:             Full URL to download the amdgpu-install .deb package.
+#   amdgpu_deb_path:            Temporary path to store the downloaded .deb file
+#                               (default: /tmp/amdgpu-install.deb).
+#   vulkan_packages:            Vulkan driver and diagnostic packages
+#                               (default: [mesa-vulkan-drivers, vulkan-tools]).
+#   rocm_prefix:                ROCm installation prefix (default: /opt/rocm).
+#   rocm_lld_path:              Path to ROCm's bundled lld.
+#   rocm_llvm_lib_dir:          ROCm's LLVM library directory, the first place the
+#                               libxml2 compatibility library is installed.
+#   libxml2_compat_deb_url:     URL of the Ubuntu 25.04 libxml2 package supplying
+#                               the libxml2.so.2 that ROCm's 'lld' links against.
+#   libxml2_compat_deb_path:    Temporary path for the downloaded .deb file
+#                               (default: /tmp/libxml2-compat.deb).
+#   libxml2_compat_extract_dir: Temporary directory the .deb is extracted into
+#                               (default: /tmp/libxml2-compat).
+#   libxml2_compat_lib:         Path of the library within the extracted package.
+#   libxml2_compat_dir:         Directory used when the library has to go on the
+#                               loader's global search path
+#                               (default: /opt/rocm-compat/lib).
+#   libxml2_compat_conf:        ld.so.conf.d file naming libxml2_compat_dir.
 
 - name: Install ROCm (Radeon Open Compute)
   hosts: nodes
   become: true
   become_exe: sudo.ws
   vars:
-    amdgpu_install_version: "7.1.1.70101-1"
+    gpu_users:
+      - '{{ ansible_user }}'
+    gpu_groups:
+      - video
+      - render
+    amdgpu_rocm_version: '7.1.1'
+    amdgpu_install_version: '7.1.1.70101-1'
+    # Codenames present under https://repo.radeon.com/amdgpu-install/7.1.1/ubuntu/.
+    # Raising amdgpu_rocm_version means re-reading that index: AMD adds and drops
+    # releases between ROCm versions rather than tracking Ubuntu's support window.
+    amdgpu_supported_releases:
+      - jammy
+      - noble
+    amdgpu_fallback_release: noble
+    amdgpu_repo_release: >-
+      {{ ansible_distribution_release
+         if ansible_distribution_release in amdgpu_supported_releases
+         else amdgpu_fallback_release }}
     amdgpu_deb_url: >-
-      https://repo.radeon.com/amdgpu-install/7.1.1/ubuntu/noble/amdgpu-install_{{ amdgpu_install_version }}_all.deb
-    amdgpu_deb_path: "/tmp/amdgpu-install.deb"
+      https://repo.radeon.com/amdgpu-install/{{ amdgpu_rocm_version }}/ubuntu/{{
+      amdgpu_repo_release }}/amdgpu-install_{{ amdgpu_install_version }}_all.deb
+    amdgpu_deb_path: /tmp/amdgpu-install.deb
+    vulkan_packages:
+      - mesa-vulkan-drivers
+      - vulkan-tools
+    rocm_prefix: /opt/rocm
+    rocm_lld_path: '{{ rocm_prefix }}/lib/llvm/bin/lld'
+    rocm_llvm_lib_dir: '{{ rocm_prefix }}/lib/llvm/lib'
+    # Ubuntu 25.04's libxml2 — the last Ubuntu package carrying the
+    # libxml2.so.2 SONAME. 25.10 ships only libxml2-16 (libxml2.so.16), which
+    # is not ABI compatible, and the 'libxml2' package name no longer resolves
+    # at all. The '+really' in the version is Debian's marker for a downgrade,
+    # not a typo.
+    #
+    # 25.04's build and not 24.04's, even though ROCm itself is built against
+    # 24.04: noble's libxml2 links libicuuc.so.74 while 25.10 ships libicu76,
+    # so it swaps one missing library for another and lld still will not load.
+    # The 25.04 build needs only libz, liblzma, libm, and libc, all present
+    # here. Served from the archive pool rather than a launchpad.net '+files/'
+    # URL, which redirects through launchpadlibrarian and timed out from the
+    # nodes.
+    libxml2_compat_deb_url: >-
+      http://archive.ubuntu.com/ubuntu/pool/main/libx/libxml2/libxml2_2.12.7+dfsg+really2.9.14-0.4ubuntu0.4_amd64.deb
+    libxml2_compat_deb_path: /tmp/libxml2-compat.deb
+    libxml2_compat_extract_dir: /tmp/libxml2-compat
+    libxml2_compat_lib: usr/lib/x86_64-linux-gnu/libxml2.so.2.9.14
+    libxml2_compat_dir: /opt/rocm-compat/lib
+    libxml2_compat_conf: /etc/ld.so.conf.d/rocm-libxml2-compat.conf
   tasks:
     # -------------------------------------------------------------------------
-    # GPU Group Configuration
-    # Ensures the 'video' and 'render' groups exist, adds the current user to
-    # them, and configures /etc/adduser.conf so new users automatically inherit
-    # the 'video' group — granting GPU access without manual intervention.
+    # Release Check
+    # AMD publishes amdgpu-install repositories for a couple of Ubuntu releases
+    # per ROCm version, and the nodes run ahead of them. Installing the closest
+    # build works, but it lands binaries linked against an older Ubuntu's
+    # libraries — which is the whole reason the libxml2 section below exists.
+    #
+    # The codename picked here reaches further than the one download: the
+    # installer .deb has its own codename baked into the APT sources it drops
+    # in /etc/apt/sources.list.d (amdgpu.list and rocm.list), so it also decides
+    # which build every subsequent ROCm package comes from. It additionally
+    # drops /etc/apt/preferences.d/repo-radeon-pin-600, pinning everything from
+    # repo.radeon.com above Ubuntu's own archive (600 against the default 500).
+    # Nothing of Ubuntu's is displaced by that: every package AMD ships carries
+    # an -amdgpu name of its own (mesa-amdgpu-vulkan-drivers, libegl1-amdgpu-
+    # mesa, llvm-amdgpu), so no name collides with a distribution package.
+    #
+    # This warns rather than fails: the fallback build is the only ROCm these
+    # nodes can have, so failing here would leave them with no GPU stack at
+    # all. What must go red instead is the verification section at the end,
+    # which checks that the resulting installation actually works.
     # -------------------------------------------------------------------------
-    - name: Ensure video and render groups exist
-      ansible.builtin.group:
-        name: "{{ item }}"
-        state: present
-      loop:
-        - video
-        - render
+    - name: Warn when AMD publishes no ROCm repository for this Ubuntu release
+      ansible.builtin.debug:
+        msg: >-
+          AMD publishes no amdgpu-install repository for Ubuntu
+          {{ ansible_distribution_release }} at ROCm {{ amdgpu_rocm_version }}
+          (only {{ amdgpu_supported_releases | join(', ') }}). Installing the
+          {{ amdgpu_fallback_release }} build instead, which needs the
+          libxml2.so.2 compatibility library this playbook installs further
+          down. See ROCm#6046.
+      when: ansible_distribution_release not in amdgpu_supported_releases
 
-    - name: Add user to video and render groups
+    # -------------------------------------------------------------------------
+    # GPU Group Configuration
+    # 'render' owns /dev/kfd and /dev/dri/renderD*, 'video' owns /dev/dri/card*.
+    # ROCm needs 'render'; 'video' is what the graphics stack uses. Both are
+    # granted, and /etc/adduser.conf is configured so new users inherit them
+    # without manual intervention.
+    #
+    # The accounts come from gpu_users rather than from a gathered fact. The
+    # earlier version used ansible_user_id, which is the user Ansible's modules
+    # run as — and since this play sets become at play level, fact gathering
+    # runs as root too, so the tasks added root to these groups and left the
+    # inventory user without GPU access. Nothing fails when that happens:
+    # usermod succeeds and the play goes green, and the first sign of it is
+    # rocminfo reporting permission denied on /dev/kfd.
+    # -------------------------------------------------------------------------
+    - name: Ensure the GPU access groups exist
+      ansible.builtin.group:
+        name: '{{ item }}'
+        state: present
+      loop: '{{ gpu_groups }}'
+
+    - name: Add GPU users to the GPU access groups
       ansible.builtin.user:
-        name: "{{ ansible_user_id }}"
-        groups: video,render
+        name: '{{ item }}'
+        groups: '{{ gpu_groups | join(",") }}'
         append: true
+      loop: '{{ gpu_users }}'
+      notify: Report that open sessions must reconnect
 
     - name: Enable ADD_EXTRA_GROUPS in adduser.conf
       ansible.builtin.lineinfile:
         path: /etc/adduser.conf
-        regexp: "^ADD_EXTRA_GROUPS="
-        line: "ADD_EXTRA_GROUPS=1"
+        regexp: '^ADD_EXTRA_GROUPS='
+        line: ADD_EXTRA_GROUPS=1
         state: present
 
-    - name: Set EXTRA_GROUPS to 'video' in adduser.conf
+    - name: Set EXTRA_GROUPS to the GPU access groups in adduser.conf
       ansible.builtin.lineinfile:
         path: /etc/adduser.conf
-        regexp: "^EXTRA_GROUPS="
-        line: 'EXTRA_GROUPS="video"'
+        regexp: '^EXTRA_GROUPS='
+        line: 'EXTRA_GROUPS="{{ gpu_groups | join(" ") }}"'
         state: present
 
     # -------------------------------------------------------------------------
@@ -79,23 +200,23 @@
       block:
         - name: Download AMDGPU installer package
           ansible.builtin.get_url:
-            url: "{{ amdgpu_deb_url }}"
-            dest: "{{ amdgpu_deb_path }}"
-            mode: "0644"
+            url: '{{ amdgpu_deb_url }}'
+            dest: '{{ amdgpu_deb_path }}'
+            mode: '0644'
 
         - name: Install AMDGPU installer package
           ansible.builtin.apt:
-            deb: "{{ amdgpu_deb_path }}"
+            deb: '{{ amdgpu_deb_path }}'
             state: present
 
         - name: Clean up AMDGPU installer package
           ansible.builtin.file:
-            path: "{{ amdgpu_deb_path }}"
+            path: '{{ amdgpu_deb_path }}'
             state: absent
 
     - name: Run AMDGPU installer for ROCm
       ansible.builtin.command:
-        cmd: "amdgpu-install -y --usecase=rocm"
+        cmd: 'amdgpu-install -y --usecase=rocm'
       register: amdgpu_install_result
       changed_when: "'successfully' in amdgpu_install_result.stdout"
 
@@ -112,6 +233,144 @@
           - python3-wheel
         state: present
         update_cache: true
+
+    # -------------------------------------------------------------------------
+    # Vulkan Driver
+    # The 'rocm' use case installs the compute stack only, so without this
+    # nothing on the node provides a Vulkan ICD and anything using a graphics
+    # API silently lands on a software rasterizer. Mesa's RADV comes from
+    # Ubuntu rather than from amdgpu-install's 'graphics' use case, which
+    # installs AMD's own Mesa built for the repository release — an older
+    # Ubuntu than the one running. 25.10 ships Mesa 25.2.8, which enumerates
+    # the APU as 'AMD Radeon Graphics (RADV GFX1151)'. AMD's packages carry
+    # their own names (mesa-amdgpu-vulkan-drivers), so Ubuntu's
+    # mesa-vulkan-drivers is unaffected by the repo.radeon.com APT pin.
+    # vulkan-tools is what makes a missing ICD visible.
+    # -------------------------------------------------------------------------
+    - name: Install Vulkan driver and tools
+      ansible.builtin.apt:
+        name: '{{ vulkan_packages }}'
+        state: present
+
+    # -------------------------------------------------------------------------
+    # libxml2 Compatibility Library
+    # ROCm's bundled 'lld' is linked against libxml2.so.2. Ubuntu releases after
+    # 25.04 ship only the ABI-incompatible libxml2.so.16, so lld dies at load
+    # time and every hipcc compile fails at the device-link step with
+    # "error while loading shared libraries: libxml2.so.2". This is an open ROCm
+    # bug with no upstream fix: ROCm#6046 (25.10) and ROCm#6194 (26.04). Delete
+    # this whole section once AMD ships an lld that links the current libxml2,
+    # or if the nodes move to a release AMD publishes for.
+    #
+    # Gated on lld failing to resolve its libraries rather than on the release
+    # name, so the section stops doing anything the moment either of those
+    # happens. The gate matches any unresolved library rather than
+    # 'libxml2.so.2' specifically: a compatibility library that is present but
+    # itself unloadable — one pulling in an ICU the host does not have, say —
+    # leaves libxml2.so.2 resolved in ldd output while lld still refuses to
+    # start, and a libxml2-specific gate would skip the block and leave the bad
+    # file in place. Reinstalling overwrites it. If the unresolved library is
+    # something else, this reinstalls libxml2 to no effect and the verification
+    # below fails naming the real one.
+    # -------------------------------------------------------------------------
+    - name: Check whether ROCm's lld resolves its shared libraries
+      ansible.builtin.command:
+        cmd: 'ldd {{ rocm_lld_path }}'
+      register: rocm_lld_libraries
+      changed_when: false
+      failed_when: false
+
+    - name: Install the libxml2.so.2 compatibility library
+      when: "'not found' in rocm_lld_libraries.stdout"
+      block:
+        - name: Download the Ubuntu 25.04 libxml2 package
+          ansible.builtin.get_url:
+            url: '{{ libxml2_compat_deb_url }}'
+            dest: '{{ libxml2_compat_deb_path }}'
+            mode: '0644'
+
+        # No 'creates' guard: a run that died between this task and the cleanup
+        # at the end of the block would leave a tree from a previous package,
+        # which the guard would then treat as up to date.
+        - name: Extract the libxml2 package to /tmp
+          ansible.builtin.command:
+            cmd: >-
+              dpkg-deb --extract {{ libxml2_compat_deb_path }}
+              {{ libxml2_compat_extract_dir }}
+          changed_when: true
+
+        # First placement: ROCm's own LLVM library directory, which is where
+        # ROCm 7.1.1 resolves it from — lld carries a RUNPATH reaching that
+        # directory, as it must to find libclang-cpp.so and libc++.so.1 there.
+        # The library is then visible to ROCm's own binaries and to nothing
+        # else on the system. The fallback below puts it on the loader's global
+        # search path instead, where any process can link against it; it runs
+        # only if a future ROCm build ships an lld without that RUNPATH.
+        - name: Install libxml2.so.2 into the ROCm LLVM library directory
+          ansible.builtin.copy:
+            src: '{{ libxml2_compat_extract_dir }}/{{ libxml2_compat_lib }}'
+            dest: '{{ rocm_llvm_lib_dir }}/libxml2.so.2'
+            remote_src: true
+            owner: root
+            group: root
+            mode: '0644'
+
+        - name: Re-check whether ROCm's lld resolves its shared libraries
+          ansible.builtin.command:
+            cmd: 'ldd {{ rocm_lld_path }}'
+          register: rocm_lld_libraries_rpath
+          changed_when: false
+          failed_when: false
+
+        # Fallback: lld has no RUNPATH reaching its own library directory, so
+        # the loader has to be told about a directory globally. That directory
+        # holds this one file, rather than being /lib/x86_64-linux-gnu, so
+        # nothing links against the obsolete library by accident.
+        - name: Place libxml2.so.2 on the loader search path
+          when: "'not found' in rocm_lld_libraries_rpath.stdout"
+          block:
+            - name: Create the ROCm compatibility library directory
+              ansible.builtin.file:
+                path: '{{ libxml2_compat_dir }}'
+                state: directory
+                owner: root
+                group: root
+                mode: '0755'
+
+            - name: Install libxml2.so.2 into the ROCm compatibility directory
+              ansible.builtin.copy:
+                src: '{{ libxml2_compat_extract_dir }}/{{ libxml2_compat_lib }}'
+                dest: '{{ libxml2_compat_dir }}/libxml2.so.2'
+                remote_src: true
+                owner: root
+                group: root
+                mode: '0644'
+
+            - name: Remove the unreachable copy from the ROCm LLVM directory
+              ansible.builtin.file:
+                path: '{{ rocm_llvm_lib_dir }}/libxml2.so.2'
+                state: absent
+
+            - name: Add the ROCm compatibility directory to the loader path
+              ansible.builtin.template:
+                src: rocm-libxml2-compat.conf.j2
+                dest: '{{ libxml2_compat_conf }}'
+                owner: root
+                group: root
+                mode: '0644'
+
+            - name: Refresh the dynamic linker cache
+              ansible.builtin.command:
+                cmd: ldconfig
+              changed_when: true
+
+        - name: Clean up the libxml2 package and extracted directory
+          ansible.builtin.file:
+            path: '{{ item }}'
+            state: absent
+          loop:
+            - '{{ libxml2_compat_deb_path }}'
+            - '{{ libxml2_compat_extract_dir }}'
 
     # -------------------------------------------------------------------------
     # NPU Module Blacklist
@@ -140,7 +399,89 @@
         mode: '0644'
       notify: Update initramfs
 
+    # -------------------------------------------------------------------------
+    # Verification
+    # Everything above can succeed on a machine where nothing works: usermod
+    # returns 0 whether or not the account can reach the GPU afterwards, and
+    # amdgpu-install returns 0 for a stack whose linker will not start. The
+    # checks below turn either into a failed run.
+    #
+    # A group added during this run is in no session that was already open,
+    # since the group set is fixed at login — including the SSH session Ansible
+    # itself is running over. So the checks below read /etc/group rather than
+    # the credentials of that session: 'id -nG <user>' resolves the named user
+    # from /etc/group, and runuser builds a fresh group set from /etc/group
+    # when it starts rocminfo. The play does not reboot to settle this, since
+    # these are cluster nodes and a reboot from a driver playbook takes the
+    # cluster with it; the handler at the end tells the operator to reconnect.
+    # -------------------------------------------------------------------------
+    - name: Read the group membership of each GPU user
+      ansible.builtin.command:
+        cmd: 'id -nG {{ item }}'
+      loop: '{{ gpu_users }}'
+      register: gpu_user_groups
+      changed_when: false
+
+    - name: Assert each GPU user is in the GPU access groups
+      ansible.builtin.assert:
+        that:
+          - gpu_groups | difference(item.stdout.split()) | length == 0
+        fail_msg: >-
+          {{ item.item }} is not in
+          {{ gpu_groups | difference(item.stdout.split()) | join(', ') }},
+          so it cannot open /dev/kfd or /dev/dri.
+      loop: '{{ gpu_user_groups.results }}'
+      loop_control:
+        label: '{{ item.item }}'
+
+    - name: Verify each GPU user can enumerate the GPU with rocminfo
+      ansible.builtin.command:
+        cmd: 'runuser -u {{ item }} -- {{ rocm_prefix }}/bin/rocminfo'
+      loop: '{{ gpu_users }}'
+      changed_when: false
+
+    # lld is the device-link step of every hipcc compile, and it fails by
+    # refusing to load rather than by reporting an error, so running it is the
+    # cheapest end-to-end check that the libxml2 section did its job.
+    #
+    # The flavor argument is not optional. lld is a multi-driver binary that
+    # picks its driver from argv[0], and invoked under its own name it prints
+    # "lld is a generic driver" and exits 1 — which fails this task on a
+    # perfectly working installation. 'gnu' is the flavor clang selects when it
+    # invokes lld for an AMDGPU device link, so this runs what hipcc runs.
+    - name: Verify ROCm's lld starts
+      ansible.builtin.command:
+        cmd: '{{ rocm_lld_path }} -flavor gnu --version'
+      changed_when: false
+
+    - name: Read the Vulkan driver summary
+      ansible.builtin.command:
+        cmd: vulkaninfo --summary
+      register: vulkaninfo_result
+      changed_when: false
+
+    # Matched on the driver name rather than on a device being listed at all:
+    # Mesa always exposes llvmpipe as an additional device, so vulkaninfo
+    # reports a GPU even when no hardware driver is installed.
+    - name: Assert a Vulkan driver enumerates the GPU
+      ansible.builtin.assert:
+        that:
+          - "'radv' in (vulkaninfo_result.stdout | lower)"
+        fail_msg: >-
+          vulkaninfo names no RADV driver, so graphics workloads are on a
+          software rasterizer rather than the GPU.
+
   handlers:
+    # A handler so the notice is the last thing the run prints, and so it
+    # appears only on the runs that actually changed a group.
+    - name: Report that open sessions must reconnect
+      ansible.builtin.debug:
+        msg: >-
+          GPU group membership changed. Shells that were already open still
+          carry the old group set and will keep getting permission denied on
+          /dev/kfd — log out and back in, or reboot the node, before using the
+          GPU from them.
+
     - name: Update initramfs
       ansible.builtin.command:
         cmd: update-initramfs -u -k all
