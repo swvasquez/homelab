@@ -119,6 +119,7 @@ a strong credential.
 | **Zotero (WebDAV)** | Zotero desktop/mobile clients only speak HTTP Basic and do not follow redirects. | Apache HTTP Basic auth against an htpasswd credential (bcrypt-hashed, delivered via OpenBao + ESO). |
 | **Vaultwarden (native clients)** | The desktop/mobile/browser-extension Bitwarden clients call the Vaultwarden API directly rather than through the browser flow. | Vaultwarden's own account auth. (Its **web vault** UI still uses Model A + Model B; only the API path bypasses ForwardAuth.) |
 | **Syncthing (sync protocol)** | The peer block-exchange/discovery protocol is not HTTP and has no login concept. | Syncthing's own device-ID/TLS peer authentication. (Its **GUI** still uses Model A.) |
+| **Harbor (registry API)** | containerd pulls images over `/v2` and fetches a token from `/service`; it cannot follow a redirect to a login form and reports the returned HTML as a malformed manifest. | Harbor's own token issuer, which returns an anonymous pull token because the proxy cache projects are public. `hosts.toml` has no credentials field and the cluster's `imagePullSecrets` match on the registry named in the image reference rather than the mirror contacted, so no credential in the cluster reaches Harbor. These paths serve cached copies of images that are public upstream. (Its **web portal** uses Model A + Model B; only the registry paths bypass ForwardAuth.) |
 
 The common thread: **the bypass is dictated by the client, not the service.** A
 service is gated by Authentik when its users arrive through a browser that can be

@@ -1,0 +1,81 @@
+{#
+  Host-backed storage for Harbor's registry blobs: a StorageClass with no
+  provisioner, a statically defined local PersistentVolume on the node flagged
+  registry_cache_node in the inventory, and the PVC Harbor's registry
+  component claims.
+
+  Not Longhorn, unlike every other volume in the cluster. Cached blobs are
+  reconstructible by pulling upstream again, so replicating them costs disk on
+  both nodes to protect data that has a free source of truth. Harbor's
+  database is not reconstructible and stays on Longhorn.
+
+  volumeBindingMode WaitForFirstConsumer is what pins the registry pod to the
+  node holding the blobs. The scheduler defers binding until it places the pod,
+  then honours the PV's nodeAffinity, so the pod lands where the directory is.
+  A nodeSelector on the Deployment would achieve the same placement but would
+  duplicate the node's identity in a second place and let the two disagree.
+
+  The capacity is advisory. Kubernetes uses it to match this PVC to this PV and
+  nothing enforces it against the filesystem, so the registry can write past it
+  until the underlying partition is full. What bounds growth is the retention
+  rule plus garbage collection, both configured by cluster/registry.yml. Making
+  this a real ceiling means giving the path its own filesystem — an LVM logical
+  volume or a loopback image — which is a decision about the node's disks
+  rather than about Harbor.
+
+  reclaimPolicy Retain so deleting the PVC leaves the directory alone. For a
+  cache the data is expendable, but Delete on a local volume means a mistaken
+  `helm uninstall` silently empties a host directory, and the recovery for the
+  opposite mistake is one `rm -rf` the operator chooses to run.
+
+  Variables:
+    registry_storage_class:  Name of the no-provisioner StorageClass.
+    registry_cache_path:     Directory on the host holding the blobs.
+    registry_cache_size:     Advisory capacity of the PV and request of the PVC.
+    registry_cache_hostname: Inventory hostname of the node holding the blobs,
+                             matched against the kubernetes.io/hostname label.
+    harbor_namespace:        Namespace the PVC is created in.
+#}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: '{{ registry_storage_class }}'
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: harbor-registry-blobs
+spec:
+  capacity:
+    storage: '{{ registry_cache_size }}'
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: '{{ registry_storage_class }}'
+  local:
+    path: '{{ registry_cache_path }}'
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - '{{ registry_cache_hostname }}'
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: harbor-registry-blobs
+  namespace: '{{ harbor_namespace }}'
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: '{{ registry_storage_class }}'
+  volumeName: harbor-registry-blobs
+  resources:
+    requests:
+      storage: '{{ registry_cache_size }}'

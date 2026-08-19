@@ -30,11 +30,12 @@ The cluster playbooks then run in this order, each via
 8. `authentication`
 9. `git`
 10. `gitops`
-11. `security`
-12. `agent`
+11. `registry`
+12. `security`
+13. `agent`
 
-Two dependencies inside that sequence are worth calling out, because the failure
-they produce doesn't point back at the ordering:
+Three dependencies inside that sequence are worth calling out, because the
+failure they produce doesn't point back at the ordering:
 
 - **`security` after `authentication`.** The security playbook patches the
   running kube-apiserver; doing it before Authentik exists leaves services
@@ -42,6 +43,11 @@ they produce doesn't point back at the ordering:
 - **`observability` before `security`.** Falcosidekick forwards alerts to
   Alertmanager, which `observability.yml` provides. Deploy Falco first and it has
   nowhere to send anything.
+- **`registry` after `kubernetes`.** `kubernetes.yml` writes the containerd
+  `config_path` that makes the mirror files `registry.yml` drops on each node
+  readable. Without it containerd ignores them and logs nothing, so every pull
+  keeps going upstream and the cache silently stays empty. On a cluster built
+  before the registry playbook existed, `kubernetes` has to be re-run.
 
 `agent` is listed last but depends on nothing beyond a reachable apiserver, so
 it can run at any point after `bootstrap`. It creates a ServiceAccount and

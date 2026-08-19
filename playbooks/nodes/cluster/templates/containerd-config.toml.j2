@@ -25,6 +25,10 @@
   Variables:
     containerd_sandbox_image:  Pause image started for each pod sandbox.
                                Defined in playbooks/nodes/cluster/kubernetes.yml.
+    containerd_certs_dir:      Directory searched for per-registry hosts.toml
+                               mirror configuration. Defined in
+                               playbooks/nodes/cluster/kubernetes.yml and
+                               populated by playbooks/nodes/cluster/registry.yml.
 #}
 # Schema version, not a containerd version. Version 3 is what containerd 2.x
 # reads natively. A version 2 file is still accepted and migrated at startup
@@ -56,3 +60,19 @@ version = 3
 # stops the pause image from being reclaimed while pods are using it.
 [plugins.'io.containerd.cri.v1.images'.pinned_images]
   sandbox = '{{ containerd_sandbox_image }}'
+
+# Directory containerd searches for per-registry mirror configuration, as
+# <config_path>/<registry host>/hosts.toml. Written by cluster/registry.yml,
+# which points the registries the cluster pulls from at Harbor's proxy cache.
+#
+# containerd does not read hosts.toml unless this key names a directory: with
+# it unset, a hosts.toml dropped on a node is ignored and nothing is logged
+# about the file that was never read. Stated here rather than in registry.yml
+# because it belongs to the containerd config this template owns, and it is
+# inert on its own — with certs.d empty or absent, every pull goes upstream
+# as it did before.
+#
+# containerd re-reads this directory per pull, so adding, correcting, or
+# removing a mirror takes effect without restarting the runtime.
+[plugins.'io.containerd.cri.v1.images'.registry]
+  config_path = '{{ containerd_certs_dir }}'

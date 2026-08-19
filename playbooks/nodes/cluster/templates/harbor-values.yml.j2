@@ -1,0 +1,122 @@
+{#
+  Helm values for Harbor, deployed as a proxy cache for the registries
+  the cluster pulls from.
+
+  Scoped to caching. Trivy is disabled, and nothing here pushes homelab-built
+  images — the OTBR image still reaches the cluster through
+  `docker save | ctr -n k8s.io images import`, which needs no registry.
+  Enabling scanning later is this file plus a PVC for the vulnerability
+  database.
+
+  expose.type is clusterIP rather than ingress so the chart deploys its own
+  nginx component, which does Harbor's internal path routing (/v2 to the
+  registry, /service to the token issuer, /api and / to core and portal)
+  behind a single Service. cluster/registry.yml's HTTPRoutes then all point at
+  that one Service and differ only in which of them carries the Authentik
+  ForwardAuth filter. Using the chart's own ingress instead would put that
+  path routing in a resource the chart owns, where the filter cannot be
+  applied selectively.
+
+  expose.tls.enabled is false because Traefik terminates TLS at the gateway
+  using the wildcard certificate that already covers *.{{ dns_zone }}.
+  externalURL is still https: Harbor builds the Www-Authenticate realm that
+  containerd follows to fetch a token out of this value, so a http:// here
+  sends every client to a scheme the gateway redirects away from.
+
+  harborAdminPassword is supplied through existingSecretAdminPassword rather
+  than inline, so the credential stays out of the rendered Helm release blob.
+  Setting it at all matters beyond hygiene: Harbor 2.15.0 and earlier accepted
+  the built-in Harbor12345 for the admin account regardless of configuration
+  (CVE-2026-4404, fixed in 2.15.1). This deployment is on a fixed version and
+  does not rely on that.
+
+  updateStrategy is Recreate. The registry's blobs live on a ReadWriteOnce
+  local PersistentVolume, so a RollingUpdate would hold the volume in the old
+  pod while the new one waits to attach it, and the upgrade would stall until
+  the deadline. Recreate stops the old pod first, at the cost of the cache
+  being briefly unavailable during an upgrade — which degrades to upstream
+  pulls rather than to failures.
+
+  The chart's default containerSecurityContext already drops all capabilities,
+  disallows privilege escalation, sets seccompProfile RuntimeDefault, and runs
+  as non-root, so Harbor satisfies the cluster's fail-closed `restricted` Pod
+  Security Admission default without a namespace opt-down and without
+  restating any of it here.
+
+  Harbor's images bake in UID/GID 10000, so the pods are not remapped to the
+  shared nonroot_uid the way the charts that accept a runAsUser are. The blob
+  directory on the host is chowned to match, in cluster/registry.yml.
+
+  PostgreSQL is a CloudNativePG Cluster managed outside this chart, so the
+  bundled database is disabled and the password is read from the same
+  cnpg-formatted Secret CloudNativePG provisions the user from. Valkey (the
+  chart's internal cache, named redis in the values regardless) stays bundled
+  — it holds job state and API cache, both regenerable, and running it through
+  CloudNativePG's operator is not an option since it is not PostgreSQL.
+
+  Variables:
+    harbor_hostname:         FQDN Harbor is reached at, derived from dns_zone.
+    harbor_storage_class:    StorageClass for the volumes that are not the blob
+                             store (default: longhorn).
+    harbor_db_name:          PostgreSQL database name for Harbor's core.
+    harbor_db_username:      PostgreSQL username for Harbor.
+    harbor_ca_bundle_secret: Name of the Secret holding the homelab CA under a
+                             ca.crt key, created by the playbook.
+    harbor_namespace:        Namespace Harbor is deployed into, used to address
+                             the CloudNativePG read-write Service.
+    dns_zone:                DNS zone served by Bind9. Read from group_vars.
+#}
+expose:
+  type: clusterIP
+  tls:
+    enabled: false
+
+externalURL: 'https://{{ harbor_hostname }}'
+
+existingSecretAdminPassword: harbor-credentials
+existingSecretAdminPasswordKey: admin-password
+existingSecretSecretKey: harbor-credentials
+
+updateStrategy:
+  type: Recreate
+
+# Injects the homelab CA into the trust store of core, jobservice, registry,
+# and trivy. Harbor's core needs it to verify Authentik's certificate when it
+# fetches the OIDC discovery document, which is what lets oidc_verify_cert stay
+# on. The Secret's key must be named ca.crt.
+caBundleSecretName: '{{ harbor_ca_bundle_secret }}'
+
+persistence:
+  enabled: true
+  resourcePolicy: keep
+  persistentVolumeClaim:
+    # Claimed rather than provisioned: the blob store is a static local volume
+    # on the node flagged registry_cache_node, created by
+    # registry-blob-storage.yml.j2.
+    registry:
+      existingClaim: harbor-registry-blobs
+    jobservice:
+      jobLog:
+        storageClass: '{{ harbor_storage_class }}'
+        size: 1Gi
+    redis:
+      storageClass: '{{ harbor_storage_class }}'
+      size: 1Gi
+
+database:
+  type: external
+  external:
+    host: harbor-db-rw.{{ harbor_namespace }}.svc
+    port: '5432'
+    username: '{{ harbor_db_username }}'
+    coreDatabase: '{{ harbor_db_name }}'
+    # Key must be named `password`, which is what the cnpg-formatted Secret
+    # already uses.
+    existingSecret: harbor-db-credentials
+    sslmode: disable
+
+redis:
+  type: internal
+
+trivy:
+  enabled: false

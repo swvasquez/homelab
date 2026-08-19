@@ -46,7 +46,7 @@ Playbooks live under `playbooks/`, organized by Ansible inventory group, then by
 | Directory | Contains |
 |-----------|----------|
 | `nodes/infrastructure` | Host configuration applied to an already-installed OS (e.g. remote access, firewall rules, shared storage) |
-| `nodes/cluster` | Kubernetes cluster bootstrapping and core platform components, including the Git server (`git.yml`) and GitOps controller (`gitops.yml`) |
+| `nodes/cluster` | Kubernetes cluster bootstrapping and core platform components, including the Git server (`git.yml`), GitOps controller (`gitops.yml`), and registry proxy cache (`registry.yml`) |
 | `nodes/development` | Language toolchains and common CLI utilities |
 | `nodes/service` | Cluster-hosted user services (e.g. Syncthing, Jellyfin, Vaultwarden) |
 | `ipkvm/infrastructure` | OS-level configurations for IP KVM devices |

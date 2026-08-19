@@ -1,0 +1,55 @@
+{#
+  containerd mirror configuration for one upstream registry, written to
+  <containerd_certs_dir>/<upstream host>/hosts.toml. containerd finds this
+  file by the directory name matching the registry host in an image
+  reference, so manifests keep saying ghcr.io/... and the node looks at
+  Harbor first without anything rewriting the reference.
+
+  The file is read only because cluster/kubernetes.yml sets
+  registry.config_path in the containerd config. Without that key containerd
+  never opens this file and never says so.
+
+  server is the fallback, and host entries are tried before it. With Harbor
+  down, unreachable, or not yet installed, pulls go straight upstream — which
+  is what makes it safe to deploy this before Harbor exists and what keeps a
+  cluster whose registry lives inside it from being unable to start.
+
+  override_path is required and is the setting most easily missed. By default
+  containerd treats the host URL as a registry root and appends its own
+  /v2/<repository>/..., which against a URL that already ends in /v2/<project>
+  produces /v2/<project>/v2/<repository> and a 404 on every pull. override_path
+  tells containerd the path given here is already the API root, so the request
+  becomes /v2/<project>/<repository>/manifests/<tag> — the path Harbor's proxy
+  cache projects serve.
+
+  capabilities includes resolve, not just pull. containerd's own documentation
+  gives public mirrors ["pull"] alone so that an untrusted mirror cannot decide
+  which digest a tag names; the client asks upstream to resolve the tag and
+  fetches only blobs from the mirror. That would leave the cache useless
+  whenever upstream is unreachable, which is half the reason it exists. Harbor
+  here is a registry the homelab runs, so it is trusted to answer both, and
+  this line is what makes the cache an availability measure rather than only a
+  bandwidth one.
+
+  Pulls are anonymous. hosts.toml has no credentials field, and the
+  imagePullSecrets already in the cluster are matched against the registry host
+  in the image reference rather than the mirror actually contacted, so nothing
+  in the existing credential path reaches Harbor. The proxy cache projects are
+  public for this reason.
+
+  Variables:
+    registry_upstream_url:   Scheme and host of the upstream registry this
+                             file mirrors (e.g. https://ghcr.io).
+    registry_project:        Name of the Harbor proxy cache project holding
+                             this upstream's cached artifacts.
+    harbor_hostname:         FQDN of the Harbor service
+                             (e.g. harbor.homelab.internal).
+    registry_ca_path:        Full path to the homelab CA certificate on the
+                             node, used to verify Harbor's TLS certificate.
+#}
+server = "{{ registry_upstream_url }}"
+
+[host."https://{{ harbor_hostname }}/v2/{{ registry_project }}"]
+  capabilities = ["pull", "resolve"]
+  override_path = true
+  ca = "{{ registry_ca_path }}"

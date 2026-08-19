@@ -1,0 +1,1261 @@
+---
+# ==============================================================================
+# Playbook: Install Harbor as a Registry Proxy Cache
+# ==============================================================================
+# This playbook deploys Harbor to the Kubernetes cluster via Helm and points
+# the cluster's container runtime at it, so images come off the LAN instead of
+# the internet.
+#
+# Every registry the cluster pulls from gets a Harbor proxy cache project and a
+# matching containerd mirror entry in
+# /etc/containerd/certs.d/<registry host>/hosts.toml. containerd resolves the
+# mirror below the manifest, so image references are unchanged — a pod still
+# names ghcr.io and the node looks at Harbor first. No admission policy rewrites
+# anything.
+#
+# Written after the cri-dockerd to containerd migration on 2026-08-18, which
+# left both nodes reading an empty k8s.io containerd namespace: roughly a
+# hundred images re-pulled from upstream at once, producing ErrImagePull on
+# CoreDNS and Kyverno. The same happens on any node rebuild and on the second
+# node of a rolling operation. Under cri-dockerd this was not possible —
+# Docker's registry-mirrors redirected Docker Hub only, so caching ghcr.io or
+# registry.k8s.io would have required rewriting every manifest.
+#
+# Harbor runs inside the cluster it caches for. The `server` fallback in
+# hosts.toml resolves the circularity: with Harbor down, unreachable, or not
+# yet installed, pulls go upstream as they did before. That is also what lets
+# every dependency it needs (Longhorn, CloudNativePG, Traefik, cert-manager) be
+# the copy the cluster already runs. Harbor's own images cannot come from
+# Harbor, so a cold start pulls them upstream first.
+#
+# Pulls are anonymous and the proxy cache projects are public. hosts.toml has
+# no credentials field, and the cluster's imagePullSecrets are matched against
+# the registry host named in the image reference rather than the mirror
+# contacted, so no credential in the cluster reaches Harbor. The alternatives
+# are a static Authorization header in hosts.toml on every node, or rewriting
+# manifests to Harbor paths so the secrets match — the manifest rewriting this
+# design avoids. The public projects serve cached copies of images that are
+# public upstream.
+#
+# Harbor authenticates its portal against Authentik over OIDC, with accounts
+# created on first login. That is separate from the ForwardAuth gate below:
+# ForwardAuth decides whether a request reaches the host, Harbor's own login
+# decides identity inside Harbor. It removes the second password, not the
+# second page — Harbor shows a "LOGIN WITH AUTHENTIK" button and has no setting
+# to skip it.
+#
+# The registry API carries no ForwardAuth filter. containerd cannot complete a
+# browser redirect flow, so /v2 and /service are served without it and Harbor's
+# token issuer guards them. Three HTTPRoutes share one hostname and one backend
+# Service, differing only in path prefix and whether the filter is attached;
+# Gateway API gives the longest matching prefix precedence, so the portal route
+# at / takes everything the other two do not claim.
+#
+# Blob storage is not on Longhorn. Cached blobs can be re-fetched upstream, so
+# replicating them spends disk on both nodes to protect data that has another
+# copy. They live on a static local PersistentVolume on the node flagged
+# registry_cache_node in the inventory; the volume's node affinity and
+# WaitForFirstConsumer binding place the registry pod there. Harbor's database
+# cannot be re-fetched and stays on Longhorn via CloudNativePG.
+#
+# Run order:
+#   1. cluster/kubernetes.yml   (sets containerd's registry config_path)
+#   2. cluster/storage.yml      (Longhorn, for the database and job logs)
+#   3. cluster/database.yml     (CloudNativePG operator)
+#   4. cluster/network.yml      (Traefik gateway and the wildcard certificate)
+#   5. cluster/authentication.yml (Authentik, for the portal's ForwardAuth gate)
+#   6. cluster/registry.yml     (this playbook)
+#
+# Variables:
+#   bootstrap_node:          Boolean indicating if the host is the control
+#                            plane bootstrap node where Helm and kubectl
+#                            commands run. Read from inventory host vars.
+#   registry_cache_node:     Boolean indicating if the host stores the cached
+#                            image blobs. Read from inventory host vars.
+#   dns_zone:                DNS zone served by Bind9 (e.g. homelab.internal).
+#                            Read from group_vars.
+#   harbor_namespace:        Kubernetes namespace for Harbor
+#                            (default: harbor).
+#   harbor_chart_version:    Helm chart version of Harbor to install
+#                            (default: 1.19.2, which deploys Harbor 2.15.2).
+#   harbor_hostname:         FQDN for Harbor, derived from dns_zone
+#                            (default: harbor.<dns_zone>).
+#   harbor_storage_class:    StorageClass for Harbor's volumes other than the
+#                            blob store (default: longhorn).
+#   harbor_db_name:          PostgreSQL database name for Harbor's core
+#                            (default: registry).
+#   harbor_db_username:      PostgreSQL username for Harbor (default: harbor).
+#   harbor_db_storage_size:  Storage size for the Harbor cnpg database PVC
+#                            (default: 5Gi).
+#   harbor_uid:              UID/GID baked into Harbor's images, applied to the
+#                            blob directory on the host (default: 10000).
+#   harbor_ca_bundle_secret: Name of the Secret holding the homelab CA under a
+#                            ca.crt key, mounted into Harbor's trust store via
+#                            the chart's caBundleSecretName so it can verify
+#                            Authentik's certificate
+#                            (default: harbor-ca-bundle).
+#   authentik_namespace:     Kubernetes namespace where Authentik is deployed.
+#                            Used by the ForwardAuth Middleware template to
+#                            build the outpost URL (default: authentik).
+#   authentik_hostname:      FQDN for Authentik, derived from dns_zone. Used to
+#                            build the OIDC issuer URL Harbor is pointed at
+#                            (default: authentik.<dns_zone>).
+#   harbor_oidc_name:        Provider name Harbor shows on its login button
+#                            (default: authentik).
+#   registry_cache_path:     Directory on the cache node holding the blobs
+#                            (default: /var/lib/harbor/registry).
+#   registry_cache_size:     Capacity of the blob PersistentVolume. Advisory —
+#                            see the note on the storage template
+#                            (default: 30Gi).
+#   registry_cache_retained_tags:
+#                            Number of most recently cached artifacts kept per
+#                            repository, with no time component (default: 1).
+#   registry_storage_class:  Name of the no-provisioner StorageClass backing
+#                            the blob volume (default: registry-blobs).
+#   registry_proxied:        Upstream registries to cache, each with the
+#                            containerd host directory, the URL containerd
+#                            falls back to, the URL and adapter type of
+#                            Harbor's registry endpoint, and the Harbor project
+#                            name.
+#   registry_retention_cron: Harbor cron for the per-project retention job.
+#                            Harbor crons carry a leading seconds field
+#                            (default: 0 0 3 * * *).
+#   registry_gc_cron:        Harbor cron for the system garbage collection job
+#                            (default: 0 0 4 * * *).
+#   containerd_certs_dir:    Directory containerd searches for hosts.toml. Must
+#                            match the value cluster/kubernetes.yml writes into
+#                            the containerd config
+#                            (default: /etc/containerd/certs.d).
+#   kubectl_config_path:     Full path to the kubectl config file
+#                            (default: /home/<ansible_user>/.kube/config).
+
+- name: Install Harbor as a registry proxy cache
+  hosts: nodes
+  become: true
+  become_exe: sudo.ws
+  vars:
+    harbor_namespace: harbor
+    harbor_chart_version: 1.19.2
+    harbor_hostname: 'harbor.{{ dns_zone }}'
+    harbor_storage_class: longhorn
+    harbor_db_name: registry
+    harbor_db_username: harbor
+    harbor_db_storage_size: 5Gi
+    harbor_uid: 10000
+    harbor_ca_bundle_secret: harbor-ca-bundle
+    authentik_namespace: authentik
+    authentik_hostname: 'authentik.{{ dns_zone }}'
+    # Shown on the button Harbor puts on its login page, which reads
+    # "LOGIN WITH <name>" uppercased.
+    harbor_oidc_name: authentik
+    # Scope mappings to request from Authentik, each paired with the scope it
+    # issues. The scope is stated here rather than read back from the mapping
+    # because /propertymappings/all/ serializes only the fields every mapping
+    # type shares — pk and name are present, scope_name is not.
+    #
+    # offline_access is included because Harbor needs a refresh token to keep a
+    # session past the access token's lifetime; without it the portal drops
+    # back to the login page on expiry. Each entry is matched against what
+    # Authentik actually has, so an Authentik missing a mapping yields a
+    # shorter scope string rather than a request for a scope its provider
+    # cannot issue.
+    harbor_oidc_scopes:
+      - scope: openid
+        mapping: "authentik default OAuth Mapping: OpenID 'openid'"
+      - scope: email
+        mapping: "authentik default OAuth Mapping: OpenID 'email'"
+      - scope: profile
+        mapping: "authentik default OAuth Mapping: OpenID 'profile'"
+      - scope: offline_access
+        mapping: "authentik default OAuth Mapping: OpenID 'offline_access'"
+    registry_cache_path: /var/lib/harbor/registry
+    registry_cache_size: 30Gi
+    registry_cache_retained_tags: 1
+    registry_storage_class: registry-blobs
+    registry_retention_cron: '0 0 3 * * *'
+    registry_gc_cron: '0 0 4 * * *'
+    containerd_certs_dir: /etc/containerd/certs.d
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    registry_ca_path: '{{ containerd_certs_dir }}/homelab-ca.crt'
+    # Inventory hostname of the node holding the blobs, and of the node running
+    # kubectl. Derived from the inventory rather than named here so the two
+    # roles can move without editing this playbook.
+    registry_cache_hostname: >-
+      {{ groups["nodes"] | map("extract", hostvars)
+         | selectattr("registry_cache_node", "equalto", true)
+         | map(attribute="inventory_hostname") | first }}
+    bootstrap_hostname: >-
+      {{ groups["nodes"] | map("extract", hostvars)
+         | selectattr("bootstrap_node", "equalto", true)
+         | map(attribute="inventory_hostname") | first }}
+    # One hostname and one backend Service, split by path so that only the
+    # portal carries the Authentik filter. See the HTTPRoutes section.
+    harbor_routes:
+      - name: registry
+        prefix: /v2
+        forward_auth: false
+      - name: token
+        prefix: /service
+        forward_auth: false
+      - name: portal
+        prefix: /
+        forward_auth: true
+    # The registries the cluster pulls from. `host` is the directory containerd
+    # looks in, matched against the registry host in an image reference.
+    #
+    # docker.io needs two different URLs because the name in an image reference
+    # is not a registry endpoint: containerd falls back to registry-1.docker.io,
+    # while Harbor's docker-hub adapter is pointed at hub.docker.com.
+    #
+    # Everything else uses the generic docker-registry adapter rather than a
+    # vendor-specific one. Harbor ships dedicated ghcr and quay adapters, but
+    # those exist for replication features this deployment does not use, and
+    # several of them require credentials that anonymous proxy caching does not.
+    registry_proxied:
+      - host: docker.io
+        fallback_url: https://registry-1.docker.io
+        endpoint_url: https://hub.docker.com
+        endpoint_type: docker-hub
+        project: dockerhub
+      - host: ghcr.io
+        fallback_url: https://ghcr.io
+        endpoint_url: https://ghcr.io
+        endpoint_type: docker-registry
+        project: ghcr
+      - host: quay.io
+        fallback_url: https://quay.io
+        endpoint_url: https://quay.io
+        endpoint_type: docker-registry
+        project: quay
+      - host: registry.k8s.io
+        fallback_url: https://registry.k8s.io
+        endpoint_url: https://registry.k8s.io
+        endpoint_type: docker-registry
+        project: k8s
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Namespace
+    # Created before any other resource so the credential Secrets and the blob
+    # PVC have a home prior to the Helm install.
+    # -------------------------------------------------------------------------
+    - name: Create Harbor namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create namespace {{ harbor_namespace }}
+      register: harbor_ns_result
+      changed_when: "'created' in harbor_ns_result.stdout"
+      failed_when:
+        - harbor_ns_result.rc != 0
+        - "'already exists' not in harbor_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Default ServiceAccount Hardening
+    # Disables the default ServiceAccount token automount in this namespace so
+    # ad-hoc pods that don't name a ServiceAccount cannot read a usable API
+    # bearer credential.
+    # -------------------------------------------------------------------------
+    - name: Disable default ServiceAccount token automount in Harbor namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch serviceaccount default
+          -n {{ harbor_namespace }}
+          --type=merge
+          -p '{"automountServiceAccountToken": false}'
+      register: harbor_sa_automount_result
+      changed_when: "'patched' in harbor_sa_automount_result.stdout"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Harbor Credentials
+    # Generates the admin password, the registry secret key, and the PostgreSQL
+    # password on first run, then reuses them on every subsequent run so they
+    # stay stable across upgrades. Two Secrets, guarded independently:
+    # harbor-credentials holds admin-password and secretKey, harbor-db-
+    # credentials holds the cnpg-formatted username + password consumed both by
+    # CloudNativePG to provision the user and by Harbor's chart through
+    # database.external.existingSecret.
+    #
+    # secretKey is the key Harbor encrypts stored registry credentials with. It
+    # must be exactly 16 characters, and the chart will generate one if none is
+    # supplied — but a generated value is recoverable only through Helm's
+    # lookup of the previous release, so it is generated here into a named
+    # Secret instead, where a reinstall finds it the same way every other
+    # credential is found.
+    # -------------------------------------------------------------------------
+    - name: Check if Harbor credentials secret already exists
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret harbor-credentials -n {{ harbor_namespace }}
+      register: existing_harbor_credentials_check
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Check if Harbor database credentials secret already exists
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret harbor-db-credentials -n {{ harbor_namespace }}
+      register: existing_harbor_db_credentials_check
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Generate Harbor admin password
+      ansible.builtin.command:
+        cmd: openssl rand -base64 24
+      register: generated_harbor_admin_password
+      changed_when: false
+      when:
+        - bootstrap_node | default(false)
+        - existing_harbor_credentials_check.rc != 0
+
+    # -hex 8 rather than -base64: Harbor requires the key to be exactly 16
+    # characters, and 8 bytes of hex is 16 of them.
+    - name: Generate Harbor registry secret key
+      ansible.builtin.command:
+        cmd: openssl rand -hex 8
+      register: generated_harbor_secret_key
+      changed_when: false
+      when:
+        - bootstrap_node | default(false)
+        - existing_harbor_credentials_check.rc != 0
+
+    - name: Generate Harbor PostgreSQL password
+      ansible.builtin.command:
+        cmd: openssl rand -base64 24
+      register: generated_harbor_postgres_password
+      changed_when: false
+      when:
+        - bootstrap_node | default(false)
+        - existing_harbor_db_credentials_check.rc != 0
+
+    - name: Create Harbor credentials Kubernetes secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic harbor-credentials
+          -n {{ harbor_namespace }}
+          --from-literal=admin-password={{ generated_harbor_admin_password.stdout }}
+          --from-literal=secretKey={{ generated_harbor_secret_key.stdout }}
+      when:
+        - bootstrap_node | default(false)
+        - existing_harbor_credentials_check.rc != 0
+      changed_when: true
+
+    - name: Create Harbor cnpg database credentials Kubernetes secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic harbor-db-credentials
+          -n {{ harbor_namespace }}
+          --from-literal=username={{ harbor_db_username }}
+          --from-literal=password={{ generated_harbor_postgres_password.stdout }}
+      when:
+        - bootstrap_node | default(false)
+        - existing_harbor_db_credentials_check.rc != 0
+      changed_when: true
+
+    - name: Read Harbor admin password from Kubernetes secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret harbor-credentials -n {{ harbor_namespace }}
+          -o jsonpath='{.data.admin-password}'
+      register: harbor_admin_password_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Harbor admin password fact
+      ansible.builtin.set_fact:
+        harbor_admin_password: '{{ harbor_admin_password_b64.stdout | b64decode }}'
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Homelab CA
+    # The wildcard-tls Secret's ca.crt field carries the issuer's certificate,
+    # and since the wildcard is signed by homelab-ca-issuer that is the
+    # homelab-ca root. Read once here and used twice: as a Secret mounted into
+    # Harbor's containers, and as a file on each node for containerd.
+    #
+    # Harbor needs it to verify Authentik's certificate when it fetches the
+    # OIDC discovery document and exchanges the authorization code. Without it
+    # the only way to make OIDC work is oidc_verify_cert false, which turns off
+    # certificate verification on the path that carries the login.
+    #
+    # delegate_to rather than `when: bootstrap_node`, so every host in the play
+    # gets the certificate even when the bootstrap node is not one of them.
+    # That is what lets a first run be narrowed to a single non-bootstrap node
+    # with --limit. Each host reads the Secret for itself, which is one
+    # redundant kubectl call per node and avoids run_once, whose behavior
+    # depends on the play's strategy.
+    # -------------------------------------------------------------------------
+    - name: Read homelab CA certificate from wildcard-tls secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret wildcard-tls -n kube-system
+          -o jsonpath='{.data.ca\.crt}'
+      register: registry_homelab_ca_b64
+      changed_when: false
+      delegate_to: '{{ bootstrap_hostname }}'
+
+    # Applied rather than create-only, so a CA rotation propagates into
+    # Harbor's trust store on the next run instead of leaving a stale
+    # certificate that fails only when Authentik's chain next changes.
+    - name: Apply homelab CA bundle secret in Harbor namespace
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail;
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create secret generic {{ harbor_ca_bundle_secret }}
+          -n {{ harbor_namespace }}
+          --from-literal=ca.crt='{{ registry_homelab_ca_b64.stdout | b64decode }}'
+          --dry-run=client -o yaml |
+          kubectl --kubeconfig={{ kubectl_config_path }} apply -f -
+      register: harbor_ca_bundle_apply
+      changed_when: "'unchanged' not in harbor_ca_bundle_apply.stdout"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Blob Directory
+    # Creates the directory the local PersistentVolume points at, on the node
+    # flagged registry_cache_node. Owned by Harbor's UID/GID rather than left
+    # to the pod's fsGroup: Harbor's images bake in 10000 and cannot be
+    # remapped, and a local PersistentVolume is a plain host directory whose
+    # ownership Kubernetes does not manage the way it does for a provisioned
+    # volume.
+    #
+    # Mode 0700 so nothing else on the host reads the cache. The blobs are
+    # copies of public upstream images, but the directory is also where a
+    # pushed image would land if Harbor is ever used for more than caching.
+    # -------------------------------------------------------------------------
+    - name: Create registry blob directory on cache node
+      ansible.builtin.file:
+        path: '{{ registry_cache_path }}'
+        state: directory
+        owner: '{{ harbor_uid }}'
+        group: '{{ harbor_uid }}'
+        mode: '0700'
+      when: registry_cache_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Blob Storage
+    # Applies the no-provisioner StorageClass, the local PersistentVolume bound
+    # to the cache node, and the PVC Harbor's registry component claims through
+    # persistence.persistentVolumeClaim.registry.existingClaim.
+    #
+    # Applied before the Helm install so the claim exists when the chart
+    # references it. With WaitForFirstConsumer the PVC stays Pending until the
+    # registry pod is scheduled, which is expected and not a failure.
+    # -------------------------------------------------------------------------
+    - name: Write registry blob storage manifest
+      ansible.builtin.template:
+        src: registry-blob-storage.yml.j2
+        dest: /tmp/registry-blob-storage.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply registry blob storage manifest
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/registry-blob-storage.yml
+      register: registry_blob_storage_result
+      changed_when: >-
+        'created' in registry_blob_storage_result.stdout or
+        'configured' in registry_blob_storage_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Remove registry blob storage manifest temporary file
+      ansible.builtin.file:
+        path: /tmp/registry-blob-storage.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Database
+    # Provisions a CloudNativePG Cluster for Harbor's core database. The
+    # cnpg-formatted credentials Secret is created in the Harbor Credentials
+    # section above and is the same Secret the chart reads the password from,
+    # so the value lives in one place.
+    # -------------------------------------------------------------------------
+    - name: Write Harbor cnpg Cluster manifest
+      ansible.builtin.copy:
+        dest: /tmp/harbor-db-cluster.yml
+        mode: '0600'
+        content: |
+          apiVersion: postgresql.cnpg.io/v1
+          kind: Cluster
+          metadata:
+            name: harbor-db
+            namespace: '{{ harbor_namespace }}'
+          spec:
+            instances: 1
+            imageName: ghcr.io/cloudnative-pg/postgresql:17
+            storage:
+              storageClass: '{{ harbor_storage_class }}'
+              size: '{{ harbor_db_storage_size }}'
+            bootstrap:
+              initdb:
+                database: '{{ harbor_db_name }}'
+                owner: '{{ harbor_db_username }}'
+                secret:
+                  name: harbor-db-credentials
+      when: bootstrap_node | default(false)
+
+    - name: Apply Harbor cnpg Cluster manifest
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/harbor-db-cluster.yml
+      register: harbor_db_cluster_result
+      changed_when: >-
+        'created' in harbor_db_cluster_result.stdout or
+        'configured' in harbor_db_cluster_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Remove Harbor cnpg Cluster manifest temporary file
+      ansible.builtin.file:
+        path: /tmp/harbor-db-cluster.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Wait for Harbor cnpg Cluster to become healthy
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get cluster harbor-db -n {{ harbor_namespace }}
+          -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: harbor_db_ready
+      until: harbor_db_ready.stdout == 'True'
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Harbor Installation
+    # Installs Harbor via Helm from the official chart repository. --wait
+    # because the proxy cache projects are created through Harbor's REST API
+    # immediately afterward and the API is not up until the core deployment is.
+    # -------------------------------------------------------------------------
+    - name: Add Harbor Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add harbor https://helm.goharbor.io
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Update Helm repositories
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Write Harbor Helm values file
+      ansible.builtin.template:
+        src: harbor-values.yml.j2
+        dest: /tmp/harbor-values.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Install or upgrade Harbor via Helm
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade --install harbor harbor/harbor
+          --namespace {{ harbor_namespace }}
+          --kubeconfig {{ kubectl_config_path }}
+          --values /tmp/harbor-values.yml
+          --version {{ harbor_chart_version }}
+          --wait
+          --timeout 10m
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Remove Harbor Helm values file
+      ansible.builtin.file:
+        path: /tmp/harbor-values.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ForwardAuth Middleware and HTTPRoutes
+    # Three routes on one hostname, all pointing at the single Service the
+    # chart's nginx component fronts. They differ only in path prefix and in
+    # whether the Authentik ForwardAuth filter is attached.
+    #
+    # /v2 is the registry API and /service is the token issuer containerd is
+    # redirected to by the Www-Authenticate header on a 401. Neither can carry
+    # ForwardAuth: containerd cannot follow a browser redirect to a login form,
+    # and would report the returned HTML as a malformed manifest. Harbor's own
+    # token issuer is what guards these paths, and for public proxy cache
+    # projects it issues an anonymous pull token.
+    #
+    # The portal route matches / and so also covers /api, which the portal's
+    # browser client calls with the Authentik session cookie already set. The
+    # playbook's own API calls below do not go through the gateway for this
+    # reason.
+    #
+    # Gateway API gives the longest matching path prefix precedence, so the
+    # portal route being a prefix of the other two is what makes it the
+    # fallback rather than a conflict.
+    # -------------------------------------------------------------------------
+    - name: Write ForwardAuth Middleware manifest for Harbor
+      ansible.builtin.template:
+        src: traefik-forward-auth-middleware.yml.j2
+        dest: /tmp/traefik-forward-auth-middleware-harbor.yml
+        mode: '0644'
+      vars:
+        middleware_namespace: '{{ harbor_namespace }}'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ForwardAuth Middleware in Harbor namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/traefik-forward-auth-middleware-harbor.yml
+      register: harbor_middleware_result
+      changed_when: >-
+        'created' in harbor_middleware_result.stdout or
+        'configured' in harbor_middleware_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Harbor ForwardAuth Middleware manifest
+      ansible.builtin.file:
+        path: /tmp/traefik-forward-auth-middleware-harbor.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write Harbor HTTPRoute manifests
+      ansible.builtin.template:
+        src: httproute.yml.j2
+        dest: /tmp/harbor-httproute-{{ item.name }}.yml
+        mode: '0644'
+      vars:
+        httproute_name: 'harbor-{{ item.name }}'
+        httproute_namespace: '{{ harbor_namespace }}'
+        httproute_hostname: '{{ harbor_hostname }}'
+        httproute_backend_name: harbor
+        httproute_backend_namespace: '{{ harbor_namespace }}'
+        httproute_backend_port: 80
+        httproute_path_prefix: '{{ item.prefix }}'
+        with_forward_auth: '{{ item.forward_auth | bool }}'
+      loop: '{{ harbor_routes }}'
+      loop_control:
+        label: '{{ item.name }}'
+      when: bootstrap_node | default(false)
+
+    - name: Apply Harbor HTTPRoutes
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/harbor-httproute-{{ item.name }}.yml
+      register: harbor_httproute_result
+      changed_when: >-
+        'created' in harbor_httproute_result.stdout or
+        'configured' in harbor_httproute_result.stdout
+      loop: '{{ harbor_routes }}'
+      loop_control:
+        label: '{{ item.name }}'
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Harbor HTTPRoute manifests
+      ansible.builtin.file:
+        path: /tmp/harbor-httproute-{{ item.name }}.yml
+        state: absent
+      loop: '{{ harbor_routes }}'
+      loop_control:
+        label: '{{ item.name }}'
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Proxy Cache Projects
+    # Harbor's registry endpoints and proxy cache projects are API objects
+    # rather than Helm values, so they are created after the install.
+    #
+    # Calls go to the Service ClusterIP over plain HTTP, reachable from cluster
+    # nodes through Cilium's eBPF kube-proxy replacement, for the same reason
+    # the Authentik integration in cluster/git.yml does: it bypasses the
+    # ForwardAuth filter that would otherwise intercept /api, and it needs no
+    # trust in the homelab CA on the control host.
+    # -------------------------------------------------------------------------
+    - name: Get Harbor Service ClusterIP
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get svc harbor -n {{ harbor_namespace }}
+          -o jsonpath='{.spec.clusterIP}'
+      register: harbor_clusterip
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Harbor API base URL fact
+      ansible.builtin.set_fact:
+        harbor_api_url: 'http://{{ harbor_clusterip.stdout }}/api/v2.0'
+      when: bootstrap_node | default(false)
+
+    - name: List existing Harbor registry endpoints
+      ansible.builtin.uri:
+        url: '{{ harbor_api_url }}/registries?page_size=100'
+        url_username: admin
+        url_password: '{{ harbor_admin_password }}'
+        force_basic_auth: true
+      register: harbor_existing_registries
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Create Harbor registry endpoints
+      ansible.builtin.uri:
+        url: '{{ harbor_api_url }}/registries'
+        method: POST
+        url_username: admin
+        url_password: '{{ harbor_admin_password }}'
+        force_basic_auth: true
+        body_format: json
+        body:
+          name: '{{ item.project }}'
+          type: '{{ item.endpoint_type }}'
+          url: '{{ item.endpoint_url }}'
+          insecure: false
+        status_code: [201]
+      loop: '{{ registry_proxied }}'
+      loop_control:
+        label: '{{ item.host }}'
+      when:
+        - bootstrap_node | default(false)
+        - item.project not in (harbor_existing_registries.json | map(attribute='name') | list)
+
+    - name: Get Harbor registry endpoints with their IDs
+      ansible.builtin.uri:
+        url: '{{ harbor_api_url }}/registries?page_size=100'
+        url_username: admin
+        url_password: '{{ harbor_admin_password }}'
+        force_basic_auth: true
+      register: harbor_registries
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: List existing Harbor projects
+      ansible.builtin.uri:
+        url: '{{ harbor_api_url }}/projects?page_size=100'
+        url_username: admin
+        url_password: '{{ harbor_admin_password }}'
+        force_basic_auth: true
+      register: harbor_existing_projects
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    # Public so that containerd can pull without credentials it has no way to
+    # present. See the header — this is forced by the mirror design, not a
+    # relaxation chosen for convenience.
+    #
+    # Serialized with to_json for the same reason the retention body below is:
+    # registry_id has to reach Harbor as a number, and a YAML body would give
+    # it the string '1'. Harbor stores project metadata as strings, which is
+    # why 'public' is quoted here and the count in the retention rule is not.
+    - name: Create Harbor proxy cache projects
+      ansible.builtin.uri:
+        url: '{{ harbor_api_url }}/projects'
+        method: POST
+        url_username: admin
+        url_password: '{{ harbor_admin_password }}'
+        force_basic_auth: true
+        body_format: json
+        body: >-
+          {{ {
+               'project_name': item.project,
+               'registry_id': harbor_registries.json
+                 | selectattr('name', 'equalto', item.project)
+                 | map(attribute='id') | first | int,
+               'metadata': {'public': 'true'},
+             } | to_json }}
+        status_code: [201]
+      loop: '{{ registry_proxied }}'
+      loop_control:
+        label: '{{ item.project }}'
+      when:
+        - bootstrap_node | default(false)
+        - item.project not in (harbor_existing_projects.json | map(attribute='name') | list)
+
+    # -------------------------------------------------------------------------
+    # Retention
+    # Keeps the registry_cache_retained_tags most recently cached artifacts of
+    # each repository. Count only, with no time component: an image that has
+    # not been pulled in a month is still there, because being superseded is
+    # the reason to evict something and age is not. Cache size is then bounded
+    # by how many repositories are cached times the count, and does not depend
+    # on how often anything is pulled.
+    #
+    # The rule is PUT over the whole policy rather than added to it. Harbor
+    # creates a 7 day retention policy for every new proxy cache project, and
+    # retention rules combine — a time-based rule left underneath would keep
+    # expiring the artifacts the count rule intends to hold indefinitely.
+    #
+    # The repository selector matches per repository, not across the project:
+    # latestPushedK with a `**` repository filter retains that many artifacts
+    # in each matching repository, which is what "the last N of each image"
+    # requires.
+    #
+    # Retention only marks artifacts as deleted. The disk comes back from the
+    # garbage collection job scheduled below, which is also what reclaims the
+    # untagged artifacts this rule's tag selector cannot reach — a proxy cache
+    # accumulates those whenever something is pulled by digest.
+    # -------------------------------------------------------------------------
+    - name: Read Harbor proxy cache projects
+      ansible.builtin.uri:
+        url: '{{ harbor_api_url }}/projects/{{ item.project }}'
+        url_username: admin
+        url_password: '{{ harbor_admin_password }}'
+        force_basic_auth: true
+      register: harbor_project_details
+      changed_when: false
+      loop: '{{ registry_proxied }}'
+      loop_control:
+        label: '{{ item.project }}'
+      when: bootstrap_node | default(false)
+
+    # The body is built as a dict inside one Jinja expression and serialized
+    # with to_json rather than written as YAML. Harbor rejects a retention rule
+    # whose count is a string, and a YAML body would give it one: this
+    # collection runs without jinja2_native, so '{{ n | int }}' as a mapping
+    # value templates back to "1" rather than 1. Inside the expression the
+    # value is still a Python int when to_json serializes it.
+    - name: Replace default retention policy on each proxy cache project
+      ansible.builtin.uri:
+        url: >-
+          {{ harbor_api_url }}/retentions/{{ item.json.metadata.retention_id }}
+        method: PUT
+        url_username: admin
+        url_password: '{{ harbor_admin_password }}'
+        force_basic_auth: true
+        body_format: json
+        body: >-
+          {{ {
+               'algorithm': 'or',
+               'scope': {'level': 'project', 'ref': item.json.project_id | int},
+               'trigger': {
+                 'kind': 'Schedule',
+                 'references': {},
+                 'settings': {'cron': registry_retention_cron},
+               },
+               'rules': [{
+                 'disabled': false,
+                 'action': 'retain',
+                 'template': 'latestPushedK',
+                 'params': {'latestPushedK': registry_cache_retained_tags | int},
+                 'scope_selectors': {'repository': [{
+                   'kind': 'doublestar',
+                   'decoration': 'repoMatches',
+                   'pattern': '**',
+                 }]},
+                 'tag_selectors': [{
+                   'kind': 'doublestar',
+                   'decoration': 'matches',
+                   'pattern': '**',
+                 }],
+               }],
+             } | to_json }}
+        status_code: [200]
+      changed_when: true
+      loop: '{{ harbor_project_details.results }}'
+      loop_control:
+        label: '{{ item.item.project }}'
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Garbage Collection
+    # Retention marks artifacts; this is what removes their blobs from disk.
+    # Without it the retention count bounds nothing and the blob directory
+    # grows without limit, which on a local volume means filling a partition on
+    # the cache node rather than exhausting a Longhorn pool.
+    #
+    # delete_untagged reclaims artifacts with no tag at all. A proxy cache
+    # accumulates these whenever something is pulled by digest, and the
+    # retention rule's tag selector never matches them.
+    #
+    # Scheduled an hour after retention so the marks it acts on are the current
+    # ones. Harbor crons carry a leading seconds field, unlike Kubernetes ones.
+    #
+    # POST creates the schedule and PUT updates an existing one, so first runs
+    # and subsequent runs take different paths through the same API. With no
+    # schedule set, the GET returns an empty body rather than a JSON null, and
+    # the uri module only populates .json when the response parses as JSON — so
+    # the branch defaults the whole .json rather than reading through it.
+    # -------------------------------------------------------------------------
+    - name: Read Harbor garbage collection schedule
+      ansible.builtin.uri:
+        url: '{{ harbor_api_url }}/system/gc/schedule'
+        url_username: admin
+        url_password: '{{ harbor_admin_password }}'
+        force_basic_auth: true
+      register: harbor_gc_schedule
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Schedule Harbor garbage collection
+      ansible.builtin.uri:
+        url: '{{ harbor_api_url }}/system/gc/schedule'
+        method: >-
+          {{ ((harbor_gc_schedule.json | default({})).get('schedule') is none)
+             | ternary('POST', 'PUT') }}
+        url_username: admin
+        url_password: '{{ harbor_admin_password }}'
+        force_basic_auth: true
+        body_format: json
+        body:
+          parameters:
+            delete_untagged: true
+          schedule:
+            type: Custom
+            cron: '{{ registry_gc_cron }}'
+        status_code: [200, 201]
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Authentik OIDC
+    # Creates an OAuth2 provider and application in Authentik for Harbor, then
+    # switches Harbor's auth mode to OIDC so an Authentik identity becomes a
+    # Harbor session.
+    #
+    # This does not replace the ForwardAuth gate on the portal route — the two
+    # do different jobs. ForwardAuth decides whether a request may reach the
+    # host and forwards identity headers Harbor does not read; Harbor's own
+    # login decides who you are inside Harbor. Gating a service that has its
+    # own account system does not log you into it, which is why the portal
+    # asked for a second credential before this.
+    #
+    # It removes the second password, not the second page. Harbor puts a
+    # "LOGIN WITH AUTHENTIK" button on its login page and has no setting to
+    # skip it — auto-redirect is an open upstream request (goharbor/harbor
+    # #11077 and #22231), unimplemented as of 2.15.2. With an Authentik session
+    # already established by ForwardAuth, clicking it completes without a
+    # prompt.
+    #
+    # Ordered after the proxy cache configuration. Those calls authenticate as
+    # the local admin over basic auth, and doing them before the auth mode
+    # changes keeps them on the path they were written for.
+    #
+    # Harbor refuses to switch from database auth to OIDC while any local user
+    # other than admin exists, so this is reversible only in one direction
+    # without deleting accounts. The admin account keeps working after the
+    # switch, which is what the playbook's own API calls depend on.
+    # -------------------------------------------------------------------------
+    - name: Read Authentik bootstrap token from Kubernetes secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret authentik-credentials -n {{ authentik_namespace }}
+          -o jsonpath='{.data.bootstrap-token}'
+      register: harbor_authentik_token_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Get Authentik server ClusterIP
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get svc authentik-server -n {{ authentik_namespace }}
+          -o jsonpath='{.spec.clusterIP}'
+      register: harbor_authentik_clusterip
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Authentik API facts
+      ansible.builtin.set_fact:
+        authentik_bootstrap_token: '{{ harbor_authentik_token_b64.stdout | b64decode }}'
+        authentik_api_url: 'http://{{ harbor_authentik_clusterip.stdout }}/api/v3'
+      when: bootstrap_node | default(false)
+
+    - name: Get default authorization flow UUID
+      ansible.builtin.uri:
+        url: >-
+          {{ authentik_api_url }}/flows/instances/?slug=default-provider-authorization-implicit-consent
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: harbor_auth_flow_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Get default invalidation flow UUID
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/flows/instances/?slug=default-provider-invalidation-flow'
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: harbor_invalidation_flow_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Get OIDC scope property mappings from Authentik
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/propertymappings/all/?page_size=100'
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: harbor_property_mappings_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set OIDC scope mapping facts
+      ansible.builtin.set_fact:
+        harbor_oidc_mapping_names: >-
+          {{
+            harbor_property_mappings_result.json.results
+            | selectattr('meta_model_name', 'equalto',
+                         'authentik_providers_oauth2.scopemapping')
+            | selectattr('name', 'in',
+                         harbor_oidc_scopes | map(attribute='mapping') | list)
+            | map(attribute='name') | list
+          }}
+        harbor_oidc_mapping_pks: >-
+          {{
+            harbor_property_mappings_result.json.results
+            | selectattr('meta_model_name', 'equalto',
+                         'authentik_providers_oauth2.scopemapping')
+            | selectattr('name', 'in',
+                         harbor_oidc_scopes | map(attribute='mapping') | list)
+            | map(attribute='pk') | list
+          }}
+      when: bootstrap_node | default(false)
+
+    - name: Check if Harbor OAuth2 provider already exists in Authentik
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/providers/oauth2/?name=Harbor'
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: harbor_existing_provider_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Create Harbor OAuth2 provider in Authentik
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/providers/oauth2/'
+        method: POST
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+        body_format: json
+        body:
+          name: Harbor
+          authorization_flow: '{{ harbor_auth_flow_result.json.results[0].pk }}'
+          invalidation_flow: '{{ harbor_invalidation_flow_result.json.results[0].pk }}'
+          property_mappings: '{{ harbor_oidc_mapping_pks }}'
+          redirect_uris:
+            - matching_mode: strict
+              url: 'https://{{ harbor_hostname }}/c/oidc/callback'
+          client_type: confidential
+          sub_mode: user_username
+        status_code: [201]
+      register: harbor_create_provider_result
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - harbor_existing_provider_result.json.pagination.count == 0
+
+    # An existing provider is reused as-is apart from its signing key, so a
+    # later change to harbor_oidc_scopes reaches it only by deleting it in
+    # Authentik first.
+    - name: Set OIDC provider ID fact from existing provider
+      ansible.builtin.set_fact:
+        harbor_oidc_provider_id: '{{ harbor_existing_provider_result.json.results[0].pk }}'
+      when:
+        - bootstrap_node | default(false)
+        - harbor_existing_provider_result.json.pagination.count > 0
+
+    - name: Set OIDC provider ID fact from newly created provider
+      ansible.builtin.set_fact:
+        harbor_oidc_provider_id: '{{ harbor_create_provider_result.json.pk }}'
+      when:
+        - bootstrap_node | default(false)
+        - harbor_existing_provider_result.json.pagination.count == 0
+
+    # Authentik signs ID tokens with HS256 when a provider has no signing key,
+    # using the client secret as the HMAC key. Harbor's OIDC library accepts
+    # only asymmetric signatures and rejects the login with
+    # "unexpected signature algorithm HS256; expected RS256". Selecting an RSA
+    # keypair switches the provider to RS256. The web UI fills this in by
+    # default and the API does not, which is why a provider created here needs
+    # it set explicitly and one created by hand would not.
+    #
+    # Gitea does not need this — its OIDC client accepts HS256 — so
+    # cluster/git.yml creates its provider without a signing key.
+    - name: Get Authentik signing certificates
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/crypto/certificatekeypairs/?has_key=true'
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: harbor_authentik_keypairs
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    # Prefers the self-signed certificate Authentik ships and generates on
+    # first start, falling back to whatever else has a private key.
+    - name: Set OIDC signing key fact
+      ansible.builtin.set_fact:
+        harbor_oidc_signing_key: >-
+          {{ (
+               (harbor_authentik_keypairs.json.results
+                | selectattr('name', 'equalto', 'authentik Self-signed Certificate')
+                | map(attribute='pk') | list)
+               + (harbor_authentik_keypairs.json.results
+                  | map(attribute='pk') | list)
+             ) | first }}
+      when: bootstrap_node | default(false)
+
+    # PATCHed on every run rather than set at creation, so a provider that
+    # already exists is corrected too. Without this the only fix for an
+    # existing provider is deleting it in Authentik.
+    - name: Set Harbor OAuth2 provider signing key
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/providers/oauth2/{{ harbor_oidc_provider_id }}/'
+        method: PATCH
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+        body_format: json
+        body:
+          signing_key: '{{ harbor_oidc_signing_key }}'
+        status_code: [200]
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    # The application slug is what Authentik builds the issuer URL from, so it
+    # has to match the oidc_endpoint given to Harbor below.
+    - name: Check if Harbor application already exists in Authentik
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/core/applications/?slug=harbor'
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: harbor_existing_app_result
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Create Harbor application in Authentik
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/core/applications/'
+        method: POST
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+        body_format: json
+        body:
+          name: Harbor
+          slug: harbor
+          provider: '{{ harbor_oidc_provider_id }}'
+        status_code: [201]
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - harbor_existing_app_result.json.pagination.count == 0
+
+    # Read on every run rather than only on creation, so a rotation in
+    # Authentik reaches Harbor on the next deploy.
+    - name: Get Harbor OAuth2 provider details from Authentik
+      ansible.builtin.uri:
+        url: '{{ authentik_api_url }}/providers/oauth2/{{ harbor_oidc_provider_id }}/'
+        headers:
+          Authorization: 'Bearer {{ authentik_bootstrap_token }}'
+      register: harbor_oidc_provider_details
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    # oidc_auto_onboard creates the Harbor account on first login rather than
+    # asking the user to pick a username, and oidc_user_claim names the claim
+    # it takes that username from. sub_mode user_username on the provider above
+    # makes preferred_username and sub agree.
+    #
+    # The scope is built from the mappings that were actually found, so it
+    # never asks Authentik for a scope its provider cannot issue.
+    - name: Configure Harbor to authenticate against Authentik
+      ansible.builtin.uri:
+        url: '{{ harbor_api_url }}/configurations'
+        method: PUT
+        url_username: admin
+        url_password: '{{ harbor_admin_password }}'
+        force_basic_auth: true
+        body_format: json
+        body:
+          auth_mode: oidc_auth
+          oidc_name: '{{ harbor_oidc_name }}'
+          oidc_endpoint: 'https://{{ authentik_hostname }}/application/o/harbor/'
+          oidc_client_id: '{{ harbor_oidc_provider_details.json.client_id }}'
+          oidc_client_secret: '{{ harbor_oidc_provider_details.json.client_secret }}'
+          oidc_scope: >-
+            {{ harbor_oidc_scopes
+               | selectattr('mapping', 'in', harbor_oidc_mapping_names)
+               | map(attribute='scope') | join(',') }}
+          oidc_verify_cert: true
+          oidc_auto_onboard: true
+          oidc_user_claim: preferred_username
+        status_code: [200]
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # containerd Mirror Configuration
+    # Written last, on every node, so the mirror only starts being used once
+    # Harbor is serving. Deploying it earlier would not break pulls — the
+    # `server` fallback in each file covers an absent Harbor — but it would
+    # make the first failure ambiguous.
+    #
+    # The homelab CA is installed on every node, because containerd verifies
+    # Harbor's TLS certificate like any other client and the cluster nodes are
+    # not among the devices cluster/network.yml installs the CA into. Scoped to
+    # a file the hosts.toml entries reference rather than added to the node
+    # trust store, so only containerd's connections to Harbor are affected.
+    # skip_verify is the third option and is not used: it would disable
+    # verification for a host every image in the cluster comes through.
+    #
+    # No containerd restart follows. containerd re-reads certs.d per pull, so a
+    # correction takes effect on the next pull and a wrong entry is undone by
+    # deleting a file.
+    #
+    # A wrong mirror fails in two ways that both point away from the mirror: if
+    # containerd's registry config_path is unset, this file is ignored and
+    # nothing is logged, and if the host entry is wrong, pulls fail without
+    # naming the mirror as the cause. Introducing it one registry at a time on
+    # one node is therefore worth the extra runs — `--limit` narrows the node
+    # and registry_proxied is a variable that can be overridden to a single
+    # entry.
+    # -------------------------------------------------------------------------
+    - name: Create containerd certs.d directory
+      ansible.builtin.file:
+        path: '{{ containerd_certs_dir }}'
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Install homelab CA certificate for containerd
+      ansible.builtin.copy:
+        content: '{{ registry_homelab_ca_b64.stdout | b64decode }}'
+        dest: '{{ registry_ca_path }}'
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Create containerd host directory for each proxied registry
+      ansible.builtin.file:
+        path: '{{ containerd_certs_dir }}/{{ item.host }}'
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      loop: '{{ registry_proxied }}'
+      loop_control:
+        label: '{{ item.host }}'
+
+    - name: Write containerd mirror configuration for each proxied registry
+      ansible.builtin.template:
+        src: registry-hosts.toml.j2
+        dest: '{{ containerd_certs_dir }}/{{ item.host }}/hosts.toml'
+        owner: root
+        group: root
+        mode: '0644'
+      vars:
+        registry_upstream_url: '{{ item.fallback_url }}'
+        registry_project: '{{ item.project }}'
+      loop: '{{ registry_proxied }}'
+      loop_control:
+        label: '{{ item.host }}'

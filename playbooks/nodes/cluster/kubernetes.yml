@@ -62,6 +62,11 @@
 #                        sandbox. Must match the Kubernetes minor version —
 #                        'kubeadm config images list' on a node prints the
 #                        expected value (default: registry.k8s.io/pause:3.10.1).
+#   containerd_certs_dir: Directory containerd searches for per-registry
+#                        hosts.toml mirror configuration. Named in the
+#                        containerd config written here; the files under it are
+#                        written by cluster/registry.yml, which must use the
+#                        same value (default: /etc/containerd/certs.d).
 #   helm_keyring_path:   Path to store the Helm APT GPG keyring
 #                        (default: /etc/apt/keyrings/helm.gpg).
 #   helm_packages:       List of Helm packages to install (default: [helm]).
@@ -115,6 +120,7 @@
     crictl_config_path: /etc/crictl.yaml
     containerd_cri_endpoint: unix:///run/containerd/containerd.sock
     containerd_sandbox_image: registry.k8s.io/pause:3.10.1
+    containerd_certs_dir: /etc/containerd/certs.d
     helm_keyring_path: /etc/apt/keyrings/helm.gpg
     helm_packages:
       - helm
@@ -411,7 +417,7 @@
     # see them once it reads 'k8s.io' — so it starts replacements that collide
     # with processes still holding the same host ports and sockets.
     #
-    # Observed on deathstranding02 on 2026-08-18: cilium-envoy failed to bind
+    # Observed on a worker node on 2026-08-18: cilium-envoy failed to bind
     # its domain socket (errno 98) and node-exporter failed on 0.0.0.0:9100,
     # both against their own predecessors. Two cilium-agents programming one
     # eBPF datapath also broke the node's DNS, which stalled every image pull.
@@ -511,7 +517,7 @@
     # process pointing at it, which reports the node NotReady with a runtime of
     # 'docker://Unknown'.
     #
-    # This is not hypothetical. It happened on deathstranding02 on 2026-08-18,
+    # This is not hypothetical. It happened on a worker node on 2026-08-18,
     # when the k9s download failed DNS resolution and left the node stranded
     # until the kubelet was restarted by hand.
     - name: Restart the kubelet before any task that can fail on the network

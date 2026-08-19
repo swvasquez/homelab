@@ -21,7 +21,7 @@ The hardware and operating systems underneath Layer 0 are described in
 | **1 — Cluster core** | Make the cluster schedulable and safe by default | Metrics Server, Pod Security Admission |
 | **2 — Infrastructure** | Networking, storage, and the ingress front door | Cilium, Hubble, Cilium CLI, Gateway API CRDs, Traefik, cert-manager, Bind9, ExternalDNS, Longhorn, open-iscsi, nfs-common |
 | **3 — Platform services** | Shared backends that applications consume | CloudNativePG, OpenBao, External Secrets Operator, Stakater Reloader, Authentik, Prometheus, Alertmanager, Grafana, node-exporter, kube-state-metrics |
-| **4 — Delivery & governance** | How workloads are deployed and kept honest | Gitea, Argo CD, Kyverno, Falco, Falcosidekick |
+| **4 — Delivery & governance** | How workloads are deployed and kept honest | Gitea, Argo CD, Harbor, Kyverno, Falco, Falcosidekick |
 | **5 — Applications** | End-user workloads | Firefly III, Home Assistant, Immich, Jellyfin, Open WebUI, Syncthing, Thread/Matter stack, Vaultwarden, vLLM, Zotero |
 
 ---
@@ -63,7 +63,11 @@ The kubelet reaches it through containerd's CRI plugin. The `containerd.io`
 package ships `/etc/containerd/config.toml` containing
 `disabled_plugins = ["cri"]`, which `cluster/kubernetes.yml` replaces with a
 config that leaves the plugin enabled and sets `SystemdCgroup = true` to match
-the kubelet's `--cgroup-driver=systemd`.
+the kubelet's `--cgroup-driver=systemd`. That config also points containerd's
+registry `config_path` at `/etc/containerd/certs.d`, which is what makes it
+read the per-registry `hosts.toml` mirror files written by
+`cluster/registry.yml`. Without the key those files are ignored and nothing is
+logged about it.
 
 A containerd restart does not stop running containers. Each is held by its own
 `containerd-shim-runc-v2` process, which is not a child of the daemon and
@@ -256,8 +260,9 @@ and counts of cluster objects.
 ## Layer 4 — Delivery & Governance
 
 How workloads get into the cluster and are kept honest: source hosting, GitOps
-delivery, admission policy, and runtime threat detection. Installed by
-`cluster/git.yml`, `cluster/gitops.yml`, and `cluster/security.yml`.
+delivery, image caching, admission policy, and runtime threat detection.
+Installed by `cluster/git.yml`, `cluster/gitops.yml`, `cluster/registry.yml`,
+and `cluster/security.yml`.
 
 ### Gitea
 A self-hosted Git service providing repository hosting, issue tracking, and a
@@ -268,6 +273,25 @@ uses the CloudNativePG operator for its PostgreSQL database.
 A declarative GitOps continuous-delivery controller. It continuously
 synchronizes the live cluster state to manifests stored in a Git repository, and
 is the mechanism by which the end-user services are deployed and kept in sync.
+
+### Harbor
+Installed by `cluster/registry.yml`. An OCI registry run as a proxy cache for
+the four registries the cluster pulls from — Docker Hub, `ghcr.io`, `quay.io`,
+and `registry.k8s.io` — each with its own proxy cache project. containerd finds
+it through `/etc/containerd/certs.d/<registry>/hosts.toml`, so image references
+in manifests are unchanged and no admission policy rewrites them. Each file
+names its upstream as the fallback, so pulls go direct whenever Harbor is down.
+Cached blobs are stored on a local PersistentVolume on the node flagged
+`registry_cache_node` in the inventory rather than on Longhorn; the core
+database is a CloudNativePG cluster. Retention keeps the most recently cached
+artifact of each repository with no time-based expiry, and a nightly garbage
+collection reclaims the disk. Trivy scanning is disabled and nothing pushes
+images to it. Its web portal is gated by ForwardAuth and authenticates against
+Authentik over OIDC, with accounts created on first login; the `/v2` and
+`/service` paths carry neither — containerd cannot follow an SSO redirect, so
+the proxy cache projects are public and pulls are anonymous. Harbor has no
+setting to skip its own login page, so reaching the portal is an Authentik
+session plus one click on Harbor's OIDC button.
 
 ### Kyverno
 A Kubernetes-native admission policy engine that enforces workload-hygiene

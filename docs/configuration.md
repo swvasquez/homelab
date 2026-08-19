@@ -47,6 +47,7 @@ all:
           bootstrap_node: <true|false>
           worker_node: <true|false>
           nfs_server: <true|false>
+          registry_cache_node: <true|false>
           slurm_controller: <true|false>
           slurm_compute_node: <true|false>
           vllm_host: <true|false>
@@ -96,6 +97,7 @@ differentiates them. Flags marked *exactly one* must be true on a single host.
 | `bootstrap_node` | *(exactly one)* Host initializes the cluster and is where run-once, cluster-wide tasks execute. |
 | `worker_node` | Host accepts scheduled workloads. |
 | `nfs_server` | *(exactly one)* Host exports the NFS share; every other node mounts it. |
+| `registry_cache_node` | *(exactly one)* Host holds the registry proxy cache's image blobs on local disk. The blob PersistentVolume is pinned here by node affinity, which places Harbor's registry pod here too. |
 | `slurm_controller` | *(exactly one)* Host runs `slurmctld` and holds the munge key that is distributed to the rest. |
 | `slurm_compute_node` | Host runs `slurmd` and accepts batch jobs. Can be combined with `slurm_controller`. |
 | `vllm_host` | Host is labeled for the vLLM DaemonSet. Defaults to true. |
@@ -362,9 +364,10 @@ These are the couplings that no single file makes visible.
   ([ansible#85837](https://github.com/ansible/ansible/issues/85837)); it is not a
   preference. `sudo.ws` is not available on Arch Linux, which is why the IP KVM
   playbooks use standard `sudo` instead.
-- **Exactly-one flags.** `bootstrap_node`, `nfs_server`, `slurm_controller`, and
-  `thread_radio_host` must each be true on exactly one host. Nothing validates
-  this; setting two produces conflicting cluster state rather than an error.
+- **Exactly-one flags.** `bootstrap_node`, `nfs_server`, `registry_cache_node`,
+  `slurm_controller`, and `thread_radio_host` must each be true on exactly one
+  host. Nothing validates this; setting two produces conflicting cluster state
+  rather than an error.
 - **`lb_ip_pool_cidr` versus the LAN.** The pool must sit inside `lan_cidr` (so
   L2 announcement reaches LAN clients) while staying outside the router's DHCP
   range (so nothing else is handed the same address).
