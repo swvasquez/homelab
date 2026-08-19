@@ -37,6 +37,18 @@ Write for someone looking something up, not someone reading start to finish.
   included. `sudo` raises an authentication prompt I'll deny if I don't want it.
 - The service and DNS load balancers sit on the LAN, so `curl` cluster services
   directly by IP or DNS name rather than asking me to reach them.
+- In the sandbox (`SANDBOX_VM_ID` is set), the deny rules `.sbx/config.py`
+  computes cover the LAN and `*.homelab.internal`, and subtract the API server
+  address only when I start it with `just sbx-up cluster`. `kubectl` can work
+  there while the `curl` above does not. `kubectl auth can-i --list` tells the
+  two modes apart: it prints the verbs the agent identity holds when the sandbox
+  has access, and errors when it doesn't.
+- The token in `.sbx/agent.kubeconfig` expires. Minting a new one is
+  `just agent-kube-config`, which reads the admin kubeconfig on my machine, so
+  ask me rather than reading an authentication error as a cluster fault.
+- `playbooks/nodes/cluster/templates/agent-cluster-role.yml.j2` is the
+  permission specification for that identity. Read it before concluding a
+  `kubectl` command isn't permitted.
 - Anything on the homelab nodes has to go through me. Give me one command at a
   time and wait for the output before proposing the next.
 - If several commands aren't getting you what you need, stop and say you're not
