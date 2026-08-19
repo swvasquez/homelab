@@ -297,9 +297,10 @@ To reset a node's Kubernetes state so the cluster can be rebuilt from the run
 order above, run on **each** node:
 
 ```bash
-kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock
+kubeadm reset -f --cri-socket unix:///run/containerd/containerd.sock
 ```
 
-The `--cri-socket` flag is required because the cluster runs on cri-dockerd:
-kubeadm otherwise probes the standard containerd/CRI-O sockets, finds no runtime
-at them, and can't remove the running containers.
+The `--cri-socket` flag names the runtime explicitly rather than letting kubeadm
+probe for one. Probing picks the first socket it finds from a built-in list, and
+a node that still has a stale socket file from a previous runtime can be matched
+to a runtime that is not running the containers, which then survive the reset.

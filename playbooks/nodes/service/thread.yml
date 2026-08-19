@@ -82,7 +82,8 @@
 #   2. cluster/git.yml
 #   3. cluster/gitops.yml
 #   4. service/thread.yml (this playbook — builds the OTBR image on the radio
-#      host on first run, then deploys OTBR + Matter server via ArgoCD)
+#      host on first run and imports it into containerd's 'k8s.io' namespace,
+#      then deploys OTBR + Matter server via ArgoCD)
 #
 # Input Variables:
 #   bootstrap_node:        Boolean indicating if the host is the control
@@ -109,6 +110,11 @@
 #                          mDNSResponder backend (default: otbr-mdnsresponder).
 #   otbr_image_tag:        Tag for the locally built OTBR image, matching the
 #                          OpenThread source release (default: 2026.07.0).
+#   otbr_image_ref:        Reference containerd stores the imported image
+#                          under, which 'docker save' canonicalizes from
+#                          otbr_image. Used for the ctr name== filters, which
+#                          match the stored reference exactly (default:
+#                          docker.io/library/<otbr_image>:<otbr_image_tag>).
 #   otbr_src_repo:         Git repository built into the OTBR image
 #                          (default: https://github.com/openthread/ot-br-posix).
 #   otbr_src_version:      Git tag of ot-br-posix to build
@@ -181,10 +187,22 @@
     # binds 5353 exclusively and loses the port to the Matter server, leaving
     # the border router undiscoverable. mDNSResponder (the same backend the
     # Home Assistant OS add-on uses) port-shares with other responders. The
-    # image stays in the radio host's local Docker store and is consumed with
-    # imagePullPolicy: Never — no registry involved.
+    # image is built on the radio host and imported into containerd's 'k8s.io'
+    # namespace there, then consumed with imagePullPolicy: Never — no registry
+    # involved.
     otbr_image: otbr-mdnsresponder
     otbr_image_tag: '2026.07.0'
+    # The reference containerd stores the image under, which is not the name it
+    # was built with. 'docker save' writes the canonical form of a short name,
+    # so an image tagged otbr-mdnsresponder:<tag> arrives in the k8s.io
+    # namespace as docker.io/library/otbr-mdnsresponder:<tag>. ctr's name==
+    # filter is an exact match against that stored reference, so filtering on
+    # the short name matches nothing and reports the image absent.
+    #
+    # The manifest still refers to the short name: the CRI resolves it to the
+    # same canonical reference, which is why the pod finds an image the ctr
+    # filter could not.
+    otbr_image_ref: 'docker.io/library/{{ otbr_image }}:{{ otbr_image_tag }}'
     otbr_src_repo: https://github.com/openthread/ot-br-posix
     otbr_src_version: v2026.07.0
     otbr_build_dir: /tmp/ot-br-posix-build
@@ -273,14 +291,29 @@
     # -------------------------------------------------------------------------
     # OTBR Image Build (mDNSResponder backend)
     # -------------------------------------------------------------------------
-    # Builds the OpenThread Border Router image directly in the radio host's
-    # Docker store using the mDNSResponder mDNS backend (see the otbr_image
-    # note in vars). The cluster runs the Docker runtime (cri-dockerd), so an
-    # image built here is immediately usable by the kubelet with
-    # imagePullPolicy: Never — no registry. The build is gated on the image
-    # not already existing so re-runs are fast. The temporary source clone is
-    # removed afterward. Runs on the radio host so the image is local to the
-    # node the OTBR pod is pinned to.
+    # Builds the OpenThread Border Router image on the radio host using the
+    # mDNSResponder mDNS backend (see the otbr_image note in vars), then
+    # imports it into the containerd namespace the kubelet reads. Runs on the
+    # radio host so the image is local to the node the OTBR pod is pinned to.
+    #
+    # The build and the import are separate steps because Docker and the
+    # kubelet look in different places. Both use the same containerd daemon,
+    # but containerd isolates images by namespace: 'docker build' writes to
+    # 'moby' and the kubelet reads 'k8s.io'. An image in one is invisible from
+    # the other, and with imagePullPolicy: Never there is no registry to fall
+    # back to — the pod fails with ErrImageNeverPull. 'docker save' piped to
+    # 'ctr -n k8s.io images import' is the transfer; both commands come from
+    # packages infrastructure/docker.yml already installs, so nothing is added
+    # to build images for the cluster.
+    #
+    # The gate is 'ctr -n k8s.io images ls' rather than 'docker image inspect'
+    # for the same reason. Gating on Docker's copy reports success while the
+    # namespace the kubelet reads is empty, which is a green playbook run and a
+    # pod stuck on ErrImageNeverPull.
+    #
+    # ctr rather than nerdctl or a standalone buildkitd: ctr ships in the
+    # containerd.io package, and writing to an arbitrary namespace is
+    # something none of the buildx drivers can do.
     # -------------------------------------------------------------------------
     - name: Ensure git is installed on the radio host
       ansible.builtin.apt:
@@ -288,12 +321,46 @@
         state: present
       when: thread_radio_host | default(false)
 
-    - name: Check whether the OTBR mDNSResponder image already exists
+    - name: Check whether the OTBR mDNSResponder image is in the kubelet's namespace
       ansible.builtin.command:
-        cmd: docker image inspect {{ otbr_image }}:{{ otbr_image_tag }}
+        cmd: ctr --namespace k8s.io images ls --quiet name=={{ otbr_image_ref }}
       register: otbr_image_check
       changed_when: false
       failed_when: false
+      when: thread_radio_host | default(false)
+
+    - name: Check whether the OTBR mDNSResponder image is in Docker's store
+      ansible.builtin.command:
+        cmd: docker image inspect {{ otbr_image }}:{{ otbr_image_tag }}
+      register: otbr_docker_check
+      changed_when: false
+      failed_when: false
+      when: thread_radio_host | default(false)
+
+    # Two separate questions, because the answers drive different work. The
+    # image has to be built only if it exists in neither store, and imported
+    # whenever the kubelet's namespace lacks it — including the case where it
+    # is already in Docker's, which is what a node migrated from cri-dockerd
+    # looks like. Deriving the build from the k8s.io check alone would rebuild
+    # from source, which takes hours, to produce an image already on disk.
+    #
+    # 'ctr images ls' exits 0 with no output when its filter matches nothing,
+    # so the output is the test rather than the return code. 'docker image
+    # inspect' does signal absence through its return code.
+    - name: Determine whether the OTBR image needs importing
+      ansible.builtin.set_fact:
+        otbr_image_missing: >-
+          {{ otbr_image_check.rc != 0 or (otbr_image_check.stdout | trim) == '' }}
+      when: thread_radio_host | default(false)
+
+    # A separate task rather than a second key in the one above, so it can be
+    # written in terms of otbr_image_missing. Keys within a single set_fact are
+    # not guaranteed to see each other, and repeating the expression instead
+    # would leave two copies of it to keep in step.
+    - name: Determine whether the OTBR image needs building
+      ansible.builtin.set_fact:
+        otbr_image_needs_build: >-
+          {{ otbr_image_missing and otbr_docker_check.rc != 0 }}
       when: thread_radio_host | default(false)
 
     - name: Clone the OpenThread Border Router source on the radio host
@@ -305,7 +372,7 @@
         force: true
       when:
         - thread_radio_host | default(false)
-        - otbr_image_check.rc != 0
+        - otbr_image_needs_build | default(false)
 
     - name: Build the OTBR image with the mDNSResponder backend # noqa: command-instead-of-module
       ansible.builtin.command:
@@ -320,7 +387,41 @@
       changed_when: true
       when:
         - thread_radio_host | default(false)
-        - otbr_image_check.rc != 0
+        - otbr_image_needs_build | default(false)
+
+    # Piped through the shell rather than saved to a file first: the image is
+    # over a gigabyte, and the radio host is the node with the least free disk.
+    - name: Import the OTBR image into the kubelet's containerd namespace # noqa: command-instead-of-module
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail &&
+          docker save {{ otbr_image }}:{{ otbr_image_tag }}
+          | ctr --namespace k8s.io images import -
+        executable: /bin/bash
+      register: otbr_image_import
+      changed_when: true
+      when:
+        - thread_radio_host | default(false)
+        - otbr_image_missing | default(false)
+
+    # Re-reads the store rather than trusting the import's exit status. The
+    # pipeline's status is ctr's, and a 'docker save' that dies partway still
+    # lets ctr exit 0 having imported nothing usable — set -o pipefail catches
+    # the write end failing, not a truncated stream that ctr accepts.
+    #
+    # Checked here because the alternative place to find out is the pod:
+    # imagePullPolicy is Never, so a missing image is ErrImageNeverPull with no
+    # registry to fall back on, and the deployment below would report success
+    # while leaving OTBR unable to start.
+    - name: Verify the OTBR image is present in the kubelet's namespace
+      ansible.builtin.command:
+        cmd: ctr --namespace k8s.io images ls --quiet name=={{ otbr_image_ref }}
+      register: otbr_image_verify
+      changed_when: false
+      failed_when: (otbr_image_verify.stdout | trim) == ''
+      when:
+        - thread_radio_host | default(false)
+        - otbr_image_missing | default(false)
 
     - name: Clean up the OTBR build directory
       ansible.builtin.file:

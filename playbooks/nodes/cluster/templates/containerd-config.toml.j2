@@ -1,0 +1,58 @@
+{#
+  containerd configuration for a node running Kubernetes.
+
+  Replaces the file shipped by the containerd.io package, whose only
+  non-comment line is disabled_plugins = ['cri']. Docker sets that because it
+  drives containerd over the native API and has no use for the CRI plugin;
+  Kubernetes needs the CRI plugin, so it is left enabled here by not being
+  named. CRI is in containerd's default plugin set, so nothing has to switch
+  it on.
+
+  Only the settings that differ from containerd's defaults are written.
+  containerd fills in everything absent — root, state, the snapshotter, the
+  CRI listening socket — and 'containerd config dump' on a node prints the
+  merged result. Writing the full default output instead would bury the three
+  decisions below in several hundred lines that restate defaults, and would
+  pin values that should follow the installed version.
+
+  Docker is unaffected by this file. It uses the 'moby' containerd namespace
+  through the native API, which is reached whether or not the CRI plugin is
+  loaded. Docker's own image store is containerd-backed here
+  ('docker info' reports the overlayfs driver rather than overlay2), so both
+  Docker and the kubelet read images from this daemon — different namespaces
+  of it, so neither sees the other's images.
+
+  Variables:
+    containerd_sandbox_image:  Pause image started for each pod sandbox.
+                               Defined in playbooks/nodes/cluster/kubernetes.yml.
+#}
+# Schema version, not a containerd version. Version 3 is what containerd 2.x
+# reads natively. A version 2 file is still accepted and migrated at startup
+# with a deprecation warning, and the plugin names differ between the two:
+# what was 'io.containerd.grpc.v1.cri' is split into the runtime and images
+# plugins below. A version 2 example from a search result will not work here
+# and fails quietly, by being parsed into a plugin nothing reads.
+version = 3
+
+# Must agree with --cgroup-driver=systemd in /etc/default/kubelet. Where they
+# disagree the kubelet still starts, and the disagreement surfaces later as
+# containers failing to start or as resource limits not being enforced,
+# because two writers are managing the same cgroup tree by different layouts.
+#
+# systemd rather than cgroupfs because these nodes boot with systemd managing
+# cgroup v2, which admits a single writer per subtree.
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc.options]
+  SystemdCgroup = true
+
+# The pause image holds a pod's network namespace open while its other
+# containers come and go. containerd has a compiled-in default that tracks the
+# containerd release rather than the Kubernetes one, so it is stated here to
+# keep it tied to the cluster's version. 'kubeadm config images list' on a node
+# prints the value the kubelet expects.
+#
+# pinned_images.sandbox, not the sandbox_image key: that key belongs to the
+# version 2 schema and is silently ignored in a version 3 file. Pinned images
+# are also exempt from containerd's image garbage collection, which is what
+# stops the pause image from being reclaimed while pods are using it.
+[plugins.'io.containerd.cri.v1.images'.pinned_images]
+  sandbox = '{{ containerd_sandbox_image }}'

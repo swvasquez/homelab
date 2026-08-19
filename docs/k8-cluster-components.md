@@ -17,7 +17,7 @@ The hardware and operating systems underneath Layer 0 are described in
 
 | Layer | Purpose | Components |
 |-------|---------|-----------|
-| **0 — Node foundation** | Turn bare hosts into cluster members | kubelet, kubeadm, kubectl, containerd, Docker Engine, cri-dockerd, Helm, k9s, chrony |
+| **0 — Node foundation** | Turn bare hosts into cluster members | kubelet, kubeadm, kubectl, containerd, Docker Engine, crictl, Helm, k9s, chrony |
 | **1 — Cluster core** | Make the cluster schedulable and safe by default | Metrics Server, Pod Security Admission |
 | **2 — Infrastructure** | Networking, storage, and the ingress front door | Cilium, Hubble, Cilium CLI, Gateway API CRDs, Traefik, cert-manager, Bind9, ExternalDNS, Longhorn, open-iscsi, nfs-common |
 | **3 — Platform services** | Shared backends that applications consume | CloudNativePG, OpenBao, External Secrets Operator, Stakater Reloader, Authentik, Prometheus, Alertmanager, Grafana, node-exporter, kube-state-metrics |
@@ -29,8 +29,8 @@ The hardware and operating systems underneath Layer 0 are described in
 ## Layer 0 — Node Foundation
 
 The base tooling that turns each bare host into a Kubernetes cluster member: the
-node agent, the container runtime and the bridge Kubernetes reaches it through,
-and the CLIs used to build and operate the cluster. Installed by
+node agent, the container runtime, and the CLIs used to build and operate the
+cluster. Installed by
 `cluster/kubernetes.yml`, except containerd and Docker Engine, which come from
 `infrastructure/docker.yml`.
 
@@ -59,18 +59,33 @@ considers references within a single namespace, `docker system prune` cannot
 reach cluster images. Placing an image where the kubelet can see it therefore
 means targeting that namespace explicitly, with `ctr -n k8s.io`.
 
+The kubelet reaches it through containerd's CRI plugin. The `containerd.io`
+package ships `/etc/containerd/config.toml` containing
+`disabled_plugins = ["cri"]`, which `cluster/kubernetes.yml` replaces with a
+config that leaves the plugin enabled and sets `SystemdCgroup = true` to match
+the kubelet's `--cgroup-driver=systemd`.
+
+A containerd restart does not stop running containers. Each is held by its own
+`containerd-shim-runc-v2` process, which is not a child of the daemon and
+re-attaches when it returns.
+
 ### Docker Engine
 The container platform comprising the `dockerd` daemon, the `docker` CLI, and
-the Buildx and Compose plugins. It is kept on the nodes both for direct use and
-because Kubernetes reaches containerd through it. It runs with `live-restore`
-enabled so that upgrading the Docker package does not stop running containers —
-without it, an `apt upgrade` that happens to include a new Docker version would
-stop every pod on the node as a side effect of unrelated OS patching.
+the Buildx and Compose plugins. Kubernetes does not use it — the kubelet
+connects to containerd directly — and it is kept on the nodes for direct use
+and for building images. Its image store is containerd-backed (`docker info`
+reports the `overlayfs` driver), so a `docker build` writes into containerd's
+`moby` namespace. Moving an image to where the kubelet reads it is
+`docker save … | ctr -n k8s.io images import -`, which is how the locally built
+OTBR image reaches the cluster. It runs with `live-restore` enabled, so
+upgrading the Docker package does not stop its running containers.
 
-### cri-dockerd
-A Container Runtime Interface (CRI) shim that bridges Kubernetes to the Docker
-Engine, which natively dropped built-in CRI support. It runs as a systemd
-socket and service on every node so the kubelet can drive Docker as its runtime.
+### crictl
+The CRI client, from the `cri-tools` package. It lists and inspects what the
+kubelet is running — `crictl ps`, `crictl images`, `crictl logs` — against the
+same socket the kubelet uses. `docker ps` does not substitute for it: Docker
+sees only the `moby` namespace, so it shows none of the cluster's containers.
+`/etc/crictl.yaml` names the endpoint so crictl does not fall back to probing.
 
 ### Helm
 The package manager for Kubernetes, installed as a system package. It is used to

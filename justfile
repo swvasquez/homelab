@@ -169,7 +169,7 @@ destroy-cluster subset="nodes":
         --ask-become-pass \
         -i inventory.yml \
         -m ansible.builtin.shell \
-        -a 'kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock' \
+        -a 'kubeadm reset -f --cri-socket unix:///run/containerd/containerd.sock' \
         --become \
         -e ansible_become_exe=sudo.ws \
         -B 1 -P 0

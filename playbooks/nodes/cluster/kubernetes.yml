@@ -10,9 +10,10 @@
 #   - Ensures time synchronization is active via chrony.
 #   - Loads required kernel modules and sets sysctl networking parameters.
 #   - Disables swap (runtime and permanently via /etc/fstab), a requirement for kubelet.
-#   - Installs and enables the cri-dockerd bridge for Docker CRI compatibility.
+#   - Configures containerd's CRI plugin and removes cri-dockerd, so the
+#     kubelet talks to containerd directly rather than through Docker.
 #   - Installs kubelet, kubeadm, and kubectl.
-#   - Configures the kubelet cgroup driver to match Docker (systemd) and
+#   - Configures the kubelet cgroup driver to match containerd (systemd) and
 #     enables the seccomp default so every container without an explicit
 #     seccompProfile runs under the container runtime's RuntimeDefault
 #     profile instead of Unconfined. Existing containers keep their current
@@ -28,19 +29,39 @@
 #     kubelet, containers, and iSCSI before suspend (S3 or S0ix) and restores
 #     them on resume. No drain or cross-node coordination — Longhorn handles
 #     reconciliation natively on wake.
-#   - Writes a kubelet drop-in (after-cri-docker.conf) that declares a hard
-#     dependency on cri-docker.service, ensuring kubelet never starts before its
+#   - Writes a kubelet drop-in (after-containerd.conf) that declares a hard
+#     dependency on containerd.service, ensuring kubelet never starts before its
 #     CRI socket is available.
+#   - Removes superseded pkgs.k8s.io channels so raising kube_version replaces
+#     the APT repository entry rather than adding a second one.
+#   - Corrects the kubeadm CRI socket annotation on every node where it no
+#     longer matches containerd_cri_endpoint.
+#
+# Runs one node at a time (serial: 1) because it can restart containerd and the
+# kubelet. See the comment above the play.
 #
 # Variables:
-#   kube_version:        Kubernetes version to install (default: v1.28).
+#   kube_version:        Kubernetes minor version channel of the pkgs.k8s.io
+#                        APT repository (default: v1.35). Selects a channel
+#                        rather than pinning a version — the packages are held
+#                        after install, so this is what an upgrade would be
+#                        allowed to reach, not what is running.
 #   keyring_path:        Path to store the Kubernetes APT GPG keyring
 #                        (default: /etc/apt/keyrings/kubernetes-apt-keyring.gpg).
-#   kube_packages:       List of Kubernetes packages to install
-#                        (default: [kubelet, kubeadm, kubectl]).
-#   cri_dockerd_version: Version of cri-dockerd to install (default: 0.3.24).
-#   cri_dockerd_distro:  Ubuntu distro codename for the cri-dockerd package
-#                        (default: ubuntu-jammy).
+#   kube_packages:       List of Kubernetes packages to install, all held at
+#                        their installed version afterwards
+#                        (default: [kubelet, kubeadm, kubectl, cri-tools]).
+#   containerd_config_path: Path to the containerd configuration file
+#                        (default: /etc/containerd/config.toml).
+#   crictl_config_path:  Path to the crictl configuration file, which points
+#                        the CRI client at the same socket as the kubelet
+#                        (default: /etc/crictl.yaml).
+#   containerd_cri_endpoint: CRI socket the kubelet connects to
+#                        (default: unix:///run/containerd/containerd.sock).
+#   containerd_sandbox_image: Pause image containerd starts for each pod
+#                        sandbox. Must match the Kubernetes minor version —
+#                        'kubeadm config images list' on a node prints the
+#                        expected value (default: registry.k8s.io/pause:3.10.1).
 #   helm_keyring_path:   Path to store the Helm APT GPG keyring
 #                        (default: /etc/apt/keyrings/helm.gpg).
 #   helm_packages:       List of Helm packages to install (default: [helm]).
@@ -66,19 +87,34 @@
 #                        installed on each node
 #                        (default: /usr/local/bin/k8s-suspend.sh).
 
+# serial: 1 runs the whole play through on one node before starting the next.
+# This play can restart containerd and the kubelet, and Ansible otherwise
+# advances task-by-task across all hosts — so a configuration that stops
+# containerd from starting would be written to every node before the first
+# restart revealed it. Running a node at a time means a failure stops the run
+# with the remaining nodes untouched, which on a two-node cluster is the
+# difference between a degraded cluster and no cluster.
+#
+# The cost is that every run is serialized, including ones that change nothing.
+# The alternative is remembering to pass --limit at the call site, which is not
+# a property of the playbook and so is not a property anyone can rely on.
 - name: Install and configure Kubernetes
   hosts: nodes
+  serial: 1
   become: true
   become_exe: sudo.ws
   vars:
-    kube_version: v1.28
+    kube_version: v1.35
     keyring_path: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
     kube_packages:
       - kubelet
       - kubeadm
       - kubectl
-    cri_dockerd_version: 0.3.24
-    cri_dockerd_distro: ubuntu-jammy
+      - cri-tools
+    containerd_config_path: /etc/containerd/config.toml
+    crictl_config_path: /etc/crictl.yaml
+    containerd_cri_endpoint: unix:///run/containerd/containerd.sock
+    containerd_sandbox_image: registry.k8s.io/pause:3.10.1
     helm_keyring_path: /etc/apt/keyrings/helm.gpg
     helm_packages:
       - helm
@@ -153,6 +189,34 @@
           ansible.builtin.file:
             path: /tmp/k8s-release.key
             state: absent
+
+    # The file does not exist before the first run, and lineinfile with
+    # state absent fails on a missing path rather than treating it as nothing
+    # to remove.
+    - name: Stat the Kubernetes APT sources file
+      ansible.builtin.stat:
+        path: /etc/apt/sources.list.d/kubernetes.list
+      register: k8s_sources_stat
+
+    # apt_repository adds an entry and never removes one, so raising
+    # kube_version leaves the old channel in the file next to the new one and
+    # apt resolves packages across both. The nodes carried the v1.28 and v1.35
+    # channels together until 2026-08-18; the apt-mark holds below are what
+    # kept that from selecting a package from the wrong one.
+    #
+    # Runs before the channel is added so the apt_repository task refreshes the
+    # cache against an already-clean file, rather than needing a second update.
+    #
+    # The negative lookahead keeps the current channel while removing every
+    # other: lineinfile's regexp is a Python regular expression, and state
+    # absent removes every line it matches.
+    - name: Remove superseded Kubernetes APT repository channels
+      ansible.builtin.lineinfile:
+        path: /etc/apt/sources.list.d/kubernetes.list
+        regexp: >-
+          ^deb .*pkgs\.k8s\.io/core:/stable:/(?!{{ kube_version | regex_escape }}/)v[0-9.]+/
+        state: absent
+      when: k8s_sources_stat.stat.exists
 
     - name: Add Kubernetes APT repository
       ansible.builtin.apt_repository:
@@ -248,66 +312,137 @@
         replace: '# \1'
 
     # -------------------------------------------------------------------------
-    # CRI-Dockerd Installation
-    # Installs the cri-dockerd bridge, which acts as a compatibility layer
-    # between Kubernetes (which requires a CRI-compatible runtime) and Docker
-    # Engine (which natively dropped CRI support).
-    # This involves determining the current CPU architecture, fetching the
-    # specific release deb package from GitHub, installing it, reloading the
-    # systemd daemon to register the new service files, and enabling the
-    # cri-dockerd systemd socket and service to bridge the connection.
+    # Architecture Detection
+    # Read once for the deb downloads further down (k9s).
     # -------------------------------------------------------------------------
     - name: Get CPU architecture for package downloads
       ansible.builtin.command: dpkg --print-architecture
       register: dpkg_arch
       changed_when: false
 
-    - name: Download cri-dockerd deb package
-      ansible.builtin.get_url:
-        url: https://github.com/Mirantis/cri-dockerd/releases/download/v{{ cri_dockerd_version }}/cri-dockerd_{{ cri_dockerd_version }}.3-0.{{ cri_dockerd_distro }}_{{ dpkg_arch.stdout }}.deb  # noqa: yaml[line-length]
-        dest: /tmp/cri-dockerd.deb
+    # -------------------------------------------------------------------------
+    # containerd CRI Runtime
+    # Points the kubelet at containerd directly. containerd is installed by
+    # infrastructure/docker.yml as the containerd.io package, so nothing is
+    # installed here — the daemon is already running, with its CRI plugin
+    # switched off.
+    #
+    # That is the one thing this section changes. Docker ships
+    # /etc/containerd/config.toml containing disabled_plugins = ['cri'],
+    # because Docker does not use CRI and leaving the plugin loaded would
+    # expose a second runtime interface it does not manage. Kubernetes needs
+    # that interface, so the file is replaced with one that does not disable
+    # it.
+    #
+    # The file is written whole rather than edited in place. Replacing it means
+    # Docker's shipped defaults for root, state, and the snapshotter are no
+    # longer in the file, but containerd applies its own defaults for anything
+    # absent and those are the same values — 'containerd config dump' shows the
+    # effective result. Editing in place would leave the playbook's output
+    # depending on what the installed Docker version happened to ship.
+    #
+    # Docker keeps working across this change. It talks to containerd over the
+    # native API in the 'moby' namespace, which is unrelated to whether the CRI
+    # plugin is loaded.
+    # -------------------------------------------------------------------------
+    - name: Configure containerd with the CRI plugin enabled
+      ansible.builtin.template:
+        src: containerd-config.toml.j2
+        dest: '{{ containerd_config_path }}'
         mode: '0644'
-
-    - name: Install cri-dockerd package
-      ansible.builtin.apt:
-        deb: /tmp/cri-dockerd.deb
-        state: present
-
-    - name: Clean up temporary cri-dockerd deb file
-      ansible.builtin.file:
-        path: /tmp/cri-dockerd.deb
-        state: absent
-
-    - name: Ensure cri-docker drop-in directory exists
-      ansible.builtin.file:
-        path: /etc/systemd/system/cri-docker.service.d
-        state: directory
-        mode: '0755'
         owner: root
         group: root
+      notify: Restart containerd
 
-    - name: Write systemd drop-in to order cri-docker after docker
+    - name: Restart containerd before the kubelet is pointed at it
+      ansible.builtin.meta: flush_handlers
+
+    # crictl is the CRI client — the tool that inspects what the kubelet is
+    # actually running, now that 'docker ps' shows only Docker's own
+    # containers. It comes from the cri-tools package in kube_packages.
+    #
+    # Without this file crictl discovers the endpoint by trying a built-in
+    # list of socket paths, printing a deprecation warning each time it falls
+    # back. The suspend hook parses crictl output, so a warning on stderr and
+    # a probe delay on every call are both worth removing.
+    - name: Configure the crictl endpoint
       ansible.builtin.copy:
-        dest: /etc/systemd/system/cri-docker.service.d/require-docker.conf
+        dest: '{{ crictl_config_path }}'
         mode: '0644'
         owner: root
         group: root
         content: |
-          [Unit]
-          Wants=docker.service
+          runtime-endpoint: {{ containerd_cri_endpoint }}
+          image-endpoint: {{ containerd_cri_endpoint }}
+          timeout: 10
 
-    - name: Reload systemd daemon after cri-dockerd installation
-      ansible.builtin.systemd:
-        daemon_reload: true
+    # -------------------------------------------------------------------------
+    # cri-dockerd Removal
+    # The kubelet reached containerd through cri-dockerd until this playbook
+    # started configuring the CRI plugin directly. Removing the package stops
+    # and disables its units as part of the uninstall.
+    #
+    # The drop-in files are deleted separately: dpkg leaves files in
+    # /etc/systemd/system alone because they are administrator-owned rather
+    # than package-owned. A leftover after-cri-docker.conf orders the kubelet
+    # after a unit that no longer exists, and systemd holds the kubelet in
+    # 'activating' waiting for a job that can never run.
+    # -------------------------------------------------------------------------
+    - name: Remove the cri-dockerd package
+      ansible.builtin.apt:
+        name: cri-dockerd
+        state: absent
+        purge: true
 
-    - name: Enable and start cri-dockerd services
-      ansible.builtin.systemd:
-        name: '{{ item }}'
-        state: started
-        enabled: true
+    - name: Remove cri-dockerd and kubelet systemd drop-ins for cri-docker
+      ansible.builtin.file:
+        path: '{{ item }}'
+        state: absent
       loop:
-        - cri-docker.socket
-        - cri-docker.service
+        - /etc/systemd/system/cri-docker.service.d/require-docker.conf
+        - /etc/systemd/system/cri-docker.service.d
+        - /etc/systemd/system/kubelet.service.d/after-cri-docker.conf
+      notify: Reload systemd daemon
+
+    # Containers cri-dockerd started keep running after it is removed. Each is
+    # held by its own containerd-shim-runc-v2, which is not a child of anything
+    # being stopped here, so removing the package orphans them rather than
+    # ending them. They are in the 'moby' namespace, where the kubelet cannot
+    # see them once it reads 'k8s.io' — so it starts replacements that collide
+    # with processes still holding the same host ports and sockets.
+    #
+    # Observed on deathstranding02 on 2026-08-18: cilium-envoy failed to bind
+    # its domain socket (errno 98) and node-exporter failed on 0.0.0.0:9100,
+    # both against their own predecessors. Two cilium-agents programming one
+    # eBPF datapath also broke the node's DNS, which stalled every image pull.
+    # A drain does not prevent this — DaemonSet pods are exempt from it by
+    # design, and on a control-plane node the static pods are too, which is
+    # where it would mean two etcds and two API servers.
+    #
+    # Placed before the kubelet is restarted so the old containers are gone
+    # before their replacements are created, rather than after they have
+    # already collided. The label is cri-dockerd's own, so this matches
+    # nothing on a node that never ran it, and nothing a user started with
+    # docker directly.
+    #
+    # failed_when: false covers a node where docker is absent or its daemon is
+    # stopped, where there is nothing to find. It also means a stopped daemon
+    # holding live containers — live-restore keeps them running — is read as
+    # 'no orphans' and they are left to collide. Recovering from that is the
+    # 'docker stop' by hand this task replaces, so the failure is visible in
+    # the pods rather than here.
+    - name: Find containers left behind by cri-dockerd
+      ansible.builtin.command:
+        cmd: docker ps --quiet --filter label=io.kubernetes.pod.namespace
+      register: orphaned_cri_docker_containers
+      changed_when: false
+      failed_when: false
+
+    - name: Stop containers left behind by cri-dockerd # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: docker stop {{ orphaned_cri_docker_containers.stdout_lines | join(' ') }}
+      changed_when: true
+      when: orphaned_cri_docker_containers.stdout_lines | length > 0
 
     # -------------------------------------------------------------------------
     # Kubernetes Installation and Configuration
@@ -315,10 +450,16 @@
     #   - Installs the primary Kubernetes components (kubelet, kubeadm, kubectl).
     #   - Applies an 'apt-mark hold' to these packages to prevent unintentional
     #     version upgrades during routine system updates.
-    #   - Configures kubelet extra args: cgroup driver (systemd, required to
-    #     match Docker) and seccomp default (RuntimeDefault applied to every
+    #   - Configures kubelet extra args: cgroup driver (systemd, which must
+    #     match SystemdCgroup in the containerd config above — a mismatch is
+    #     accepted at start and surfaces later as pods failing to run), the CRI
+    #     endpoint, and seccomp default (RuntimeDefault applied to every
     #     container that does not declare an explicit seccompProfile).
     #   - Starts and enables the kubelet service.
+    #
+    # The CRI endpoint is stated rather than left to the kubelet's built-in
+    # default, which has changed between releases and is resolved by probing a
+    # list of known socket paths when unset.
     # -------------------------------------------------------------------------
     - name: Install Kubernetes components
       ansible.builtin.apt:
@@ -331,23 +472,26 @@
         selection: hold
       loop: '{{ kube_packages }}'
 
-    - name: Configure kubelet extra args (cgroup driver and seccomp default)
+    - name: Configure kubelet extra args (cgroup driver, CRI endpoint, seccomp default)
       ansible.builtin.copy:
         dest: /etc/default/kubelet
-        content: 'KUBELET_EXTRA_ARGS=--cgroup-driver=systemd --seccomp-default=true'
+        content: >-
+          KUBELET_EXTRA_ARGS=--cgroup-driver=systemd
+          --container-runtime-endpoint={{ containerd_cri_endpoint }}
+          --seccomp-default=true
         mode: '0644'
       notify: restart kubelet
 
-    - name: Write systemd drop-in to order kubelet after cri-docker
+    - name: Write systemd drop-in to order kubelet after containerd
       ansible.builtin.copy:
-        dest: /etc/systemd/system/kubelet.service.d/after-cri-docker.conf
+        dest: /etc/systemd/system/kubelet.service.d/after-containerd.conf
         mode: '0644'
         owner: root
         group: root
         content: |
           [Unit]
-          After=cri-docker.service
-          Wants=cri-docker.service
+          After=containerd.service
+          Wants=containerd.service
 
     - name: Reload systemd daemon after kubelet drop-in changes
       ansible.builtin.systemd:
@@ -358,6 +502,40 @@
         name: kubelet
         state: started
         enabled: true
+
+    # Handlers normally run at the end of the play, which is too late to be
+    # safe here. Everything below this point — Helm, k9s, the lifecycle hooks —
+    # downloads from the internet, and a failure in any of it aborts the play
+    # before the kubelet is restarted. The node is left mid-migration at that
+    # point: cri-dockerd purged, its socket gone, and the kubelet still the old
+    # process pointing at it, which reports the node NotReady with a runtime of
+    # 'docker://Unknown'.
+    #
+    # This is not hypothetical. It happened on deathstranding02 on 2026-08-18,
+    # when the k9s download failed DNS resolution and left the node stranded
+    # until the kubelet was restarted by hand.
+    - name: Restart the kubelet before any task that can fail on the network
+      ansible.builtin.meta: flush_handlers
+
+    # Asks the CRI endpoint itself rather than asking systemd whether
+    # containerd is running. The two answer different questions: containerd
+    # starts and reports active even when the CRI plugin failed to load, since
+    # a plugin failure is recorded against the plugin and not the daemon. The
+    # node then looks healthy from the outside while nothing serves the
+    # kubelet, and the first symptom is pods never being created.
+    #
+    # Placed after the kubelet restart because crictl arrives with cri-tools in
+    # kube_packages, which is installed in this section. Failing here stops the
+    # play, which is correct — every task below assumes a working runtime, and
+    # serial: 1 means the remaining nodes are left untouched.
+    - name: Verify containerd is serving the CRI API
+      ansible.builtin.command:
+        cmd: crictl --runtime-endpoint {{ containerd_cri_endpoint }} version
+      register: crictl_version
+      changed_when: false
+      until: crictl_version is succeeded
+      retries: 6
+      delay: 5
 
     # -------------------------------------------------------------------------
     # Helm Installation
@@ -375,11 +553,16 @@
     - name: Download and dearmor Helm GPG key
       when: not helm_keyring_stat.stat.exists
       block:
+        # Retried for the same reason as the k9s download below — see there.
         - name: Download Helm GPG key
           ansible.builtin.get_url:
             url: https://packages.buildkite.com/helm-linux/helm-debian/gpgkey
             dest: /tmp/helm-gpgkey
             mode: '0644'
+          register: helm_gpg_download
+          until: helm_gpg_download is succeeded
+          retries: 5
+          delay: 15
 
         - name: Dearmor Helm GPG key
           ansible.builtin.command:
@@ -419,12 +602,27 @@
     # navigation, inspection, and management of workloads directly from the
     # terminal. The release deb package is fetched from GitHub and installed
     # via APT, then the temporary file is removed.
+    #
+    # Retried because this task runs shortly after the kubelet and containerd
+    # restarts above, and Cilium re-establishing the host datapath takes the
+    # node's own DNS resolution with it for a few tens of seconds. The download
+    # fails with 'Temporary failure in name resolution' — which is EAI_AGAIN
+    # from the resolver, not the registry or GitHub being unreachable.
+    #
+    # It failed here on both nodes during the cri-dockerd to containerd
+    # migration on 2026-08-18, and because a failing task ends the play for
+    # that host, it took the lifecycle script installs below with it. Five
+    # attempts 15 seconds apart covers the window.
     # -------------------------------------------------------------------------
     - name: Download k9s deb package
       ansible.builtin.get_url:
         url: https://github.com/derailed/k9s/releases/download/v{{ k9s_version }}/k9s_linux_{{ dpkg_arch.stdout }}.deb # noqa: yaml[line-length]
         dest: /tmp/k9s.deb
         mode: '0644'
+      register: k9s_download
+      until: k9s_download is succeeded
+      retries: 5
+      delay: 15
 
     - name: Install k9s package
       ansible.builtin.apt:
@@ -493,11 +691,11 @@
     # recover on wake.
     #
     # On pre-suspend (ExecStart): stops kubelet, gracefully stops all
-    # containers, stops cri-docker and docker, force-unmounts any lingering
+    # containers, stops docker and containerd, force-unmounts any lingering
     # Longhorn mounts, logs out iSCSI sessions, waits for /dev/sd* to detach,
     # stops iscsid, and syncs.
     #
-    # On post-resume (ExecStop): starts iscsid, docker, cri-docker, and
+    # On post-resume (ExecStop): starts iscsid, containerd, docker, and
     # kubelet. Longhorn and workload pods reconcile on their own.
     # -------------------------------------------------------------------------
     - name: Remove GRUB S3 sleep mode configuration if present
@@ -534,10 +732,76 @@
         enabled: true
         daemon_reload: true
 
+    # -------------------------------------------------------------------------
+    # kubeadm CRI Socket Annotation
+    # kubeadm records each node's CRI endpoint in the
+    # kubeadm.alpha.kubernetes.io/cri-socket annotation, and reads it back on
+    # 'kubeadm upgrade' to find the runtime. bootstrap.yml sets it, but only at
+    # 'kubeadm init' and 'kubeadm join' time — nothing keeps it in step with
+    # containerd_cri_endpoint afterward. Changing the runtime therefore leaves
+    # every existing node annotated with a socket that no longer exists, and
+    # the failure surfaces at the next upgrade rather than at the change.
+    #
+    # Both nodes were corrected by hand during the cri-dockerd to containerd
+    # migration on 2026-08-18. This task is what makes that unnecessary.
+    #
+    # Last in the play, and read-before-write rather than 'annotate
+    # --overwrite' on every run, for two different reasons. Last because it
+    # needs the API server, which on a control-plane node is a static pod that
+    # has just been restarted by the runtime change above — the retries cover
+    # that, and being last means exhausting them cannot prevent anything else
+    # from being applied. Read-before-write because 'kubectl annotate' prints
+    # 'annotated' whether or not the value moved, so writing unconditionally
+    # would report a change on every run forever.
+    # -------------------------------------------------------------------------
+    - name: Read the kubeadm CRI socket annotation from every node
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }} get node {{ item }}
+          -o jsonpath={.metadata.annotations.kubeadm\.alpha\.kubernetes\.io/cri-socket}
+      register: cri_socket_current
+      changed_when: false
+      until: cri_socket_current is succeeded
+      retries: 10
+      delay: 15
+      loop: '{{ groups["nodes"] }}'
+      when: bootstrap_node | default(false)
+
+    - name: Correct the kubeadm CRI socket annotation where it is stale
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          annotate node {{ item.item }}
+          kubeadm.alpha.kubernetes.io/cri-socket={{ containerd_cri_endpoint }}
+          --overwrite
+      changed_when: true
+      loop: '{{ cri_socket_current.results | default([]) }}'
+      loop_control:
+        label: '{{ item.item }}'
+      when:
+        - bootstrap_node | default(false)
+        - item.stdout | default('') != containerd_cri_endpoint
+
   handlers:
     - name: Reload systemd daemon
       ansible.builtin.systemd:
         daemon_reload: true
+
+    # One node at a time, which serial: 1 on the play already guarantees — no
+    # throttle here, so there is one mechanism enforcing that rather than two
+    # that could disagree. Loading the CRI plugin means restarting containerd,
+    # which drops the CRI connection the kubelet holds; the kubelet reconnects
+    # on its own, but the node reports NotReady until it does.
+    #
+    # Running containers survive this. Each is held by its own
+    # containerd-shim-runc-v2 process, which is deliberately not a child of
+    # containerd and keeps running while the daemon is down; the shims
+    # re-attach when it comes back. Docker's containers are equally unaffected,
+    # and for the same reason rather than because of live-restore.
+    - name: Restart containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
 
     - name: Update GRUB
       ansible.builtin.command:

@@ -31,7 +31,7 @@
 #     errors seen in dmesg after suspend. We therefore stop containers in two
 #     phases so the iSCSI target outlives every writer of the filesystem it
 #     serves.
-#   - Leaving docker, cri-docker, and iscsid running across suspend was
+#   - Leaving the container runtime and iscsid running across suspend was
 #     tested and abandoned: s2idle (the kernel sleep state used on this
 #     hardware) wakes on essentially any activity, and the background chatter
 #     from running services caused the machine to bounce out of sleep within
@@ -40,8 +40,8 @@
 # Pre-suspend phases:
 #   1. Stop kubelet so no new pods are scheduled mid-teardown.
 #   2. Phase 1: gracefully stop WORKLOAD containers only (everything not in
-#      longhorn-system or kube-system). Their ext4 writes complete against a
-#      live iSCSI target.
+#      longhorn-system or kube-system), then Docker's own containers. Their
+#      ext4 writes complete against a live iSCSI target.
 #   3. Wait for pod-level CSI bind mounts to deactivate (systemd transient
 #      scope units from PR #49640 clean these up when containers exit).
 #   4. sync — flush dirty page cache to the still-live iSCSI target.
@@ -53,12 +53,12 @@
 #   8. Phase 2: stop SYSTEM containers (longhorn-system, kube-system). Their
 #      iSCSI targets have already been logged out, so nothing can still be
 #      writing through them.
-#   9. Stop cri-docker and docker services.
+#   9. Stop docker and containerd services.
 #  10. Stop iscsid so it cannot reconnect during suspend.
 #
 # On post-resume:
 #   1. Start iscsid so Longhorn can reconnect iSCSI targets on demand.
-#   2. Start docker and cri-docker.
+#   2. Start containerd, then docker.
 #   3. Start kubelet; Longhorn and workload pods reconcile on their own.
 # ==============================================================================
 
@@ -85,34 +85,64 @@ log_err() {
 }
 
 # Classify running containers by Kubernetes pod namespace.
-# Populates globals WORKLOAD_IDS and SYSTEM_IDS (newline-separated).
-# Unlabeled containers (non-k8s docker containers) are treated as workload
-# on the assumption that they do not own iSCSI targets.
+# Populates globals WORKLOAD_IDS, SYSTEM_IDS and DOCKER_IDS (newline-separated).
+#
+# Cluster containers are read with crictl rather than docker. The kubelet talks
+# to containerd directly, so its containers live in containerd's 'k8s.io'
+# namespace and 'docker ps' — which only ever sees 'moby' — reports none of
+# them. Under cri-dockerd every cluster container was also a Docker container
+# and one listing covered both; that is no longer true.
+#
+# Docker's own containers are collected separately and stopped in phase 1, on
+# the same assumption the previous single listing made of unlabeled containers:
+# that they do not own iSCSI targets. They have to be stopped explicitly now.
+# Stopping dockerd used to stop them as a side effect, and with live-restore
+# enabled (see infrastructure/docker.yml) it no longer does.
 classify_containers() {
     WORKLOAD_IDS=''
     SYSTEM_IDS=''
-    local raw
-    raw=$(timeout 10 docker ps --format {% raw %}'{{.ID}} {{.Label "io.kubernetes.pod.namespace"}}'{% endraw %} 2>/dev/null)
-    if [[ -z "$raw" ]]; then
+    DOCKER_IDS=''
+    local all_ids ns
+    # Reported rather than left to the empty listings below. Every crictl call
+    # here discards stderr, so an absent binary would otherwise look identical
+    # to a node with no containers running, and the hook would stop nothing
+    # while logging that there was nothing to stop.
+    if ! command -v crictl &>/dev/null; then
+        log_err 'crictl not found — cluster containers will NOT be stopped'
+    fi
+    all_ids=$(timeout 10 crictl ps -q 2>/dev/null)
+    # crictl filters server-side by label, so the namespace never has to be
+    # parsed out of a listing. One call per namespace, concatenated.
+    for ns in "${SYSTEM_NAMESPACES[@]}"; do
+        SYSTEM_IDS+=$(timeout 10 crictl ps -q \
+            --label "io.kubernetes.pod.namespace=${ns}" 2>/dev/null)$'\n'
+    done
+    SYSTEM_IDS=$(grep -v '^$' <<< "$SYSTEM_IDS" || true)
+    if [[ -n "$all_ids" ]]; then
+        if [[ -n "$SYSTEM_IDS" ]]; then
+            WORKLOAD_IDS=$(grep -vxF -f <(echo "$SYSTEM_IDS") <<< "$all_ids" || true)
+        else
+            WORKLOAD_IDS="$all_ids"
+        fi
+    fi
+    DOCKER_IDS=$(timeout 10 docker ps -q 2>/dev/null)
+    local w=0 s=0 d=0
+    [[ -n "$WORKLOAD_IDS" ]] && w=$(wc -l <<< "$WORKLOAD_IDS")
+    [[ -n "$SYSTEM_IDS" ]] && s=$(wc -l <<< "$SYSTEM_IDS")
+    [[ -n "$DOCKER_IDS" ]] && d=$(wc -l <<< "$DOCKER_IDS")
+    if (( w + s + d == 0 )); then
         log 'No running containers'
         return 0
     fi
-    # Build a regex like "^(longhorn-system|kube-system)$" for exact ns match.
-    local ns_pattern
-    ns_pattern=$(IFS='|'; echo "^(${SYSTEM_NAMESPACES[*]})$")
-    WORKLOAD_IDS=$(awk -v pat="$ns_pattern" '$2 !~ pat {print $1}' <<< "$raw")
-    SYSTEM_IDS=$(awk -v pat="$ns_pattern" '$2 ~ pat {print $1}' <<< "$raw")
-    local w=0 s=0
-    [[ -n "$WORKLOAD_IDS" ]] && w=$(wc -l <<< "$WORKLOAD_IDS")
-    [[ -n "$SYSTEM_IDS" ]] && s=$(wc -l <<< "$SYSTEM_IDS")
-    log "Classified containers: ${w} workload, ${s} system (${SYSTEM_NAMESPACES[*]})"
+    log "Classified containers: ${w} workload, ${s} system (${SYSTEM_NAMESPACES[*]}), ${d} docker"
 }
 
 stop_container_set() {
-    # Arguments: <label> <grace-seconds> <ids-newline-separated>
-    local label=$1
-    local grace=$2
-    local ids=$3
+    # Arguments: <runtime: crictl|docker> <label> <grace-seconds> <ids>
+    local runtime=$1
+    local label=$2
+    local grace=$3
+    local ids=$4
     if [[ -z "$ids" ]]; then
         log "${label}: nothing to stop"
         return 0
@@ -121,7 +151,14 @@ stop_container_set() {
     count=$(wc -l <<< "$ids")
     log "${label}: stopping ${count} container(s) with ${grace}s grace"
     # shellcheck disable=SC2086
-    timeout $(( grace + 20 )) docker stop -t "$grace" $(tr '\n' ' ' <<< "$ids") &>/dev/null || true
+    if [[ "$runtime" == 'crictl' ]]; then
+        # crictl spells the grace period --timeout; docker spells it -t.
+        timeout $(( grace + 20 )) crictl stop --timeout "$grace" \
+            $(tr '\n' ' ' <<< "$ids") &>/dev/null || true
+    else
+        timeout $(( grace + 20 )) docker stop -t "$grace" \
+            $(tr '\n' ' ' <<< "$ids") &>/dev/null || true
+    fi
     log "${label}: stop issued"
 }
 
@@ -218,8 +255,9 @@ wait_for_iscsi_detach() {
 
 start_service_with_retry() {
     # Bring a unit to active state; if it does not reach active, reset and restart
-    # once. Post-resume services chain dependencies (iscsid → docker → cri-docker
-    # → kubelet), so silent failures upstream cascade into unhealthy kubelet.
+    # once. Post-resume services chain dependencies (iscsid → containerd →
+    # docker → kubelet), so silent failures upstream cascade into unhealthy
+    # kubelet.
     local unit=$1
     local start_timeout=$2
     log "Starting ${unit}"
@@ -258,8 +296,10 @@ case "$1" in
         # in dmesg after suspend.
         # ----------------------------------------------------------------------
         classify_containers
-        stop_container_set 'Phase 1 (workload containers)' \
+        stop_container_set crictl 'Phase 1 (workload containers)' \
             "$CONTAINER_GRACE_WORKLOAD" "$WORKLOAD_IDS"
+        stop_container_set docker 'Phase 1 (docker containers)' \
+            "$CONTAINER_GRACE_WORKLOAD" "$DOCKER_IDS"
 
         wait_for_pod_csi_bind_mounts_gone
 
@@ -294,20 +334,27 @@ case "$1" in
         # Longhorn has no ext4 journals of its own to flush at this point.
         #
         # LOAD-BEARING — DO NOT REMOVE OR "SIMPLIFY" Phase 2 + the service
-        # stops below. This was tested in commit history: leaving docker,
-        # cri-docker, iscsid, and system containers running across suspend
-        # causes s2idle (the kernel sleep state on this hardware) to bounce
-        # out of sleep within ~3 seconds from residual background chatter.
-        # Symptom: `PM: suspend entry (s2idle)` followed by `PM: suspend
-        # exit` within seconds, with no user wake event. The only known cure
-        # is this aggressive teardown.
+        # stops below. This was tested in commit history: leaving the runtime,
+        # iscsid, and system containers running across suspend causes s2idle
+        # (the kernel sleep state on this hardware) to bounce out of sleep
+        # within ~3 seconds from residual background chatter. Symptom:
+        # `PM: suspend entry (s2idle)` followed by `PM: suspend exit` within
+        # seconds, with no user wake event. The only known cure is this
+        # aggressive teardown.
         # ----------------------------------------------------------------------
-        stop_container_set 'Phase 2 (system containers)' \
+        stop_container_set crictl 'Phase 2 (system containers)' \
             "$CONTAINER_GRACE_SYSTEM" "$SYSTEM_IDS"
 
-        log 'Stopping cri-docker and docker services'
-        timeout 30 systemctl stop cri-docker.service cri-docker.socket &>/dev/null || true
+        # Containers are stopped above rather than left to the daemon stops
+        # here, and that ordering is required rather than tidy. A running
+        # container is held by its own containerd-shim-runc-v2 process, which
+        # is not a child of containerd and keeps running after the daemon
+        # stops — the shim, and the container in it, would stay awake through
+        # suspend. Stopping containerd is what silences the daemon; stopping
+        # the containers is what silences the workloads.
+        log 'Stopping containerd and docker services'
         timeout 60 systemctl stop docker.service docker.socket &>/dev/null || true
+        timeout 60 systemctl stop containerd.service &>/dev/null || true
 
         log 'Stopping iscsid'
         timeout 15 systemctl stop iscsid.socket iscsid.service &>/dev/null || true
@@ -324,13 +371,15 @@ case "$1" in
         log 'Clearing any stale iSCSI sessions'
         timeout 15 iscsiadm -m node --logoutall=all &>/dev/null || true
 
+        # containerd first: docker.service and kubelet.service both depend on
+        # it, and starting it explicitly means a failure is reported against
+        # the unit that failed rather than as a dependency error on the next.
+        start_service_with_retry containerd.service 60
         start_service_with_retry docker.service 60
-        start_service_with_retry cri-docker.socket 30
-        start_service_with_retry cri-docker.service 30
         start_service_with_retry kubelet.service 30
 
         log 'Post-resume service state:'
-        for unit in iscsid.service docker.service cri-docker.service kubelet.service; do
+        for unit in iscsid.service containerd.service docker.service kubelet.service; do
             state=$(timeout 5 systemctl is-active "$unit" 2>/dev/null || echo unknown)
             log "  ${unit}: ${state}"
         done

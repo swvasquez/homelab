@@ -28,8 +28,14 @@
 # and re-run. That file is the permission specification and carries the
 # reasoning for what is granted and what is deliberately withheld. It is
 # encrypted with git-crypt like the sshd hardening templates, because it maps
-# what a leaked agent token reaches. Neither sandbox holds a key, so adjusting
-# the agent's permissions is an operator-side task.
+# what a leaked agent token reaches.
+#
+# git-crypt encrypts it in the remote repository, not against the sandbox. In
+# direct workspace mode the host working tree is mounted whole, so the sandbox
+# reads the decrypted file and .git/git-crypt/keys/default alike, and an agent
+# can edit its own permissions here. What stops that from taking effect is that
+# .claude/settings.json denies the Ansible invocations, so the change is inert
+# until the operator runs the playbook.
 #
 # Deleting the ServiceAccount revokes access. Tokens embed its UID, so every
 # token ever minted for it stops working at once, and re-running this playbook

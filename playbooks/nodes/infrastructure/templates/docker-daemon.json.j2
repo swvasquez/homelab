@@ -1,18 +1,25 @@
 {#
   Docker daemon configuration.
 
-  live-restore keeps containers running while dockerd restarts. It matters here
-  because the kubelet reaches containerd through the cri-dockerd shim, which
-  means every cluster container is a Docker container: without this setting, a
-  routine 'apt upgrade' that happens to pull a new Docker version stops every
-  pod on the node. containerd itself needs no equivalent — its per-container
-  shim processes survive a daemon restart by design.
+  live-restore keeps containers running while dockerd restarts, so an
+  'apt upgrade' that pulls a new Docker version does not stop them.
 
-  This defers the restart rather than removing it. Containers keep using the
-  runtime they were started with, so an upgraded runtime does not apply to them
-  (including its security fixes) until they are recreated — drain the node to
-  do that at a time of your choosing. Deferring is the whole point: installing
-  the update stops being the same event as disrupting the cluster.
+  This covers Docker's own containers only. It was added while the kubelet
+  reached containerd through cri-dockerd, when every cluster container was also
+  a Docker container and a dockerd restart stopped every pod on the node.
+  cluster/kubernetes.yml now configures containerd's CRI plugin and the kubelet
+  connects to it directly, so nothing the cluster runs passes through dockerd.
+  containerd needs no equivalent setting either way — its per-container shim
+  processes are not children of the daemon and survive a restart by design.
+
+  Kept because it still protects containers started with docker by hand, and
+  because the suspend hook depends on knowing which way this is set: it stops
+  Docker's containers explicitly, since with live-restore on, stopping dockerd
+  no longer stops them (cluster/templates/k8s-suspend-hook.sh.j2).
+
+  It defers a restart rather than removing it. Containers keep using the
+  runtime they were started with, so an upgraded runtime does not apply to
+  them, including its security fixes, until they are recreated.
 
   Docker supports live restore across patch-level daemon upgrades. A larger
   version jump may stop containers regardless, so it is not a guarantee.

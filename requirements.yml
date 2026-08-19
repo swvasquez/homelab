@@ -1,4 +1,16 @@
 ---
 # This file is needed for ansible linting
+#
+# ansible-lint installs these into .ansible/collections before it runs, so a
+# collection a playbook uses but this file omits fails as syntax-check
+# 'unknown-module' rather than as a missing dependency. community.general was
+# missing while four playbooks used it — network.yml (ufw), nfs.yml and
+# slurm.yml (lvol), thread.yml (ini_file), and the ipkvm playbooks (pacman) —
+# so `just lint` reported six failures on a clean checkout.
+#
+# Unpinned, matching ansible.posix. Nothing here reaches the nodes: playbooks
+# run against the collections installed in the operator's environment, and this
+# file exists for the linter.
 collections:
   - name: ansible.posix
+  - name: community.general

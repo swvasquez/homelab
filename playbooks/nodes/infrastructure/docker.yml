@@ -7,8 +7,11 @@
 #
 # containerd arrives here as a Docker dependency (the containerd.io package),
 # but it is not Docker's private component — it is the container runtime for
-# the whole node. The kubelet reaches it through the cri-dockerd shim, so every
-# cluster container is ultimately run by the same daemon that runs Docker's.
+# the whole node. The kubelet connects to it directly, so every cluster
+# container is run by the same daemon that runs Docker's, without passing
+# through dockerd. cluster/kubernetes.yml is what enables its CRI plugin and
+# points the kubelet at the socket; this playbook installs the daemon.
+#
 # The two are kept apart by containerd namespaces: Docker works in 'moby' and
 # Kubernetes in 'k8s.io', and containerd's garbage collection only ever
 # considers references within a single namespace. That is why one daemon can
@@ -40,8 +43,10 @@
 #                              (default: [the inventory connection user]).
 #   docker_daemon_config_path: Path to the Docker daemon configuration file
 #                              (default: /etc/docker/daemon.json).
-#   docker_live_restore:       Whether containers keep running across a Docker
-#                              daemon restart (default: true).
+#   docker_live_restore:       Whether Docker's own containers keep running
+#                              across a Docker daemon restart. Cluster
+#                              containers are unaffected either way — they do
+#                              not run through dockerd (default: true).
 
 - name: Install and configure Docker
   hosts: nodes
@@ -127,11 +132,11 @@
 
     # -------------------------------------------------------------------------
     # Daemon Configuration
-    # Enables live restore, which keeps containers running while dockerd itself
-    # restarts. Every cluster container runs through dockerd on these nodes, so
-    # without it an 'apt upgrade' that happens to include a new Docker version
-    # stops every pod as a side effect of unrelated OS patching. See the
-    # template for why this defers the restart rather than removing it.
+    # Enables live restore, which keeps Docker's own containers running while
+    # dockerd itself restarts, so an 'apt upgrade' carrying a new Docker
+    # version does not stop them. It does not affect anything the cluster runs
+    # — the kubelet does not reach containerd through dockerd. See the template
+    # for what it covers and what it defers.
     #
     # The packages are deliberately NOT held at their installed version. A hold
     # would trade an unscheduled outage for Docker silently dropping out of
@@ -173,9 +178,9 @@
 
   handlers:
     # Reload rather than restart. live-restore is picked up by a daemon reload,
-    # and restarting dockerd to enable it would cause exactly the outage the
-    # setting exists to prevent — the protection is not yet in effect during
-    # the restart that turns it on.
+    # and restarting dockerd to enable it would stop the containers the setting
+    # exists to keep running — it is not yet in effect during the restart that
+    # turns it on.
     - name: Reload Docker
       ansible.builtin.systemd:
         name: docker
