@@ -189,6 +189,11 @@
         httproute_backend_namespace: '{{ argocd_namespace }}'
         httproute_backend_port: 80
         with_forward_auth: true
+        homepage_name: Argo CD
+        homepage_group: Delivery & Governance
+        homepage_icon: argo-cd.png
+        homepage_description: GitOps controller
+        homepage_pod_selector: app.kubernetes.io/instance=argocd,app.kubernetes.io/name=argocd-server
       when: bootstrap_node | default(false)
 
     - name: Apply ArgoCD HTTPRoute

@@ -22,7 +22,7 @@ The hardware and operating systems underneath Layer 0 are described in
 | **2 — Infrastructure** | Networking, storage, and the ingress front door | Cilium, Hubble, Cilium CLI, Gateway API CRDs, Traefik, cert-manager, Bind9, ExternalDNS, Longhorn, open-iscsi, nfs-common |
 | **3 — Platform services** | Shared backends that applications consume | CloudNativePG, OpenBao, External Secrets Operator, Stakater Reloader, Authentik, Prometheus, Alertmanager, Grafana, node-exporter, kube-state-metrics |
 | **4 — Delivery & governance** | How workloads are deployed and kept honest | Gitea, Argo CD, Harbor, Kyverno, Falco, Falcosidekick |
-| **5 — Applications** | End-user workloads | Firefly III, Home Assistant, Immich, Jellyfin, Open WebUI, Syncthing, Thread/Matter stack, Vaultwarden, vLLM, Zotero |
+| **5 — Applications** | End-user workloads | Firefly III, Home Assistant, Homepage, Immich, Jellyfin, Open WebUI, Syncthing, Thread/Matter stack, Vaultwarden, vLLM, Zotero |
 
 ---
 
@@ -331,6 +331,24 @@ platform that integrates and controls smart-home devices, sensors, and services
 from a single dashboard. It supports mobile companion apps via long-lived tokens
 and communicates with a separate Thread border router and Matter server to reach
 smart-home devices.
+
+### Homepage
+Deployed by `service/homepage.yml`. A dashboard that links the web UIs and
+endpoints exposed on the cluster, reachable at `homepage.<dns_zone>`. It runs in
+cluster mode: it lists HTTPRoutes across all namespaces through its own
+ServiceAccount and builds one tile per route carrying `gethomepage.dev`
+annotations, which `cluster/templates/httproute.yml.j2` renders when a playbook
+sets `homepage_name`. Nothing enumerates the services in Homepage's own config —
+`services.yaml` is empty — so the object that registers a hostname with
+ExternalDNS is the same object that puts it on the dashboard.
+
+Tiles are split across two tabs by what the operator came to do rather than by
+layer: **Applications** (groups Media, Home, Personal) and **Cluster** (groups
+Platform Services, Delivery & Governance, Infrastructure, which are the layer
+names used in this document). Homepage enables tabs as soon as any group names
+one, and a group that names none then renders on every tab, so
+`homepage_service_groups` assigns a tab to all six. It also renders a cluster
+and per-node CPU/memory widget from the Metrics Server.
 
 ### Immich
 Deployed by `service/immich.yml`. A self-hosted photo and video management

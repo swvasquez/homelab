@@ -44,6 +44,9 @@
 #   observability_httproutes: List of HTTPRoute definitions for Prometheus,
 #                             Grafana, and Alertmanager. Derived from the
 #                             hostname variables above — do not set manually.
+#                             The homepage_* fields on each entry become the
+#                             gethomepage.dev annotations on that route, which
+#                             is how the three UIs reach the Homepage dashboard.
 
 - name: Install Prometheus observability stack
   hosts: nodes
@@ -62,14 +65,23 @@
         hostname: "{{ prometheus_hostname }}"
         backend_name: kube-prometheus-stack-prometheus
         backend_port: 9090
+        homepage_name: Prometheus
+        homepage_icon: prometheus.png
+        homepage_description: Metrics
       - name: grafana
         hostname: "{{ grafana_hostname }}"
         backend_name: kube-prometheus-stack-grafana
         backend_port: 80
+        homepage_name: Grafana
+        homepage_icon: grafana.png
+        homepage_description: Dashboards
       - name: alertmanager
         hostname: "{{ alertmanager_hostname }}"
         backend_name: kube-prometheus-stack-alertmanager
         backend_port: 9093
+        homepage_name: Alertmanager
+        homepage_icon: alertmanager.png
+        homepage_description: Alert routing
 
   tasks:
     # -------------------------------------------------------------------------
@@ -220,6 +232,10 @@
         httproute_backend_namespace: "{{ observability_namespace }}"
         httproute_backend_port: "{{ item.backend_port }}"
         with_forward_auth: true
+        homepage_name: "{{ item.homepage_name }}"
+        homepage_group: Platform Services
+        homepage_icon: "{{ item.homepage_icon }}"
+        homepage_description: "{{ item.homepage_description }}"
       loop: "{{ observability_httproutes }}"
       when: bootstrap_node | default(false)
 

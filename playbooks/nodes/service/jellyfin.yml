@@ -180,6 +180,10 @@
         httproute_backend_namespace: '{{ jellyfin_namespace }}'
         httproute_backend_port: 8096
         with_forward_auth: true
+        homepage_name: Jellyfin
+        homepage_group: Media
+        homepage_icon: jellyfin.png
+        homepage_description: Media server
       when: bootstrap_node | default(false)
 
     - name: Apply Jellyfin HTTPRoute

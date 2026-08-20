@@ -1,0 +1,37 @@
+{#
+  ArgoCD Application manifest for the Homepage deployment. Tracks the Homepage
+  manifests stored in the Gitea gitops repository. Any push to the gitops
+  repository triggers an immediate sync via the Gitea webhook registered by
+  gitops.yml.
+
+  Variables:
+    argocd_namespace:       Kubernetes namespace where ArgoCD is deployed.
+    homepage_namespace:     Kubernetes namespace where Homepage will be deployed.
+    homepage_gitops_path:   Path within the gitops repository to the Homepage
+                            manifests (e.g. apps/homepage).
+    gitea_namespace:        Kubernetes namespace where Gitea is deployed.
+    gitea_admin_username:   Gitea admin username that owns the gitops repository.
+    gitea_gitops_repo:      Name of the Gitea gitops repository.
+#}
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: homepage
+  namespace: '{{ argocd_namespace }}'
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: 'http://gitea-http.{{ gitea_namespace }}.svc.cluster.local:3000/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}'
+    path: '{{ homepage_gitops_path }}'
+    targetRevision: main
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: '{{ homepage_namespace }}'
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

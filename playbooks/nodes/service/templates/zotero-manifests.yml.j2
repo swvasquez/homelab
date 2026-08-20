@@ -122,6 +122,22 @@ metadata:
   namespace: '{{ zotero_namespace }}'
   labels:
     app.kubernetes.io/name: zotero-webdav
+  # Read by Homepage's Kubernetes service discovery to build the tile. Written
+  # out here rather than picked up from cluster/templates/httproute.yml.j2,
+  # which this route does not use because it needs the per-rule request
+  # timeout that template does not render. The description names the endpoint
+  # as WebDAV because the tile links a sync URL for pasting into a Zotero
+  # client, not a page to browse.
+  annotations:
+    gethomepage.dev/enabled: 'true'
+    gethomepage.dev/name: Zotero
+    gethomepage.dev/group: Personal
+    gethomepage.dev/icon: zotero.png
+    gethomepage.dev/description: WebDAV endpoint for Zotero sync
+    # The Deployment is named zotero-webdav while this route is named
+    # zotero, and Homepage's status badge searches for pods labeled
+    # app.kubernetes.io/name=<route name> unless told otherwise.
+    gethomepage.dev/pod-selector: app.kubernetes.io/name=zotero-webdav
 spec:
   parentRefs:
     - name: traefik-gateway

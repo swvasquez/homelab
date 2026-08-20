@@ -190,6 +190,10 @@
         httproute_backend_namespace: '{{ firefly_namespace }}'
         httproute_backend_port: 80
         with_forward_auth: true
+        homepage_name: Firefly III
+        homepage_group: Personal
+        homepage_icon: firefly-iii.png
+        homepage_description: Personal finance ledger
       when: bootstrap_node | default(false)
 
     - name: Apply Firefly III HTTPRoute

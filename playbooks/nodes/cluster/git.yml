@@ -196,6 +196,10 @@
         httproute_backend_namespace: '{{ gitea_namespace }}'
         httproute_backend_port: 3000
         with_forward_auth: true
+        homepage_name: Gitea
+        homepage_group: Delivery & Governance
+        homepage_icon: gitea.png
+        homepage_description: Git server
       when: bootstrap_node | default(false)
 
     - name: Apply Gitea HTTPRoute

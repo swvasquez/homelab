@@ -1,0 +1,318 @@
+{#
+  Native Kubernetes manifests for the Homepage dashboard, deployed via ArgoCD.
+  Contains the ServiceAccount, ClusterRole and ClusterRoleBinding that back
+  Kubernetes service discovery, the ConfigMap holding Homepage's nine config
+  files, the ClusterIP Service, and the Deployment.
+
+  Homepage builds its tiles by listing HTTPRoutes cluster-wide and reading the
+  gethomepage.dev annotations that cluster/templates/httproute.yml.j2 renders
+  when a playbook defines homepage_name. services.yaml is therefore left empty:
+  every tile comes from a route, so the dashboard cannot list a service whose
+  DNS record was never created.
+
+  The ClusterRole grants read on ingresses and traefik.io ingressroutes even
+  though this cluster exposes everything through Gateway API HTTPRoutes.
+  Homepage lists ingresses on every refresh without checking whether any exist
+  and logs a failure as an error, and it lists traefik.io ingressroutes whenever
+  that CRD is present, which it is here because Traefik is the gateway
+  implementation. Dropping either rule turns a working refresh into one that
+  logs errors.
+
+  Config is mounted a file at a time with subPath, which is what Homepage's own
+  install documents. subPath mounts are resolved once at container start and do
+  not track later ConfigMap writes, so the Deployment carries the Reloader
+  annotation to get a rollout when the ConfigMap content changes.
+
+  proxmox.yaml is mounted empty even though there is no Proxmox here, and it is
+  absent from the ConfigMap in Homepage's own Kubernetes install page. Homepage
+  checks seven config files at startup and copies a skeleton in for any that is
+  missing; if that copy fails it calls process.exit(1) rather than continuing
+  without the file. The upstream example survives the omission because it runs
+  with a writable root filesystem as the image's own uid, so the copy succeeds.
+  Under readOnlyRootFilesystem the copy cannot succeed, so every checked file
+  has to be present up front: docker, settings, services, bookmarks, kubernetes,
+  proxmox, widgets. custom.css and custom.js are not in that set — a separate
+  API route reads them and tolerates their absence — and are mounted only to
+  match the upstream example.
+
+  Variables:
+    homepage_namespace:          Kubernetes namespace where Homepage is deployed.
+    homepage_hostname:           FQDN the dashboard is served on. Listed in
+                                 HOMEPAGE_ALLOWED_HOSTS.
+    homepage_image:              Container image for Homepage.
+    homepage_image_tag:          Container image tag for Homepage.
+    homepage_port:               Container port Homepage listens on.
+    homepage_title:              Dashboard title shown in the header.
+    homepage_service_groups:     Ordered list of {group, tab} pairs. Rendered
+                                 into settings.yaml as the layout, which is what
+                                 fixes both group order and the tab each group
+                                 sits under. A group named by an HTTPRoute
+                                 annotation but absent here is appended after
+                                 the ordered ones, and having no tab is what
+                                 puts it on every tab rather than one.
+    homepage_group_columns:      Tiles per row within a group.
+    nonroot_uid:                 Shared non-root UID/GID for pod and container
+                                 securityContext. Read from group_vars.
+#}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: homepage
+  namespace: '{{ homepage_namespace }}'
+  labels:
+    app.kubernetes.io/name: homepage
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: homepage
+  labels:
+    app.kubernetes.io/name: homepage
+rules:
+  - apiGroups:
+      - ''
+    resources:
+      - namespaces
+      - pods
+      - nodes
+    verbs:
+      - get
+      - list
+  - apiGroups:
+      - extensions
+      - networking.k8s.io
+    resources:
+      - ingresses
+    verbs:
+      - get
+      - list
+  - apiGroups:
+      - traefik.io
+    resources:
+      - ingressroutes
+    verbs:
+      - get
+      - list
+  - apiGroups:
+      - gateway.networking.k8s.io
+    resources:
+      - httproutes
+      - gateways
+    verbs:
+      - get
+      - list
+  - apiGroups:
+      - metrics.k8s.io
+    resources:
+      - nodes
+      - pods
+    verbs:
+      - get
+      - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: homepage
+  labels:
+    app.kubernetes.io/name: homepage
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: homepage
+subjects:
+  - kind: ServiceAccount
+    name: homepage
+    namespace: '{{ homepage_namespace }}'
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: homepage
+  namespace: '{{ homepage_namespace }}'
+  labels:
+    app.kubernetes.io/name: homepage
+data:
+  kubernetes.yaml: |
+    mode: cluster
+    gateway: true
+  settings.yaml: |
+    title: {{ homepage_title }}
+    headerStyle: clean
+    layout:
+{% for entry in homepage_service_groups %}
+      {{ entry.group }}:
+        tab: {{ entry.tab }}
+        style: row
+        columns: {{ homepage_group_columns }}
+{% endfor %}
+  widgets.yaml: |
+    - kubernetes:
+        cluster:
+          show: true
+          cpu: true
+          memory: true
+          showLabel: true
+          label: cluster
+        nodes:
+          show: true
+          cpu: true
+          memory: true
+          showLabel: true
+    - search:
+        provider: duckduckgo
+        target: _blank
+  services.yaml: ''
+  bookmarks.yaml: ''
+  docker.yaml: ''
+  proxmox.yaml: ''
+  custom.css: ''
+  custom.js: ''
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: homepage
+  namespace: '{{ homepage_namespace }}'
+  labels:
+    app.kubernetes.io/name: homepage
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: homepage
+  ports:
+    - name: http
+      port: {{ homepage_port }}
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: homepage
+  namespace: '{{ homepage_namespace }}'
+  labels:
+    app.kubernetes.io/name: homepage
+  annotations:
+    # Roll the Deployment when the ConfigMap changes. The config files are
+    # subPath mounts, which the kubelet never refreshes in place, so without
+    # this a settings.yaml edit would sit unread until the pod happened to
+    # restart.
+    reloader.stakater.com/auto: 'true'
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: homepage
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: homepage
+    spec:
+      serviceAccountName: homepage
+      # Homepage reads the API with this token, so the automount stays on. The
+      # Kyverno disallow-sa-token-override policy does not fire: it matches only
+      # pods that re-enable automount while using the namespace's default
+      # ServiceAccount, which homepage.yml patches to automount: false.
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: {{ nonroot_uid }}
+        runAsGroup: {{ nonroot_uid }}
+        fsGroup: {{ nonroot_uid }}
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: homepage
+          image: '{{ homepage_image }}:{{ homepage_image_tag }}'
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - name: http
+              containerPort: {{ homepage_port }}
+              protocol: TCP
+          env:
+            # PUID and PGID are deliberately unset. The image entrypoint
+            # defaults them to 0, which makes it skip every chown and exec the
+            # server directly; the pod already runs as nonroot_uid, so there is
+            # nothing to fix up. Setting them would send the entrypoint into a
+            # chown of /app/config that fails under readOnlyRootFilesystem.
+            - name: MY_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # Homepage rejects any request whose Host header is not listed
+            # here. The pod IP entry is for the kubelet probe, which connects
+            # by address and not by name; the hostname entry is what Traefik
+            # forwards from the browser.
+            - name: HOMEPAGE_ALLOWED_HOSTS
+              value: '$(MY_POD_IP):{{ homepage_port }},{{ homepage_hostname }}'
+            # The image sets HOSTNAME to '::' and the entrypoint test-binds
+            # IPv6 before falling back to IPv4. The cluster hands out only
+            # IPv4 pod addresses, so bind IPv4 directly and skip the probe.
+            - name: HOSTNAME
+              value: 0.0.0.0
+          volumeMounts:
+            - name: config
+              mountPath: /app/config/kubernetes.yaml
+              subPath: kubernetes.yaml
+            - name: config
+              mountPath: /app/config/settings.yaml
+              subPath: settings.yaml
+            - name: config
+              mountPath: /app/config/widgets.yaml
+              subPath: widgets.yaml
+            - name: config
+              mountPath: /app/config/services.yaml
+              subPath: services.yaml
+            - name: config
+              mountPath: /app/config/bookmarks.yaml
+              subPath: bookmarks.yaml
+            - name: config
+              mountPath: /app/config/docker.yaml
+              subPath: docker.yaml
+            - name: config
+              mountPath: /app/config/proxmox.yaml
+              subPath: proxmox.yaml
+            - name: config
+              mountPath: /app/config/custom.css
+              subPath: custom.css
+            - name: config
+              mountPath: /app/config/custom.js
+              subPath: custom.js
+            - name: logs
+              mountPath: /app/config/logs
+            - name: next-cache
+              mountPath: /app/.next/cache
+          readinessProbe:
+            httpGet:
+              path: /api/healthcheck
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/healthcheck
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 15
+      volumes:
+        - name: config
+          configMap:
+            name: homepage
+        # Both paths sit inside the image rather than under a mounted config
+        # file, so readOnlyRootFilesystem makes them unwritable without a
+        # volume. Homepage writes config/logs/homepage.log there on every run.
+        # .next/cache has not been observed in use and is mounted because a
+        # Next.js server writes its render cache there; leaving it out would
+        # surface as a runtime failure rather than at startup.
+        - name: logs
+          emptyDir: {}
+        - name: next-cache
+          emptyDir: {}

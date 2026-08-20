@@ -73,6 +73,14 @@ The one exception is a genuine data dependency: **vLLM before Open WebUI**, sinc
 Open WebUI reads the vLLM API key out of the `vllm-credentials` Secret and has no
 model backend without it.
 
+`homepage` inverts the direction of that independence without breaking it. It
+builds its tiles by reading `gethomepage.dev` annotations off HTTPRoutes, and
+each route carries its own annotations, so Homepage itself needs no list and no
+re-run when a service is added. What it does need is for the *other* playbook to
+have run at least once since its route gained those annotations — a service
+deployed before then resolves in DNS but has no tile. Re-running that one
+playbook is the whole fix.
+
 ### Tailscale: shared ACL before per-host
 
 `playbooks/shared/infrastructure/tailscale.yml` owns the tailnet ACL — tag

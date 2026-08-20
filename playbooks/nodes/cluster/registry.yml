@@ -200,6 +200,10 @@
          | map(attribute="inventory_hostname") | first }}
     # One hostname and one backend Service, split by path so that only the
     # portal carries the Authentik filter. See the HTTPRoutes section.
+    # Only the portal entry carries homepage_name: all three routes share one
+    # hostname, and Homepage renders a tile per annotated route, so annotating
+    # the registry and token paths would put Harbor on the dashboard three
+    # times over.
     harbor_routes:
       - name: registry
         prefix: /v2
@@ -210,6 +214,10 @@
       - name: portal
         prefix: /
         forward_auth: true
+        homepage_name: Harbor
+        homepage_icon: harbor.png
+        homepage_description: Registry proxy cache
+        homepage_pod_selector: app=harbor,component=nginx,release=harbor
     # The registries the cluster pulls from. `host` is the directory containerd
     # looks in, matched against the registry host in an image reference.
     #
@@ -655,6 +663,11 @@
         httproute_backend_port: 80
         httproute_path_prefix: '{{ item.prefix }}'
         with_forward_auth: '{{ item.forward_auth | bool }}'
+        homepage_name: "{{ item.homepage_name | default('') }}"
+        homepage_group: Delivery & Governance
+        homepage_icon: "{{ item.homepage_icon | default('') }}"
+        homepage_description: "{{ item.homepage_description | default('') }}"
+        homepage_pod_selector: "{{ item.homepage_pod_selector | default('') }}"
       loop: '{{ harbor_routes }}'
       loop_control:
         label: '{{ item.name }}'

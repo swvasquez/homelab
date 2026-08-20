@@ -366,6 +366,16 @@ metadata:
   namespace: '{{ thread_namespace }}'
   labels:
     app.kubernetes.io/name: matter-server
+  # Read by Homepage's Kubernetes service discovery to build the tile. Written
+  # out here rather than picked up from cluster/templates/httproute.yml.j2,
+  # which this route does not use because it is rendered as part of this
+  # manifest set for ArgoCD rather than applied on its own.
+  annotations:
+    gethomepage.dev/enabled: 'true'
+    gethomepage.dev/name: Matter Server
+    gethomepage.dev/group: Home
+    gethomepage.dev/icon: matter.png
+    gethomepage.dev/description: Matter commissioning dashboard and control API
 spec:
   parentRefs:
     - name: traefik-gateway

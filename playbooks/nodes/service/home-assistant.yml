@@ -200,6 +200,10 @@
         httproute_backend_namespace: '{{ home_assistant_namespace }}'
         httproute_backend_port: '{{ home_assistant_port }}'
         with_forward_auth: false
+        homepage_name: Home Assistant
+        homepage_group: Home
+        homepage_icon: home-assistant.png
+        homepage_description: Home automation
       when: bootstrap_node | default(false)
 
     - name: Apply Home Assistant HTTPRoute

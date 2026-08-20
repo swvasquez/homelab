@@ -333,6 +333,10 @@
         httproute_backend_namespace: '{{ vaultwarden_namespace }}'
         httproute_backend_port: 80
         with_forward_auth: true
+        homepage_name: Vaultwarden
+        homepage_group: Personal
+        homepage_icon: vaultwarden.png
+        homepage_description: Password manager
       when: bootstrap_node | default(false)
 
     - name: Apply Vaultwarden HTTPRoute

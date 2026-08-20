@@ -534,6 +534,20 @@
         httproute_backend_namespace: '{{ traefik_namespace }}'
         httproute_backend_port: 8080
         with_forward_auth: true
+        homepage_name: Traefik
+        homepage_group: Infrastructure
+        homepage_icon: traefik.png
+        homepage_description: Ingress dashboard
+        # --api.insecure=true serves the dashboard under /dashboard/ and the
+        # API under /api/; the route root returns 404, so the tile links the
+        # subpath rather than the hostname Homepage would derive.
+        homepage_href: 'https://{{ traefik_hostname }}/dashboard/'
+        # This route is attached in kube-system while Traefik's pods run in
+        # traefik_namespace, and Homepage looks for a tile's pods in the route's
+        # own namespace with no way to point elsewhere. No pod selector can
+        # match, so the tile drops its status badge rather than showing a
+        # permanent 'not found'.
+        homepage_external: true
       when: bootstrap_node | default(false)
 
     - name: Apply Traefik dashboard HTTPRoute
@@ -775,6 +789,10 @@
         httproute_backend_namespace: kube-system
         httproute_backend_port: 80
         with_forward_auth: true
+        homepage_name: Hubble
+        homepage_group: Infrastructure
+        homepage_icon: cilium.png
+        homepage_description: Network flow observability
       when: bootstrap_node | default(false)
 
     - name: Apply Hubble HTTPRoute

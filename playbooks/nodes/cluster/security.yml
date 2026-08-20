@@ -590,6 +590,11 @@
         httproute_backend_namespace: '{{ falco_namespace }}'
         httproute_backend_port: 2802
         with_forward_auth: true
+        homepage_name: Falco
+        homepage_group: Delivery & Governance
+        homepage_icon: mdi-shield-bug
+        homepage_description: Runtime security alerts
+        homepage_pod_selector: app.kubernetes.io/component=ui,app.kubernetes.io/instance=falco,app.kubernetes.io/name=falcosidekick
       when: bootstrap_node | default(false)
 
     - name: Apply Falcosidekick UI HTTPRoute

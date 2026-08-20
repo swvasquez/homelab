@@ -255,6 +255,11 @@
         httproute_backend_namespace: "{{ longhorn_namespace }}"
         httproute_backend_port: 80
         with_forward_auth: true
+        homepage_name: Longhorn
+        homepage_group: Infrastructure
+        homepage_icon: longhorn.png
+        homepage_description: Block storage
+        homepage_pod_selector: app=longhorn-ui
       when: bootstrap_node | default(false)
 
     - name: Apply Longhorn HTTPRoute

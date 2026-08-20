@@ -254,6 +254,11 @@
         httproute_backend_namespace: '{{ immich_namespace }}'
         httproute_backend_port: 2283
         with_forward_auth: true
+        homepage_name: Immich
+        homepage_group: Media
+        homepage_icon: immich.png
+        homepage_description: Photo and video library
+        homepage_pod_selector: app.kubernetes.io/controller=main,app.kubernetes.io/instance=immich,app.kubernetes.io/name=server
       when: bootstrap_node | default(false)
 
     - name: Apply Immich HTTPRoute

@@ -54,8 +54,8 @@ Browser → Traefik → (ForwardAuth) → Authentik outpost
 
 This is the default for web UIs that have weak or no native auth of their own —
 the reverse proxy becomes the security boundary. Representative users: the
-Traefik dashboard, the Hubble UI, and app UIs such as Firefly III, Jellyfin,
-Open WebUI, and the Syncthing GUI. The OpenBao UI is a notable partial case: its
+Traefik dashboard, the Hubble UI, the Homepage dashboard, and app UIs such as
+Firefly III, Jellyfin, Open WebUI, and the Syncthing GUI. The OpenBao UI is a notable partial case: its
 browser UI path is gated by ForwardAuth while its API path stays token-based and
 ungated, because ESO and the CLI authenticate to the API with tokens, not a
 browser session.

@@ -222,6 +222,10 @@
         httproute_backend_namespace: '{{ syncthing_namespace }}'
         httproute_backend_port: '{{ syncthing_gui_port }}'
         with_forward_auth: true
+        homepage_name: Syncthing
+        homepage_group: Personal
+        homepage_icon: syncthing.png
+        homepage_description: File synchronization
       when: bootstrap_node | default(false)
 
     - name: Apply Syncthing HTTPRoute

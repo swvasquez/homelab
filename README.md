@@ -2,7 +2,7 @@
 
 This repository contains code to deploy and manage a homelab cluster consisting of compute nodes, client nodes, and an IP KVM.
 
-As part of this homelab, a self-managed Kubernetes cluster hosts various services such as those for file syncing, Git repository hosting, media serving, and home automation. Client nodes can access these services from within the LAN or remotely via Tailscale.
+As part of this homelab, a self-managed Kubernetes cluster hosts various services such as those for file syncing, Git repository hosting, media serving, and home automation. Client nodes can access these services from within the LAN or remotely via Tailscale. A Homepage dashboard at `homepage.<dns_zone>` lists them, building its links from the same HTTPRoutes that register their DNS names.
 
 Code is deployed to the cluster via Ansible Playbooks. Common management tasks are accessible via the project's `justfile`.
 

@@ -166,6 +166,11 @@
         httproute_backend_namespace: '{{ openwebui_namespace }}'
         httproute_backend_port: 80
         with_forward_auth: true
+        homepage_name: Open WebUI
+        homepage_group: Personal
+        homepage_icon: open-webui.png
+        homepage_description: Chat front end for vLLM
+        homepage_pod_selector: app.kubernetes.io/component=open-webui,app.kubernetes.io/instance=open-webui
       when: bootstrap_node | default(false)
 
     - name: Apply Open WebUI HTTPRoute

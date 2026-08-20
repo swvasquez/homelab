@@ -14,6 +14,23 @@
   The authentik-forward-auth Middleware must be deployed to the same namespace
   as the HTTPRoute (httproute_namespace) before enabling this.
 
+  Setting homepage_name adds the gethomepage.dev annotations that Homepage's
+  Kubernetes service discovery reads, so the route that mints the DNS record is
+  also what puts the service on the dashboard. Routes without it do not appear:
+  leave it unset for API-only routes and for the secondary routes of a hostname
+  that already has a tile, since Homepage renders one tile per annotated route
+  and would otherwise duplicate the entry. The annotations are gated on the
+  value being non-empty rather than on the variable existing, so a playbook
+  rendering this in a loop can pass item.homepage_name | default('').
+
+  Homepage renders a status badge on every tile it discovers, driven by the
+  phase of the pods it believes back the route. It looks for pods labeled
+  app.kubernetes.io/name=<httproute_name> in the HTTPRoute's own namespace, so
+  the badge reads 'not found' for any workload whose chart labels its pods
+  something else. homepage_pod_selector corrects the label; homepage_external
+  removes the badge for the case no label can fix, a route attached in a
+  different namespace from its backend.
+
   Variables:
     httproute_name:              Name of the HTTPRoute resource.
     httproute_namespace:         Kubernetes namespace where the HTTPRoute is deployed.
@@ -32,6 +49,47 @@
                                  (default: /, which matches everything).
     with_forward_auth:           (Optional) When true, applies the authentik-forward-auth
                                  Middleware to the route (default: false).
+    homepage_name:               (Optional) Display name of the tile on the
+                                 Homepage dashboard. A non-empty value is what
+                                 marks the route for discovery; the remaining
+                                 homepage_* variables are read only when it is
+                                 set.
+    homepage_group:              (Optional) Dashboard section the tile is filed
+                                 under. homepage_service_groups in
+                                 service/homepage.yml orders the groups and
+                                 assigns each to a tab; a group named here but
+                                 missing from that list is appended after the
+                                 ordered ones and, having no tab, appears on
+                                 every tab rather than one.
+    homepage_icon:               (Optional) Icon for the tile. A bare filename
+                                 resolves against the homarr-labs
+                                 dashboard-icons set (e.g. grafana.png); an
+                                 'mdi-' or 'si-' prefix selects Material Design
+                                 Icons or Simple Icons instead, which is how a
+                                 tool with no entry in that set gets an icon
+                                 (e.g. mdi-shield-bug); an https:// URL is used
+                                 as given.
+    homepage_description:        (Optional) Subtitle shown under the tile name.
+    homepage_href:               (Optional) Link target for the tile. Defaults
+                                 to https://<httproute_hostname>; set it when
+                                 the landing page is not the route root (e.g. a
+                                 UI served under /ui).
+    homepage_pod_selector:       (Optional) Label selector naming the pods whose
+                                 phase drives the tile's status badge. Set it to
+                                 the backend Service's own spec.selector, which
+                                 is by definition the pods serving this route.
+                                 Needed whenever those pods are not labeled
+                                 app.kubernetes.io/name=<httproute_name>, which
+                                 is what Homepage searches for otherwise. A
+                                 chart that labels its pods anything else
+                                 renders the tile as 'not found' without
+                                 raising an error anywhere.
+    homepage_external:           (Optional) When true, drops the status badge
+                                 from the tile entirely. Homepage looks for the
+                                 pods in the HTTPRoute's own namespace and has
+                                 no override for that, so this is the only
+                                 option when a route is attached in a different
+                                 namespace from its backend (default: false).
 #}
 {% if httproute_backend_namespace != httproute_namespace %}
 apiVersion: gateway.networking.k8s.io/v1beta1
@@ -54,6 +112,25 @@ kind: HTTPRoute
 metadata:
   name: '{{ httproute_name }}'
   namespace: '{{ httproute_namespace }}'
+{% if homepage_name | default('') %}
+  annotations:
+    gethomepage.dev/enabled: 'true'
+    gethomepage.dev/name: '{{ homepage_name }}'
+    gethomepage.dev/group: '{{ homepage_group }}'
+    gethomepage.dev/icon: '{{ homepage_icon }}'
+{% if homepage_description | default('') %}
+    gethomepage.dev/description: '{{ homepage_description }}'
+{% endif %}
+{% if homepage_href | default('') %}
+    gethomepage.dev/href: '{{ homepage_href }}'
+{% endif %}
+{% if homepage_pod_selector | default('') %}
+    gethomepage.dev/pod-selector: '{{ homepage_pod_selector }}'
+{% endif %}
+{% if homepage_external | default(false) %}
+    gethomepage.dev/external: 'true'
+{% endif %}
+{% endif %}
 spec:
   parentRefs:
     - name: traefik-gateway

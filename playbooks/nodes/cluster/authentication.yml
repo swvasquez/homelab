@@ -742,6 +742,10 @@
         httproute_backend_name: authentik-server
         httproute_backend_namespace: "{{ authentik_namespace }}"
         httproute_backend_port: 80
+        homepage_name: Authentik
+        homepage_group: Platform Services
+        homepage_icon: authentik.png
+        homepage_description: Identity provider
       when: bootstrap_node | default(false)
 
     - name: Apply Authentik HTTPRoute
@@ -822,6 +826,11 @@
         httproute_backend_port: 8200
         httproute_path_prefix: /
         with_forward_auth: true
+        homepage_name: OpenBao
+        homepage_group: Platform Services
+        homepage_icon: openbao.png
+        homepage_description: Secret store
+        homepage_pod_selector: app.kubernetes.io/instance=openbao,app.kubernetes.io/name=openbao,component=server
       when: bootstrap_node | default(false)
 
     - name: Apply OpenBao UI HTTPRoute

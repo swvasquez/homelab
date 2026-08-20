@@ -83,9 +83,10 @@ The service exposes a `ClusterIP` and attaches an `HTTPRoute` to the Traefik
 Gateway. It shares one LAN IP (the gateway's) and the wildcard certificate with
 every other web app. **This is the default** for anything that speaks HTTP(S).
 
-- **Members:** the Traefik dashboard, the Hubble UI, and essentially every
-  application web UI (Firefly III, Immich, Jellyfin, Open WebUI, Vaultwarden,
-  Home Assistant, Zotero, and the web UIs of Gitea and Syncthing).
+- **Members:** the Traefik dashboard, the Hubble UI, the Homepage dashboard, and
+  essentially every application web UI (Firefly III, Immich, Jellyfin, Open
+  WebUI, Vaultwarden, Home Assistant, Zotero, and the web UIs of Gitea and
+  Syncthing).
 - **Why:** one IP, one certificate, and one place to enforce authentication for
   the whole fleet — adding a service costs only a `ClusterIP` and an `HTTPRoute`.
 

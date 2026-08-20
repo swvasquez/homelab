@@ -1,0 +1,415 @@
+---
+# ==============================================================================
+# Playbook: Deploy Homepage via ArgoCD GitOps
+# ==============================================================================
+# This playbook configures and deploys Homepage, a dashboard that links every
+# service exposed on the cluster, using native Kubernetes manifests
+# (ServiceAccount, ClusterRole, ConfigMap, Service, Deployment).
+#
+# Tiles are not listed anywhere in this playbook. Homepage runs in cluster mode
+# and builds the dashboard by listing HTTPRoutes across all namespaces, reading
+# the gethomepage.dev annotations that cluster/templates/httproute.yml.j2
+# renders when a playbook defines homepage_name. The route that registers a
+# hostname with ExternalDNS is therefore the same object that puts the service
+# on the dashboard, so the two cannot disagree — but a service only appears
+# once its own playbook has been re-run to add the annotations to its route.
+#
+# Note on tabs and group order: homepage_service_groups fixes both the order
+# groups appear in and which of the two tabs each sits under. The split is by
+# what the operator came to do — Applications for using the homelab, Cluster for
+# running it — rather than by architectural layer, which the group headers
+# within each tab already carry. Tab order follows layout order, so Applications
+# comes first.
+#
+# Every group must name a tab. Homepage turns tabs on as soon as any group has
+# one, and from that point a group without a tab renders on *all* of them, so an
+# omission silently duplicates a group onto both pages rather than erroring.
+#
+# The Cluster groups are the layer names from docs/k8-cluster-components.md, so
+# a tile is filed where that document already places the component. Media, Home,
+# and Personal have no counterpart there — that document holds all nine
+# end-user services in one undivided layer 5 — and split the tiles by what the
+# service is used for.
+#
+# Note on tile status: each tile carries a badge reporting the phase of the pods
+# behind its route, which Homepage finds by searching the route's own namespace
+# for pods labeled app.kubernetes.io/name=<route name>. Workloads whose chart
+# labels its pods otherwise set homepage_pod_selector on their route; see
+# cluster/templates/httproute.yml.j2 for both that and the homepage_external
+# escape hatch. Nothing is configured here — this playbook never names a tile.
+#
+# Note on authentication: the dashboard is gated by Authentik ForwardAuth like
+# the other service UIs. Homepage 2.0 added a built-in password and OIDC login,
+# which is left unconfigured — settings.yaml has no auth block, so the
+# ForwardAuth middleware remains the only gate and there is no second set of
+# credentials to keep.
+#
+# Run order:
+#   1. cluster/authentication.yml
+#   2. cluster/git.yml
+#   3. cluster/gitops.yml
+#   4. service/homepage.yml (this playbook — applies its own HTTPRoute and
+#      ForwardAuth Middleware in the Homepage namespace)
+#
+# Input Variables:
+#   bootstrap_node:            Boolean indicating if the host is the control
+#                              plane bootstrap node. Read from inventory.
+#   dns_zone:                  DNS zone (e.g. homelab.internal). Read from
+#                              group_vars.
+#   homepage_namespace:        Kubernetes namespace for Homepage
+#                              (default: homepage).
+#   homepage_hostname:         FQDN for the Homepage dashboard
+#                              (default: homepage.<dns_zone>).
+#   homepage_image:            Container image for Homepage
+#                              (default: ghcr.io/gethomepage/homepage).
+#   homepage_image_tag:        Container image tag for Homepage
+#                              (default: v2.0.0).
+#   homepage_port:             Port Homepage listens on (default: 3000).
+#   homepage_title:            Title shown in the dashboard header
+#                              (default: Homelab).
+#   homepage_service_groups:   Ordered list of {group, tab} pairs, rendered into
+#                              settings.yaml as the page layout. 'group' matches
+#                              the gethomepage.dev/group annotation on an
+#                              HTTPRoute; 'tab' is the tab that group appears
+#                              under. A group named by an annotation but missing
+#                              from this list still renders, after the ordered
+#                              ones — but with no tab, which puts it on every
+#                              tab (see the note on tabs above).
+#   homepage_group_columns:    Tiles per row within a group (default: 4).
+#   nonroot_uid:               Non-root UID the Homepage pod runs as. Read from
+#                              group_vars.
+#   homepage_gitops_path:      Path within the gitops repository where the
+#                              Homepage manifests are stored
+#                              (default: apps/homepage).
+#   kubectl_config_path:       Full path to the kubectl config file
+#                              (default: /home/<ansible_user>/.kube/config).
+#   authentik_namespace:       Kubernetes namespace where Authentik is deployed.
+#                              Used to build the ForwardAuth Middleware address
+#                              (default: authentik).
+#   gitea_namespace:           Kubernetes namespace where Gitea is deployed
+#                              (default: gitea).
+#   gitea_admin_username:      Username of the Gitea admin account used to
+#                              push to the gitops repository
+#                              (default: gitea_admin).
+#   gitea_gitops_repo:         Name of the Gitea gitops repository
+#                              (default: gitops).
+#   argocd_namespace:          Kubernetes namespace where ArgoCD is deployed
+#                              (default: argocd).
+
+- name: Deploy Homepage via ArgoCD GitOps
+  hosts: nodes
+  become: true
+  become_exe: sudo.ws
+  vars:
+    homepage_namespace: homepage
+    homepage_hostname: 'homepage.{{ dns_zone }}'
+    homepage_image: ghcr.io/gethomepage/homepage
+    homepage_image_tag: 'v2.0.0'
+    homepage_port: 3000
+    homepage_title: Homelab
+    homepage_service_groups:
+      - group: Media
+        tab: Applications
+      - group: Home
+        tab: Applications
+      - group: Personal
+        tab: Applications
+      - group: Platform Services
+        tab: Cluster
+      - group: Delivery & Governance
+        tab: Cluster
+      - group: Infrastructure
+        tab: Cluster
+    homepage_group_columns: 4
+    homepage_gitops_path: apps/homepage
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+    authentik_namespace: authentik
+    gitea_namespace: gitea
+    gitea_admin_username: gitea_admin
+    gitea_gitops_repo: gitops
+    argocd_namespace: argocd
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Namespace
+    # -------------------------------------------------------------------------
+    # Creates the Homepage namespace before any other resources so that the
+    # ArgoCD Application can target it on first run.
+    # -------------------------------------------------------------------------
+    - name: Create Homepage namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create namespace {{ homepage_namespace }}
+      register: homepage_ns_result
+      changed_when: "'created' in homepage_ns_result.stdout"
+      failed_when:
+        - homepage_ns_result.rc != 0
+        - "'already exists' not in homepage_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Default ServiceAccount Hardening
+    # -------------------------------------------------------------------------
+    # Disables the default ServiceAccount token automount in this namespace so
+    # ad-hoc pods that don't name a ServiceAccount cannot read a usable API
+    # bearer credential. Homepage uses its own named ServiceAccount and is
+    # unaffected.
+    # -------------------------------------------------------------------------
+    - name: Disable default ServiceAccount token automount in Homepage namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch serviceaccount default
+          -n {{ homepage_namespace }}
+          --type=merge
+          -p '{"automountServiceAccountToken": false}'
+      register: homepage_sa_automount_result
+      changed_when: "'patched' in homepage_sa_automount_result.stdout"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ForwardAuth Middleware and HTTPRoute
+    # -------------------------------------------------------------------------
+    # Deploys the Traefik ForwardAuth Middleware in the Homepage namespace and
+    # exposes the dashboard over HTTPS via an HTTPRoute attached to the
+    # traefik-gateway. The route is gated by Authentik. Authentik must already
+    # be installed (cluster/authentication.yml) for the gate to function.
+    # ExternalDNS registers the hostname in Bind9 once the route is accepted by
+    # the Gateway.
+    #
+    # This route carries no gethomepage.dev annotations: a tile linking the
+    # dashboard to itself is the one entry the dashboard does not need.
+    # -------------------------------------------------------------------------
+    - name: Write ForwardAuth Middleware manifest for Homepage
+      ansible.builtin.template:
+        src: ../cluster/templates/traefik-forward-auth-middleware.yml.j2
+        dest: /tmp/traefik-forward-auth-middleware-homepage.yml
+        mode: '0644'
+      vars:
+        middleware_namespace: '{{ homepage_namespace }}'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ForwardAuth Middleware in Homepage namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/traefik-forward-auth-middleware-homepage.yml
+      register: homepage_middleware_result
+      changed_when: >-
+        'created' in homepage_middleware_result.stdout or
+        'configured' in homepage_middleware_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Homepage ForwardAuth Middleware manifest
+      ansible.builtin.file:
+        path: /tmp/traefik-forward-auth-middleware-homepage.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Write Homepage HTTPRoute manifest
+      ansible.builtin.template:
+        src: ../cluster/templates/httproute.yml.j2
+        dest: /tmp/homepage-httproute.yml
+        mode: '0644'
+      vars:
+        httproute_name: homepage
+        httproute_namespace: '{{ homepage_namespace }}'
+        httproute_hostname: '{{ homepage_hostname }}'
+        httproute_backend_name: homepage
+        httproute_backend_namespace: '{{ homepage_namespace }}'
+        httproute_backend_port: '{{ homepage_port }}'
+        with_forward_auth: true
+      when: bootstrap_node | default(false)
+
+    - name: Apply Homepage HTTPRoute
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/homepage-httproute.yml
+      register: homepage_httproute_result
+      changed_when: >-
+        'created' in homepage_httproute_result.stdout or
+        'configured' in homepage_httproute_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Homepage HTTPRoute manifest
+      ansible.builtin.file:
+        path: /tmp/homepage-httproute.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # GitOps - Manifest Management
+    # -------------------------------------------------------------------------
+    # Renders the Homepage native Kubernetes manifests from a Jinja2 template
+    # and commits them to the Gitea gitops repository. ArgoCD watches this path
+    # and automatically syncs the manifests to the cluster.
+    # -------------------------------------------------------------------------
+    - name: Ensure git is installed
+      ansible.builtin.apt:
+        name: git
+        state: present
+      when: bootstrap_node | default(false)
+
+    - name: Get Gitea pod IP
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get pod -n {{ gitea_namespace }}
+          -l app.kubernetes.io/name=gitea,app.kubernetes.io/instance=gitea
+          -o jsonpath='{.items[0].status.podIP}'
+      register: gitea_pod_ip
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Read Gitea admin password from Kubernetes Secret
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get secret gitea-credentials -n {{ gitea_namespace }}
+          -o jsonpath='{.data.admin-password}'
+      register: gitea_admin_password_b64
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set Gitea admin password fact
+      ansible.builtin.set_fact:
+        gitea_admin_password: "{{ gitea_admin_password_b64.stdout | b64decode }}"
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Clone or update gitops repository in temporary directory
+      ansible.builtin.git:
+        repo: >-
+          http://{{ gitea_admin_username }}:{{ gitea_admin_password }}@{{ gitea_pod_ip.stdout }}:3000/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}
+        dest: /tmp/gitops-homepage
+        version: main
+        update: true
+      no_log: true
+      when: bootstrap_node | default(false)
+
+    - name: Create Homepage directory in gitops repository
+      ansible.builtin.file:
+        path: "/tmp/gitops-homepage/{{ homepage_gitops_path }}"
+        state: directory
+        mode: "0755"
+      when: bootstrap_node | default(false)
+
+    - name: Write Homepage manifests to gitops repository
+      ansible.builtin.template:
+        src: templates/homepage-manifests.yml.j2
+        dest: "/tmp/gitops-homepage/{{ homepage_gitops_path }}/manifests.yml"
+        mode: "0644"
+      when: bootstrap_node | default(false)
+
+    - name: Configure git user email for commit # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-homepage config user.email 'ansible@{{ dns_zone | default("homelab.internal") }}'
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Configure git user name for commit # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-homepage config user.name Ansible
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Set gitops repository remote URL with credentials for push # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-homepage remote set-url origin
+          http://{{ gitea_admin_username }}:{{ gitea_admin_password }}@{{ gitea_pod_ip.stdout }}:3000/{{ gitea_admin_username }}/{{ gitea_gitops_repo }}
+      no_log: true
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Stage Homepage manifests in gitops repository # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-homepage add {{ homepage_gitops_path }}/manifests.yml
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Check for staged changes in gitops repository # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-homepage diff --cached --exit-code
+      register: gitops_diff_result
+      changed_when: false
+      failed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Commit Homepage manifests to gitops repository # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          git -C /tmp/gitops-homepage commit -m 'chore: update homepage manifests'
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - gitops_diff_result.rc != 0
+
+    - name: Push Homepage manifests commit to Gitea # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: git -C /tmp/gitops-homepage push origin main
+      changed_when: true
+      when:
+        - bootstrap_node | default(false)
+        - gitops_diff_result.rc != 0
+
+    - name: Clean up gitops temporary directory
+      ansible.builtin.file:
+        path: /tmp/gitops-homepage
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ArgoCD Application
+    # -------------------------------------------------------------------------
+    # Applies the ArgoCD Application manifest that tracks the Gitea repository.
+    # This initiates the deployment of the Homepage resources to the cluster.
+    # -------------------------------------------------------------------------
+    - name: Write ArgoCD Application manifest for Homepage
+      ansible.builtin.template:
+        src: templates/homepage-app.yml.j2
+        dest: /tmp/homepage-app.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Apply ArgoCD Application manifest for Homepage
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/homepage-app.yml
+      register: argocd_app_result
+      changed_when: >-
+        'configured' in argocd_app_result.stdout or
+        'created' in argocd_app_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up ArgoCD Application manifest for Homepage
+      ansible.builtin.file:
+        path: /tmp/homepage-app.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Trigger ArgoCD hard refresh to detect new gitops commit
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch application homepage -n {{ argocd_namespace }}
+          --type merge
+          -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Wait for ArgoCD to sync and deploy Homepage
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get application homepage -n {{ argocd_namespace }}
+          -o jsonpath='{.status.sync.status},{.status.health.status}'
+      register: argocd_status
+      until: argocd_status.stdout == 'Synced,Healthy'
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: bootstrap_node | default(false)
