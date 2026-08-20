@@ -90,6 +90,15 @@
 #                                (default: authentik).
 #   authentik_db_storage_size:   Storage size for the Authentik cnpg database
 #                                PVC (default: 8Gi).
+#   authentik_db_image:          Container image for the cnpg Cluster, pinned
+#                                by digest to PostgreSQL 17.11. A floating
+#                                ':17' tag changes the running PostgreSQL minor
+#                                version whenever the pod restarts rather than
+#                                when this playbook changes. The tag is kept
+#                                alongside the digest because cnpg rejects an
+#                                imageName carrying only a digest, reading the
+#                                tag to detect version upgrades; the digest is
+#                                what determines the image pulled.
 #   authentik_storage_class:     Kubernetes StorageClass for the database PVC
 #                                (default: longhorn).
 #   nonroot_uid:                 Shared non-root UID for the authentik server
@@ -106,6 +115,7 @@
     authentik_db_name: authentik
     authentik_db_username: authentik
     authentik_db_storage_size: 8Gi
+    authentik_db_image: 'ghcr.io/cloudnative-pg/postgresql:17.11@sha256:03cacc5491ebdabf58eeecec2ae401076f1062f14f84af9956fd6ec235082188'
     authentik_storage_class: longhorn
     authentik_bootstrap_secret_name: authentik-eso-bootstrap
     openbao_hostname: 'openbao.{{ dns_zone }}'
@@ -326,7 +336,7 @@
             namespace: '{{ authentik_namespace }}'
           spec:
             instances: 1
-            imageName: ghcr.io/cloudnative-pg/postgresql:17
+            imageName: '{{ authentik_db_image }}'
             storage:
               storageClass: '{{ authentik_storage_class }}'
               size: '{{ authentik_db_storage_size }}'

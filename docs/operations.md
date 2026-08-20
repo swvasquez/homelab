@@ -246,6 +246,54 @@ that ever bind are the retroactive ones an advisory creates. Raise the value in
 have not upgraded in a long while is the assert doing its job — re-run that group
 with `tailscale_upgrade=true`.
 
+### Upgrade the PostgreSQL image
+
+Six CloudNativePG clusters share one image, declared per playbook as
+`authentik_db_image`, `gitea_db_image`, `harbor_db_image`, `firefly_db_image`,
+`vaultwarden_db_image`, and `immich_db_image`. Each is pinned to a digest with
+the tag kept in front of it:
+
+```
+ghcr.io/cloudnative-pg/postgresql:<MINOR>@sha256:<DIGEST>
+```
+
+A tag alone is not a pin. `:17` is an alias upstream moves to each new 17.x
+build, so a pod rescheduled for any reason can come back on a different
+PostgreSQL minor with different bundled extension versions. The tag stays
+alongside the digest because CloudNativePG rejects an `imageName` carrying only
+a digest, reading the tag to detect version upgrades; the digest is what
+determines the image pulled.
+
+Resolve the new digest, set all six values, then redeploy each playbook. Every
+cluster runs `instances: 1`, so each redeploy is a brief outage for that
+service. Authentik is the one to schedule rather than fit in — Traefik's
+forward-auth depends on it, so logins to gated services fail while it restarts.
+
+```bash
+just deploy nodes service firefly
+just deploy nodes service vaultwarden
+just deploy nodes cluster git
+just deploy nodes cluster registry
+just deploy nodes cluster authentication
+just deploy nodes service immich
+```
+
+Immich carries a second value that moves with the image.
+`immich_db_vector_version` records the pgvector version the image ships, and the
+cnpg `Database` resource applies it. Immich reads the version available in the
+image on startup, runs `ALTER EXTENSION vector UPDATE` when the database is
+behind, and exits 1 because the extension is owned by `postgres` rather than by
+`immich_db_username` — leaving the value stale crash-loops `immich-server`. Read
+the version off the database once it is on the new image, set it, and re-run:
+
+```bash
+kubectl exec -n immich immich-db-1 -- \
+  psql -U postgres -tAc \
+  "SELECT default_version FROM pg_available_extensions WHERE name = 'vector'"
+
+just deploy nodes service immich
+```
+
 ### Rotate the etcd encryption key
 
 `cluster/bootstrap.yml` encrypts all Kubernetes Secret resources at rest with

@@ -18,7 +18,10 @@
 # PostgreSQL is managed by the CloudNativePG operator using the standard cnpg
 # PostgreSQL 17 image, which includes the pgvector extension required by
 # Immich v2.0+ for machine-learning similarity search. A cnpg Cluster resource
-# is provisioned in the immich namespace before ArgoCD syncs the Helm release.
+# is provisioned in the immich namespace before ArgoCD syncs the Helm release,
+# followed by a cnpg Database resource that pins the pgvector version. The
+# Immich Helm chart deploys no database of its own; upstream requires one to be
+# supplied.
 #
 # The Immich photo library is backed by the homelab NFS share under
 # nfs_k8s_path/immich, exposed through a static PersistentVolume and
@@ -74,10 +77,20 @@
 #                               dns_zone (default: immich.<dns_zone>).
 #   immich_db_name:             PostgreSQL database name (default: immich).
 #   immich_db_username:         PostgreSQL username (default: immich).
-#   immich_db_image:            Container image for the cnpg Cluster. Immich
-#                               v2.0+ uses the standard pgvector extension
-#                               which is included in the default cnpg image
-#                               (default: ghcr.io/cloudnative-pg/postgresql:17).
+#   immich_db_image:            Container image for the cnpg Cluster, pinned by
+#                               digest to PostgreSQL 17.11. A floating ':17' tag
+#                               changes the bundled pgvector version whenever
+#                               the pod restarts; bump immich_db_vector_version
+#                               in the same change as this. The tag is kept
+#                               alongside the digest because cnpg rejects an
+#                               imageName carrying only a digest, reading the
+#                               tag to detect version upgrades; the digest is
+#                               what determines the image pulled.
+#   immich_db_vector_version:   pgvector version bundled in immich_db_image,
+#                               applied by the cnpg Database resource
+#                               (default: 0.8.6). Read the version a given
+#                               image ships with: SELECT default_version FROM
+#                               pg_available_extensions WHERE name = 'vector';
 #   immich_db_storage_size:     Storage size for the Immich cnpg database PVC
 #                               (default: 5Gi).
 #   immich_library_nfs_path:    Absolute path on the NFS server for the Immich
@@ -133,7 +146,8 @@
     immich_storage_class: longhorn
     immich_db_name: immich
     immich_db_username: immich
-    immich_db_image: ghcr.io/cloudnative-pg/postgresql:17
+    immich_db_image: 'ghcr.io/cloudnative-pg/postgresql:17.11@sha256:03cacc5491ebdabf58eeecec2ae401076f1062f14f84af9956fd6ec235082188'
+    immich_db_vector_version: '0.8.6'
     immich_db_storage_size: 5Gi
     immich_library_nfs_path: '{{ nfs_k8s_path }}/immich'
     immich_library_nfs_size: 10Gi
@@ -321,6 +335,29 @@
     # db-password stored in immich-credentials. The postInitSQL bootstrap
     # creates the extensions required by Immich before ArgoCD first syncs the
     # Helm release.
+    #
+    # A cnpg Database resource then holds the pgvector version. postInitSQL
+    # runs once, when initdb finds an empty volume, so it cannot carry the
+    # extension forward when the image changes: Immich detects a newer pgvector
+    # in the image, runs ALTER EXTENSION vector UPDATE on startup, and exits 1
+    # with 'must be owner of extension vector'. pgvector is not a trusted
+    # extension, so CREATE EXTENSION requires a superuser and the extension is
+    # always owned by postgres; PostgreSQL has no ALTER EXTENSION ... OWNER TO,
+    # so immich_db_username cannot be granted the update. Making
+    # immich_db_username a superuser would let Immich run the update itself and
+    # was rejected: a superuser can execute shell commands as the postgres OS
+    # user through COPY ... TO PROGRAM, and that credential is held by the
+    # process that parses uploaded photos and videos.
+    #
+    # The cnpg instance manager runs inside the database pod and connects over
+    # the local socket as postgres, the extension's owner, so its reconcile
+    # applies the update Immich cannot. It issues ALTER EXTENSION only when
+    # spec.extensions[].version is set and differs from the installed version:
+    # omitting version creates a missing extension but never upgrades one, so
+    # immich_db_vector_version is bumped by hand alongside immich_db_image.
+    #
+    # Only vector is listed. The other four extensions have no version coupling
+    # to the image, so postInitSQL creating them once is sufficient.
     # -------------------------------------------------------------------------
     - name: Read Immich database password from credentials Secret
       ansible.builtin.command:
@@ -402,6 +439,57 @@
           -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
       register: immich_db_ready
       until: immich_db_ready.stdout == 'True'
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Write Immich cnpg Database manifest
+      ansible.builtin.copy:
+        dest: /tmp/immich-db-database.yml
+        mode: '0600'
+        content: |
+          apiVersion: postgresql.cnpg.io/v1
+          kind: Database
+          metadata:
+            name: immich-database
+            namespace: '{{ immich_namespace }}'
+          spec:
+            cluster:
+              name: immich-db
+            name: '{{ immich_db_name }}'
+            owner: '{{ immich_db_username }}'
+            databaseReclaimPolicy: retain
+            extensions:
+              - name: vector
+                version: '{{ immich_db_vector_version }}'
+      when: bootstrap_node | default(false)
+
+    - name: Apply Immich cnpg Database manifest
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/immich-db-database.yml
+      register: immich_db_database_result
+      changed_when: >-
+        'created' in immich_db_database_result.stdout or
+        'configured' in immich_db_database_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Immich cnpg Database manifest
+      ansible.builtin.file:
+        path: /tmp/immich-db-database.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    - name: Wait for Immich cnpg Database to be applied
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          get database immich-database -n {{ immich_namespace }}
+          -o jsonpath='{.status.applied}'
+      register: immich_db_database_ready
+      until: immich_db_database_ready.stdout == 'true'
       retries: 30
       delay: 10
       changed_when: false

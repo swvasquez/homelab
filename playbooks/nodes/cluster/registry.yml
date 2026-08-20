@@ -87,6 +87,15 @@
 #   harbor_db_username:      PostgreSQL username for Harbor (default: harbor).
 #   harbor_db_storage_size:  Storage size for the Harbor cnpg database PVC
 #                            (default: 5Gi).
+#   harbor_db_image:         Container image for the cnpg Cluster, pinned by
+#                            digest to PostgreSQL 17.11. A floating ':17' tag
+#                            changes the running PostgreSQL minor version
+#                            whenever the pod restarts rather than when this
+#                            playbook changes. The tag is kept alongside the
+#                            digest because cnpg rejects an imageName carrying
+#                            only a digest, reading the tag to detect version
+#                            upgrades; the digest is what determines the image
+#                            pulled.
 #   harbor_uid:              UID/GID baked into Harbor's images, applied to the
 #                            blob directory on the host (default: 10000).
 #   harbor_ca_bundle_secret: Name of the Secret holding the homelab CA under a
@@ -141,6 +150,7 @@
     harbor_db_name: registry
     harbor_db_username: harbor
     harbor_db_storage_size: 5Gi
+    harbor_db_image: 'ghcr.io/cloudnative-pg/postgresql:17.11@sha256:03cacc5491ebdabf58eeecec2ae401076f1062f14f84af9956fd6ec235082188'
     harbor_uid: 10000
     harbor_ca_bundle_secret: harbor-ca-bundle
     authentik_namespace: authentik
@@ -497,7 +507,7 @@
             namespace: '{{ harbor_namespace }}'
           spec:
             instances: 1
-            imageName: ghcr.io/cloudnative-pg/postgresql:17
+            imageName: '{{ harbor_db_image }}'
             storage:
               storageClass: '{{ harbor_storage_class }}'
               size: '{{ harbor_db_storage_size }}'

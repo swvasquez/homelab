@@ -67,6 +67,15 @@
 #   gitea_db_username:         PostgreSQL username for Gitea (default: gitea).
 #   gitea_db_storage_size:     Storage size for the Gitea cnpg database PVC
 #                              (default: 10Gi).
+#   gitea_db_image:            Container image for the cnpg Cluster, pinned by
+#                              digest to PostgreSQL 17.11. A floating ':17' tag
+#                              changes the running PostgreSQL minor version
+#                              whenever the pod restarts rather than when this
+#                              playbook changes. The tag is kept alongside the
+#                              digest because cnpg rejects an imageName
+#                              carrying only a digest, reading the tag to
+#                              detect version upgrades; the digest is what
+#                              determines the image pulled.
 #   gitea_storage_class:       Kubernetes StorageClass for the database PVC
 #                              (default: longhorn).
 #   cluster_ca_secret_name:    Name of the TLS Secret in kube-system that
@@ -95,6 +104,7 @@
     gitea_db_name: gitea
     gitea_db_username: gitea
     gitea_db_storage_size: 10Gi
+    gitea_db_image: 'ghcr.io/cloudnative-pg/postgresql:17.11@sha256:03cacc5491ebdabf58eeecec2ae401076f1062f14f84af9956fd6ec235082188'
     gitea_storage_class: longhorn
     authentik_namespace: authentik
     authentik_hostname: "authentik.{{ dns_zone }}"
@@ -621,7 +631,7 @@
             namespace: '{{ gitea_namespace }}'
           spec:
             instances: 1
-            imageName: ghcr.io/cloudnative-pg/postgresql:17
+            imageName: '{{ gitea_db_image }}'
             storage:
               storageClass: '{{ gitea_storage_class }}'
               size: '{{ gitea_db_storage_size }}'
