@@ -86,7 +86,8 @@ every other web app. **This is the default** for anything that speaks HTTP(S).
 - **Members:** the Traefik dashboard, the Hubble UI, the Homepage dashboard, and
   essentially every application web UI (Firefly III, Immich, Jellyfin, Open
   WebUI, Vaultwarden, Home Assistant, Zotero, and the web UIs of Gitea and
-  Syncthing).
+  Syncthing). Harbor enters here too, for both its web portal and the registry
+  API containerd pulls through.
 - **Why:** one IP, one certificate, and one place to enforce authentication for
   the whole fleet — adding a service costs only a `ClusterIP` and an `HTTPRoute`.
 

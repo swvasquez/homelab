@@ -209,7 +209,8 @@ level.)
   `NET_ADMIN`/`NET_RAW` — so no added Linux capabilities. But two host-side pieces
   are required, and both fail silently-ish if missing:
   - **A custom AppArmor profile (not unconfined).** Kubernetes runs containers
-    under the `docker-default` AppArmor profile, which *blocks D-Bus method calls*:
+    under the runtime's default AppArmor profile, containerd's equivalent of
+    Docker's `docker-default`, which *blocks D-Bus method calls*:
     the container's first call (`Hello`) is denied and the server crashes with
     `write EPIPE`. Rather than dropping confinement entirely (`Unconfined`), local
     mode runs under a **custom profile that is `docker-default` verbatim plus one
@@ -217,7 +218,7 @@ level.)
     /sys, mount, and firmware denials) stays in force. `service/thread.yml`
     installs it (`matter-bluetooth.apparmor.j2`) into `/etc/apparmor.d/` on the
     radio host and loads it *before* the pod is applied; the pod references it via
-    `appArmorProfile: Localhost`. Proxy mode keeps stock docker-default. This is
+    `appArmorProfile: Localhost`. Proxy mode keeps the runtime default. This is
     the privilege trade-off of local mode — one narrow D-Bus hole, not a dropped
     profile.
   - **A BlueZ D-Bus policy for the pod's uid.** BlueZ's shipped policy allows only

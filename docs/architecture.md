@@ -272,7 +272,7 @@ four ways that touch nearly every task:
   for Arch, so the IP KVM playbooks use standard `sudo`.
 
 The rolling-release model is also a mild operational hazard: unlike the nodes,
-which stay on a fixed LTS until deliberately upgraded, the appliance drifts
+which stay on a fixed release until deliberately upgraded, the appliance drifts
 forward whenever it is updated. That is another argument for keeping its
 dependencies on the cluster minimal.
 
