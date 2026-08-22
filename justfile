@@ -32,19 +32,10 @@ sbx-up access="sealed":
         args+=(--deny-network "$resource")
     done <<<"$denies"
     sbx create "${args[@]}" claude "{{ justfile_directory() }}"
-    if sbx secret ls --service anthropic | grep -q "No secrets found"; then
-        sbx run --name {{ sbx_name }} -- auth login
-    fi
 
-# Creating here would miss the deny rules sbx-up passes at creation
-# Authenticate Claude Code and store the token in the sbx keychain
-[script]
-sbx-login:
-    if ! sbx ls --quiet | grep -qx "{{ sbx_name }}"; then
-        echo "No sandbox for this repository. Run 'just sbx-up' first." >&2
-        exit 1
-    fi
-    sbx run --name {{ sbx_name }} -- auth login
+# sbx keeps the OAuth token in the host keychain and seeds each new sandbox
+# with a stand-in credential, so the agent starts signed in. If Claude ever
+# prompts anyway, sign in at that prompt, from within the sandbox.
 
 # .sbx/env (uncommitted KEY=VALUE lines) reaches this shell, not the agent
 # Open a shell in the running sandbox
