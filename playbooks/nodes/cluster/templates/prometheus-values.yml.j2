@@ -20,8 +20,19 @@
   grafana_dashboard: '1' in all namespaces and provision them automatically as
   dashboards.
 
+  Loki is registered as a datasource here rather than via a sidecar-watched
+  ConfigMap because it's a single fixed backend, not something another
+  playbook should be able to add to independently. It points at the Loki
+  gateway Service rather than the singleBinary Service directly, matching
+  what observability.yml points Alloy's writes at. Its uid is pinned to
+  'loki' — matching the chart's own 'prometheus' uid for the Prometheus
+  datasource it creates — so dashboard JSON can reference it by a fixed
+  value instead of whatever uid Grafana would otherwise generate.
+
   Variables:
     grafana_hostname: FQDN for the Grafana UI (e.g. grafana.homelab.internal).
+    loki_gateway_url: Base URL of the Loki gateway Service (e.g.
+                      http://loki-gateway.observability.svc.cluster.local).
 #}
 grafana:
   ingress:
@@ -40,6 +51,12 @@ grafana:
       label: grafana_dashboard
       labelValue: '1'
       searchNamespace: ALL
+  additionalDataSources:
+    - name: Loki
+      type: loki
+      uid: loki
+      url: '{{ loki_gateway_url }}'
+      access: proxy
 
 prometheus:
   ingress:

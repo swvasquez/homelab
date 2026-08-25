@@ -17,6 +17,12 @@
 
   The raw block below prevents Jinja2 from interpreting Grafana's legend format
   strings (e.g. {{chip}}) as template expressions.
+
+  This dashboard is set as the Grafana home page (see grafana.ini.dashboards
+  in prometheus-values.yml.j2), so it carries a top-level link to the Logs
+  dashboard (uid 'logs', see loki-logs-dashboard-configmap.yml.j2) — that's
+  otherwise a manual Dashboards-browser search away from wherever a visitor
+  lands.
 #}
 apiVersion: v1
 kind: ConfigMap
@@ -44,7 +50,20 @@ data:
       "description": "Hardware temperature and CPU utilization for each cluster node via node-exporter metrics.",
       "editable": true,
       "graphTooltip": 1,
-      "links": [],
+      "links": [
+        {
+          "asDropdown": false,
+          "icon": "external link",
+          "includeVars": false,
+          "keepTime": false,
+          "tags": [],
+          "targetBlank": false,
+          "title": "Logs",
+          "tooltip": "",
+          "type": "link",
+          "url": "/d/logs/logs"
+        }
+      ],
       "panels": [
         {
           "datasource": {"type": "prometheus", "uid": "prometheus"},

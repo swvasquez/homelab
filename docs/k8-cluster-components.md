@@ -20,7 +20,7 @@ The hardware and operating systems underneath Layer 0 are described in
 | **0 — Node foundation** | Turn bare hosts into cluster members | kubelet, kubeadm, kubectl, containerd, Docker Engine, crictl, Helm, k9s, chrony |
 | **1 — Cluster core** | Make the cluster schedulable and safe by default | Metrics Server, Pod Security Admission |
 | **2 — Infrastructure** | Networking, storage, and the ingress front door | Cilium, Hubble, Cilium CLI, Gateway API CRDs, Traefik, cert-manager, Bind9, ExternalDNS, Longhorn, open-iscsi, nfs-common |
-| **3 — Platform services** | Shared backends that applications consume | CloudNativePG, OpenBao, External Secrets Operator, Stakater Reloader, Authentik, Prometheus, Alertmanager, Grafana, node-exporter, kube-state-metrics |
+| **3 — Platform services** | Shared backends that applications consume | CloudNativePG, OpenBao, External Secrets Operator, Stakater Reloader, Authentik, Prometheus, Alertmanager, Grafana, node-exporter, kube-state-metrics, Loki, Grafana Alloy |
 | **4 — Delivery & governance** | How workloads are deployed and kept honest | Gitea, Argo CD, Harbor, Kyverno, Falco, Falcosidekick |
 | **5 — Applications** | End-user workloads | Firefly III, Home Assistant, Homepage, Immich, Jellyfin, Open WebUI, Syncthing, Thread/Matter stack, Vaultwarden, vLLM, Zotero |
 
@@ -254,6 +254,18 @@ scrape.
 A service that generates metrics about the state of Kubernetes API objects such
 as deployments, pods, and nodes. It gives Prometheus visibility into the health
 and counts of cluster objects.
+
+### Loki
+A log aggregation system, run in Monolithic mode with local filesystem storage
+on a Longhorn RWO PVC rather than S3-compatible object storage. It has no UI of
+its own — it's queried from Grafana via a datasource pointing at Loki's gateway
+Service.
+
+### Grafana Alloy
+A telemetry collector, run as a DaemonSet that pulls each node's pod and
+container logs through the Kubernetes API and pushes them to Loki. Its debug
+UI is exposed over HTTPS behind ForwardAuth, the same as the other observability
+UIs.
 
 ---
 

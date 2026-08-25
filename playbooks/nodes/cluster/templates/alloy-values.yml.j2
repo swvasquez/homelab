@@ -1,0 +1,76 @@
+{#
+  Helm values for Grafana Alloy (grafana/alloy chart), deployed as a
+  DaemonSet that ships Kubernetes pod/container logs to Loki.
+
+  The embedded config uses loki.source.kubernetes, which pulls container
+  logs through the Kubernetes API — the same path `kubectl logs` uses —
+  rather than tailing files under a hostPath mount. That avoids giving the
+  DaemonSet a host filesystem mount just to read logs the API already
+  exposes, at the cost of a bit more load on the API server.
+  discovery.kubernetes is scoped to the pod's own node via a field selector,
+  which matters specifically because this runs as a DaemonSet: without it,
+  every Alloy pod would discover and collect logs for every pod in the
+  cluster, not just the ones on its own node.
+
+  RBAC needs no manual changes: the chart's default ClusterRole (rbac.create
+  defaults to true) already grants get/list/watch on pods, pods/log, and
+  namespaces cluster-wide, which is what discovery.kubernetes and
+  loki.source.kubernetes need.
+
+  The debug UI (component graph, pipeline status) listens on :12345 with no
+  authentication of its own, so it is exposed in observability.yml via an
+  HTTPRoute gated by the Authentik ForwardAuth middleware rather than left
+  open on its ClusterIP — the same pattern used for Prometheus, Grafana, and
+  Alertmanager.
+
+  Variables:
+    loki_gateway_url: Base URL of the Loki gateway Service that receives
+                      pushed logs, e.g.
+                      http://loki-gateway.observability.svc.cluster.local.
+#}
+alloy:
+  configMap:
+    content: |
+      discovery.kubernetes "pod" {
+        role = "pod"
+        selectors {
+          role  = "pod"
+          field = "spec.nodeName=" + coalesce(sys.env("HOSTNAME"), constants.hostname)
+        }
+      }
+
+      discovery.relabel "pod_logs" {
+        targets = discovery.kubernetes.pod.targets
+
+        rule {
+          source_labels = ["__meta_kubernetes_namespace"]
+          target_label  = "namespace"
+        }
+
+        rule {
+          source_labels = ["__meta_kubernetes_pod_name"]
+          target_label  = "pod"
+        }
+
+        rule {
+          source_labels = ["__meta_kubernetes_pod_container_name"]
+          target_label  = "container"
+        }
+
+        rule {
+          source_labels = ["__meta_kubernetes_namespace", "__meta_kubernetes_pod_container_name"]
+          separator     = "/"
+          target_label  = "job"
+        }
+      }
+
+      loki.source.kubernetes "pod_logs" {
+        targets    = discovery.relabel.pod_logs.output
+        forward_to = [loki.write.default.receiver]
+      }
+
+      loki.write "default" {
+        endpoint {
+          url = "{{ loki_gateway_url }}/loki/api/v1/push"
+        }
+      }

@@ -4,13 +4,22 @@
 # ==============================================================================
 # This playbook deploys the kube-prometheus-stack Helm chart to the Kubernetes
 # cluster, providing Prometheus for metrics collection, Alertmanager for alert
-# routing, and Grafana for visualization and dashboards.
+# routing, and Grafana for visualization and dashboards. It also deploys Loki
+# for log storage and Grafana Alloy for log collection.
 #
 # Grafana is configured for anonymous admin access; UI access is gated by
 # Traefik ForwardAuth → Authentik. The chart's admin user remains in
 # kube-prometheus-stack-grafana with a chart-generated password but is not
 # consumed by any meaningful auth path, so no admin credential is generated or
 # stored by this playbook.
+#
+# Loki runs in Monolithic mode (a single StatefulSet replica) with local
+# filesystem storage on a Longhorn RWO PVC, rather than the simple-scalable or
+# microservices modes, which assume S3-compatible object storage. Alloy runs
+# as a DaemonSet, pulling each node's pod/container logs through the
+# Kubernetes API and pushing them to Loki. Loki has no UI of its own — it's
+# queried through Grafana's Explore panel — so only Alloy's debug UI gets an
+# HTTPRoute; see the values templates for both for further detail.
 #
 # Each component UI is exposed over HTTPS via a Gateway API HTTPRoute attached
 # to the traefik-gateway. ExternalDNS registers the hostnames in Bind9 once the
@@ -39,14 +48,28 @@
 #                             (default: grafana.<dns_zone>).
 #   alertmanager_hostname:    FQDN for the Alertmanager UI, derived from
 #                             dns_zone (default: alertmanager.<dns_zone>).
+#   loki_chart_version:       Helm chart version of grafana-community/loki to
+#                             install (default: 18.11.2).
+#   loki_retention_period:    How long Loki retains logs, in Loki duration
+#                             syntax (default: 168h — 7 days).
+#   loki_pvc_size:            Size of the Longhorn RWO PVC backing Loki's
+#                             filesystem storage (default: 10Gi).
+#   loki_gateway_url:         Base URL of the Loki gateway Service, derived
+#                             from the Helm release name and
+#                             observability_namespace — do not set manually.
+#   alloy_chart_version:      Helm chart version of grafana/alloy to install
+#                             (default: 1.12.0).
+#   alloy_hostname:           FQDN for the Alloy debug UI, derived from
+#                             dns_zone (default: alloy.<dns_zone>).
 #   kubectl_config_path:      Full path to the kubectl config file
 #                             (default: /home/<ansible_user>/.kube/config).
 #   observability_httproutes: List of HTTPRoute definitions for Prometheus,
-#                             Grafana, and Alertmanager. Derived from the
-#                             hostname variables above — do not set manually.
-#                             The homepage_* fields on each entry become the
-#                             gethomepage.dev annotations on that route, which
-#                             is how the three UIs reach the Homepage dashboard.
+#                             Grafana, Alertmanager, and the Alloy debug UI.
+#                             Derived from the hostname variables above — do
+#                             not set manually. The homepage_* fields on each
+#                             entry become the gethomepage.dev annotations on
+#                             that route, which is how the UIs reach the
+#                             Homepage dashboard.
 
 - name: Install Prometheus observability stack
   hosts: nodes
@@ -58,6 +81,12 @@
     prometheus_hostname: "prometheus.{{ dns_zone }}"
     grafana_hostname: "grafana.{{ dns_zone }}"
     alertmanager_hostname: "alertmanager.{{ dns_zone }}"
+    loki_chart_version: 18.11.2
+    loki_retention_period: 168h
+    loki_pvc_size: 10Gi
+    loki_gateway_url: "http://loki-gateway.{{ observability_namespace }}.svc.cluster.local"
+    alloy_chart_version: 1.12.0
+    alloy_hostname: "alloy.{{ dns_zone }}"
     kubectl_config_path: "/home/{{ ansible_user }}/.kube/config"
     authentik_namespace: authentik
     observability_httproutes:
@@ -82,6 +111,13 @@
         homepage_name: Alertmanager
         homepage_icon: alertmanager.png
         homepage_description: Alert routing
+      - name: alloy
+        hostname: "{{ alloy_hostname }}"
+        backend_name: alloy
+        backend_port: 12345
+        homepage_name: Alloy
+        homepage_icon: alloy.png
+        homepage_description: Log collection
 
   tasks:
     # -------------------------------------------------------------------------
@@ -177,9 +213,130 @@
       when: bootstrap_node | default(false)
 
     # -------------------------------------------------------------------------
+    # Loki Installation
+    # Installs Loki via Helm in Monolithic mode, storing chunks and the TSDB
+    # index on a Longhorn RWO PVC instead of S3-compatible object storage. The
+    # chart moved from grafana/helm-charts to grafana-community/helm-charts in
+    # March 2026; the copy left behind in the old repo is frozen at 6.55.0 and
+    # gets no further security fixes.
+    # -------------------------------------------------------------------------
+    - name: Add Grafana community Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add grafana-community https://grafana-community.github.io/helm-charts
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Update Helm repositories
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Write Loki values file
+      ansible.builtin.template:
+        src: loki-values.yml.j2
+        dest: /tmp/loki-values.yml
+        mode: "0600"
+      when: bootstrap_node | default(false)
+
+    - name: Install or upgrade Loki via Helm
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade --install loki
+          grafana-community/loki
+          --namespace {{ observability_namespace }}
+          --kubeconfig {{ kubectl_config_path }}
+          --values /tmp/loki-values.yml
+          --version {{ loki_chart_version }}
+          --timeout 10m
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Loki values file
+      ansible.builtin.file:
+        path: /tmp/loki-values.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Grafana Alloy Installation
+    # Installs Alloy via Helm as a DaemonSet that ships each node's pod and
+    # container logs to Loki. See templates/alloy-values.yml.j2 for how log
+    # collection is configured and why RBAC needs no manual changes.
+    # -------------------------------------------------------------------------
+    - name: Add Grafana Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add grafana https://grafana.github.io/helm-charts
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Update Helm repositories
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Write Alloy values file
+      ansible.builtin.template:
+        src: alloy-values.yml.j2
+        dest: /tmp/alloy-values.yml
+        mode: "0600"
+      when: bootstrap_node | default(false)
+
+    - name: Install or upgrade Alloy via Helm
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade --install alloy
+          grafana/alloy
+          --namespace {{ observability_namespace }}
+          --kubeconfig {{ kubectl_config_path }}
+          --values /tmp/alloy-values.yml
+          --version {{ alloy_chart_version }}
+          --timeout 10m
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Alloy values file
+      ansible.builtin.file:
+        path: /tmp/alloy-values.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Logs Dashboard
+    # Deploys a single generic Logs dashboard as a ConfigMap labelled
+    # grafana_dashboard: '1', parameterized by namespace and pod rather than
+    # duplicated per service. See templates/loki-logs-dashboard-configmap.yml.j2
+    # for why.
+    # -------------------------------------------------------------------------
+    - name: Write Logs dashboard ConfigMap manifest
+      ansible.builtin.template:
+        src: loki-logs-dashboard-configmap.yml.j2
+        dest: /tmp/loki-logs-dashboard-configmap.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply Logs dashboard ConfigMap
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/loki-logs-dashboard-configmap.yml
+      register: loki_logs_dashboard_result
+      changed_when: >-
+        'created' in loki_logs_dashboard_result.stdout or
+        'configured' in loki_logs_dashboard_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Logs dashboard ConfigMap manifest
+      ansible.builtin.file:
+        path: /tmp/loki-logs-dashboard-configmap.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
     # ForwardAuth Middleware (observability)
     # Deploys the Traefik ForwardAuth Middleware in the observability namespace
-    # so that the Prometheus, Grafana, and Alertmanager HTTPRoutes can
+    # so that the Prometheus, Grafana, Alertmanager, and Alloy HTTPRoutes can
     # reference it. The Middleware itself just declares an outbound URL — it
     # can be created before Authentik is installed; it only becomes functional
     # once cluster/authentication.yml has run and the Authentik service is
@@ -213,11 +370,13 @@
 
     # -------------------------------------------------------------------------
     # UI Exposure
-    # Exposes Prometheus, Grafana, and Alertmanager over HTTPS via Gateway API
-    # HTTPRoutes attached to the traefik-gateway. ExternalDNS registers each
-    # hostname in Bind9 once the HTTPRoutes are accepted by the Gateway. Each
-    # route is gated by ForwardAuth and only becomes accessible once Authentik
-    # is installed by cluster/authentication.yml.
+    # Exposes Prometheus, Grafana, Alertmanager, and the Alloy debug UI over
+    # HTTPS via Gateway API HTTPRoutes attached to the traefik-gateway.
+    # ExternalDNS registers each hostname in Bind9 once the HTTPRoutes are
+    # accepted by the Gateway. Each route is gated by ForwardAuth and only
+    # becomes accessible once Authentik is installed by
+    # cluster/authentication.yml. Loki has no route of its own — it has no UI;
+    # it's queried through Grafana's Explore panel.
     # -------------------------------------------------------------------------
     - name: Write observability HTTPRoute manifests
       ansible.builtin.template:

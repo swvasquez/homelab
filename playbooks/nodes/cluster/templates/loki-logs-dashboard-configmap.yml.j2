@@ -1,0 +1,171 @@
+{#
+  ConfigMap containing the Logs Grafana dashboard JSON. The Grafana sidecar
+  watches for ConfigMaps with the label grafana_dashboard: '1' in the
+  observability namespace and automatically provisions them as dashboards.
+
+  This is one generic, parameterized dashboard rather than one per service:
+  the $namespace and $pod template variables are populated from Loki's own
+  label values, so any workload Alloy collects logs from is reachable here
+  without a playbook change. No per-service dashboards exist because no
+  service currently pairs logs with its own metrics panels.
+
+  The datasource is referenced by the fixed uid 'loki' set in
+  prometheus-values.yml.j2, not a name lookup, so this JSON doesn't break if
+  the datasource is ever renamed.
+
+  The $namespace/$pod variable queries use the Loki datasource's structured
+  query object ({"type": 1, "label": ..., "stream": ...}, type 1 =
+  LokiVariableQueryType.LabelValues) rather than the Prometheus-style
+  "label_values(...)" string used elsewhere in this repo's dashboards (e.g.
+  node-metrics-dashboard-configmap.yml.j2). The Loki datasource plugin's
+  variable editor doesn't parse that string form — using it silently yields
+  an empty option list.
+
+  The raw block below prevents Jinja2 from interpreting Loki's label
+  placeholders (e.g. {{namespace}}) as template expressions.
+#}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-logs-dashboard
+  namespace: '{{ observability_namespace }}'
+  labels:
+    grafana_dashboard: '1'
+data:
+  logs.json: |
+    {% raw %}{
+      "annotations": {
+        "list": [
+          {
+            "builtIn": 1,
+            "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+            "enable": true,
+            "hide": true,
+            "iconColor": "rgba(0, 211, 255, 1)",
+            "name": "Annotations & Alerts",
+            "type": "dashboard"
+          }
+        ]
+      },
+      "description": "Cluster-wide log search and volume across every namespace, via Loki and Alloy.",
+      "editable": true,
+      "graphTooltip": 1,
+      "links": [],
+      "panels": [
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {
+                "drawStyle": "bars",
+                "fillOpacity": 100,
+                "lineWidth": 0,
+                "pointSize": 5,
+                "stacking": {"group": "A", "mode": "normal"}
+              },
+              "mappings": [],
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0},
+          "id": 1,
+          "options": {
+            "legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true},
+            "tooltip": {"mode": "multi", "sort": "desc"}
+          },
+          "targets": [
+            {
+              "datasource": {"type": "loki", "uid": "loki"},
+              "expr": "sum by (namespace) (count_over_time({namespace=~\"$namespace\", pod=~\"$pod\"} [$__interval]))",
+              "legendFormat": "{{namespace}}",
+              "queryType": "range",
+              "refId": "A"
+            }
+          ],
+          "title": "Log Volume",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "gridPos": {"h": 16, "w": 24, "x": 0, "y": 8},
+          "id": 2,
+          "options": {
+            "dedupStrategy": "none",
+            "enableLogDetails": true,
+            "prettifyLogMessage": false,
+            "showCommonLabels": false,
+            "showLabels": true,
+            "showTime": true,
+            "sortOrder": "Descending",
+            "wrapLogMessage": true
+          },
+          "targets": [
+            {
+              "datasource": {"type": "loki", "uid": "loki"},
+              "expr": "{namespace=~\"$namespace\", pod=~\"$pod\"}",
+              "queryType": "range",
+              "refId": "A"
+            }
+          ],
+          "title": "Logs",
+          "type": "logs"
+        }
+      ],
+      "refresh": "30s",
+      "schemaVersion": 38,
+      "tags": ["logs", "loki"],
+      "templating": {
+        "list": [
+          {
+            "current": {},
+            "datasource": {"type": "loki", "uid": "loki"},
+            "definition": "Namespace label values",
+            "hide": 0,
+            "includeAll": true,
+            "label": "Namespace",
+            "multi": true,
+            "name": "namespace",
+            "options": [],
+            "query": {
+              "type": 1,
+              "label": "namespace",
+              "stream": "",
+              "refId": "LokiVariableQueryEditor-VariableQuery"
+            },
+            "refresh": 2,
+            "regex": "",
+            "sort": 1,
+            "type": "query"
+          },
+          {
+            "current": {},
+            "datasource": {"type": "loki", "uid": "loki"},
+            "definition": "Pod label values, scoped to $namespace",
+            "hide": 0,
+            "includeAll": true,
+            "label": "Pod",
+            "multi": true,
+            "name": "pod",
+            "options": [],
+            "query": {
+              "type": 1,
+              "label": "pod",
+              "stream": "{namespace=~\"$namespace\"}",
+              "refId": "LokiVariableQueryEditor-VariableQuery"
+            },
+            "refresh": 2,
+            "regex": "",
+            "sort": 1,
+            "type": "query"
+          }
+        ]
+      },
+      "time": {"from": "now-1h", "to": "now"},
+      "timepicker": {},
+      "timezone": "browser",
+      "title": "Logs",
+      "uid": "logs",
+      "version": 1
+    }{% endraw %}
