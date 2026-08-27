@@ -4,7 +4,7 @@ set unstable
 set script-interpreter := ["bash", "-eu"]
 
 # +----------------------------------------------------------------------------+
-# | Setup — create and configure the local Python virtual environment          |
+# | Setup — create and configure the local Python virtual environment        |
 # +----------------------------------------------------------------------------+
 
 # VIRTUAL_ENV keeps a sandbox's Linux environment out of the host's .venv
@@ -14,7 +14,7 @@ venv path=env_var_or_default("VIRTUAL_ENV", ".venv"):
     uv pip install --python "{{ path }}/bin/python" ansible-dev-tools
 
 # +----------------------------------------------------------------------------+
-# | Sandbox — run tooling inside a Docker Sandboxes microVM                    |
+# | Sandbox — run tooling inside a Docker Sandboxes microVM                  |
 # +----------------------------------------------------------------------------+
 
 sbx_name := "homelab"
@@ -48,7 +48,7 @@ sbx-shell:
     sbx exec "${args[@]}" {{ sbx_name }} bash -l
 
 # +----------------------------------------------------------------------------+
-# | Deploy — run Ansible playbooks against inventory hosts                     |
+# | Deploy — run Ansible playbooks against inventory hosts                   |
 # +----------------------------------------------------------------------------+
 
 # Trailing arguments pass through to ansible-playbook, e.g. -e key=value
@@ -61,7 +61,7 @@ deploy group category playbook *extra:
         {{ extra }}
 
 # +----------------------------------------------------------------------------+
-# | Lint — validate Ansible playbooks with ansible-lint                        |
+# | Lint — validate Ansible playbooks with ansible-lint                      |
 # +----------------------------------------------------------------------------+
 
 # Lint Ansible playbooks using ansible-lint
@@ -69,7 +69,7 @@ lint target="playbooks":
     uv run ansible-lint "{{ target }}"
 
 # +----------------------------------------------------------------------------+
-# | Nodes — manage connectivity and power state of inventory nodes             |
+# | Nodes — manage connectivity and power state of inventory nodes           |
 # +----------------------------------------------------------------------------+
 
 # Verify that a subset of machines are reachable via Ansible
@@ -94,6 +94,31 @@ wake subset="nodes":
             | "wakeonlan -i \(.lan_broadcast) \(.mac_address)"' \
         | sh
 
+# Uses the unlock-<host> aliases from initramfs.yml. Their forced
+# cryptroot-unlock reads piped stdin byte-for-byte, hence no trailing newline.
+# An already-unlocked node keeps retrying like a failure: nothing listens on
+# the Dropbear port once the real OS is up.
+# Unlock the LUKS root of every node in a group (assumes `just wake` was run)
+[script]
+unlock subset="nodes":
+    set +x
+    read -rsp 'LUKS passphrase: ' pw
+    printf '\nRetrying each node until it unlocks; press Ctrl-C to stop.\n'
+    # Backgrounded jobs ignore SIGINT, so Ctrl-C alone leaves them retrying;
+    # SIGTERM to the whole process group is not ignored and stops them. The
+    # trap first sets both signals to ignored: kill 0 TERMs this shell too
+    # (re-entering the trap recurses until bash segfaults), and a repeated
+    # Ctrl-C between the two commands would otherwise kill this shell before
+    # kill 0 reaches the jobs
+    trap 'trap "" INT TERM; kill 0; exit 130' INT TERM
+    for host in $(uv run ansible-inventory -i inventory.yml --list \
+            | jq -r '.{{ subset }}.hosts[]'); do
+        until printf '%s' "$pw" | ssh -T -o ConnectTimeout=5 "unlock-$host"; do
+            sleep 15
+        done && echo "Unlocked $host" &
+    done
+    wait
+
 # Suspend all nodes in the inventory to S3 (non-blocking)
 suspend subset="nodes":
     uv run ansible "{{ subset }}" \
@@ -116,7 +141,7 @@ shutdown subset="nodes":
         -B 1 -P 0
 
 # +----------------------------------------------------------------------------+
-# | Kubernetes — manage the Kubernetes cluster                                 |
+# | Kubernetes — manage the Kubernetes cluster                               |
 # +----------------------------------------------------------------------------+
 
 # Needs the agent ServiceAccount that `just deploy nodes cluster agent` creates
@@ -156,17 +181,18 @@ destroy-cluster subset="nodes":
         echo "Aborted."
         exit 1
     fi
+    sock=unix:///run/containerd/containerd.sock
     uv run ansible "{{ subset }}" \
         --ask-become-pass \
         -i inventory.yml \
         -m ansible.builtin.shell \
-        -a 'kubeadm reset -f --cri-socket unix:///run/containerd/containerd.sock' \
+        -a "kubeadm reset -f --cri-socket $sock" \
         --become \
         -e ansible_become_exe=sudo.ws \
         -B 1 -P 0
 
 # +----------------------------------------------------------------------------+
-# | Secrets — store and retrieve credentials from the pass store               |
+# | Secrets — store and retrieve credentials from the pass store             |
 # +----------------------------------------------------------------------------+
 
 # Press Enter without typing to keep existing values
@@ -199,7 +225,8 @@ bao-token pass_namespace=env_var('PASS_NAMESPACE'):
 
 # Drop into a subshell with BAO_ADDR, BAO_SKIP_VERIFY and BAO_TOKEN set
 [script]
-bao-shell openbao_hostname="openbao.homelab.internal" pass_namespace=env_var('PASS_NAMESPACE'):
+bao-shell openbao_hostname="openbao.homelab.internal" \
+        pass_namespace=env_var('PASS_NAMESPACE'):
     set +x
     export BAO_ADDR="https://{{ openbao_hostname }}"
     export BAO_SKIP_VERIFY=true
@@ -208,7 +235,7 @@ bao-shell openbao_hostname="openbao.homelab.internal" pass_namespace=env_var('PA
     exec bash
 
 # +----------------------------------------------------------------------------+
-# | Utilities — miscellaneous local machine helpers                            |
+# | Utilities — miscellaneous local machine helpers                          |
 # +----------------------------------------------------------------------------+
 
 # Flush the local DNS cache
