@@ -57,7 +57,8 @@ advertising a schedulable `amd.com/gpu` resource. Workloads that need the GPU
 reach it by mounting the `/dev/kfd` and `/dev/dri` device nodes from the host
 instead, which is why GPU workloads such as vLLM are deployed as a DaemonSet
 pinned to GPU-labeled nodes rather than as a Deployment with a GPU resource
-request. See `TODO.md` for the conditions under which this would be revisited.
+request. This would be revisited if the AMD GPU Operator adds support for
+integrated Ryzen AI graphics rather than Instinct accelerators alone.
 
 Two independent schedulers share the same GPUs, for two different kinds of work:
 

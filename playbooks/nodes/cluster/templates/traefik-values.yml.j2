@@ -2,7 +2,12 @@
   Helm values for Traefik ingress controller.
 
   Configures Traefik to act as a Gateway API controller using the kubernetesGateway
-  provider. The kubernetesCRD provider is also enabled with cross-namespace access so
+  provider. Traefik fills that role rather than Cilium's built-in Gateway API
+  controller because Cilium has no ForwardAuth middleware, which is what gates
+  services behind Authentik. If Cilium gains it, Traefik could be dropped and the
+  HTTPRoutes moved back to a Cilium-managed Gateway.
+
+  The kubernetesCRD provider is also enabled with cross-namespace access so
   that Middleware resources defined in one namespace can be referenced by routes in
   other namespaces. The kubernetesIngress provider is disabled as Gateway API HTTPRoutes
   are used exclusively. A LoadBalancer service is created so Traefik receives a stable

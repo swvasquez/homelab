@@ -3,14 +3,16 @@
 # Playbook: Deploy vLLM via ArgoCD GitOps
 # ==============================================================================
 # This playbook configures and deploys vLLM to the Kubernetes cluster via ArgoCD
-# GitOps using native Kubernetes manifests (DaemonSet, Service).
+# GitOps using native Kubernetes manifests (DaemonSet, Service). The official
+# vLLM Helm chart is not used because it has no option for the ROCm image;
+# revisit if it gains one.
 #
 # vLLM serves an OpenAI-compatible API for large language model inference using
 # the ROCm vLLM image. A DaemonSet schedules one vLLM pod on every node labeled
 # homelab.internal/vllm-host=true, determined by the vllm_host inventory
 # variable (defaults to true). GPU access is provided by mounting /dev/kfd and
 # /dev/dri directly from the host, bypassing the Kubernetes GPU device plugin
-# which does not support Ryzen AI APUs (see TODO.md).
+# which does not support Ryzen AI APUs.
 #
 # The vLLM API is exposed via a dedicated LoadBalancer service with ExternalDNS,
 # rather than through Traefik/ForwardAuth, so that OpenAI-compatible clients can
