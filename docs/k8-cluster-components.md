@@ -21,7 +21,7 @@ The hardware and operating systems underneath Layer 0 are described in
 | **1 — Cluster core** | Make the cluster schedulable and safe by default | Metrics Server, Pod Security Admission |
 | **2 — Infrastructure** | Networking, storage, and the ingress front door | Cilium, Hubble, Cilium CLI, Gateway API CRDs, Traefik, cert-manager, Bind9, ExternalDNS, Longhorn, open-iscsi, nfs-common |
 | **3 — Platform services** | Shared backends that applications consume | CloudNativePG, OpenBao, External Secrets Operator, Stakater Reloader, Authentik, Prometheus, Alertmanager, Grafana, node-exporter, kube-state-metrics, Loki, Grafana Alloy |
-| **4 — Delivery & governance** | How workloads are deployed and kept honest | Gitea, Argo CD, Harbor, Kyverno, Falco, Falcosidekick |
+| **4 — Delivery & governance** | How workloads are deployed and kept honest | Gitea, Argo CD, Harbor, Kyverno, Falco, Falcosidekick, Trivy Operator |
 | **5 — Applications** | End-user workloads | Firefly III, Home Assistant, Homepage, Immich, Jellyfin, Open WebUI, Syncthing, Thread/Matter stack, Vaultwarden, vLLM, Zotero |
 
 ---
@@ -272,7 +272,8 @@ UIs.
 ## Layer 4 — Delivery & Governance
 
 How workloads get into the cluster and are kept honest: source hosting, GitOps
-delivery, image caching, admission policy, and runtime threat detection.
+delivery, image caching, admission policy, runtime threat detection, and image
+vulnerability scanning.
 Installed by `cluster/git.yml`, `cluster/gitops.yml`, `cluster/registry.yml`,
 and `cluster/security.yml`.
 
@@ -297,8 +298,8 @@ Cached blobs are stored on a local PersistentVolume on the node flagged
 `registry_cache_node` in the inventory rather than on Longhorn; the core
 database is a CloudNativePG cluster. Retention keeps the most recently cached
 artifact of each repository with no time-based expiry, and a nightly garbage
-collection reclaims the disk. Trivy scanning is disabled and nothing pushes
-images to it. Its web portal is gated by ForwardAuth and authenticates against
+collection reclaims the disk. Harbor's built-in Trivy scanning is disabled
+and nothing pushes images to it. Its web portal is gated by ForwardAuth and authenticates against
 Authentik over OIDC, with accounts created on first login; the `/v2` and
 `/service` paths carry neither — containerd cannot follow an SSO redirect, so
 the proxy cache projects are public and pulls are anonymous. Harbor has no
@@ -319,6 +320,50 @@ or anomalous behavior at runtime.
 A companion component deployed alongside Falco that fans out and forwards Falco
 alerts to external sinks. It provides a web UI and routes security events into
 the cluster's alerting pipeline.
+
+### Trivy Operator
+Installed by `cluster/security.yml`. A controller that watches workload
+resources, scans the images they run against Trivy's vulnerability database, and
+writes a `VulnerabilityReport` custom resource per workload container. Each
+report is owned by its workload, so it is removed when the workload is. Because
+the scan target is what a workload runs rather than what a registry holds, the
+findings track the cluster rather than Harbor's cache contents.
+
+It runs in ClientServer mode, which adds a StatefulSet holding one copy of the
+vulnerability database on a Longhorn volume and turns each scan job into a thin
+client; the default Standalone mode has every scan job download the database
+itself. Image pulls go through the Harbor proxy cache, but the database does
+not — Trivy fetches it from `mirror.gcr.io` from inside the pod, which is not a
+path containerd's registry mirrors apply to.
+
+Two of its scanners are enabled, for image vulnerabilities and for secrets
+committed into images. Config auditing, RBAC assessment, infra assessment,
+cluster compliance, and SBOM generation are disabled: the first two overlap
+Kyverno, the next two need the node-collector's host mounts, and nothing
+consumes SBOMs. Its namespace is not PSA-exempt — image scanning needs no host
+access, so it runs under the cluster's restricted default with the security
+contexts the chart omits supplied in its values.
+
+Findings are collected at HIGH and CRITICAL severity. A report is a single API
+object per workload container, and the apiserver rejects writes above 2MiB.
+Collecting lower severities produced reports for the largest images — vLLM
+above all, whose Python dependency tree is the biggest in the cluster — that
+exceeded it and were rejected outright, leaving those workloads with no report
+rather than a truncated one. The level is global to the operator, so the
+largest image sets it for every image. Findings with no published fix are
+still recorded. The OTBR image is excluded outright — `service/thread.yml`
+builds it on a node and imports it straight into containerd, so it is in no
+registry and a scan job, which has no containerd socket, cannot read it. It is
+the one workload with no report.
+
+Findings reach Grafana by two routes. Severity counts per workload are scraped
+from the operator's Prometheus metrics through a ServiceMonitor. The CVE
+identifiers behind those counts go to Loki instead, printed as logfmt by a
+CronJob whose stdout Alloy already collects — the operator can publish a metric
+per CVE, but that is a Prometheus series per CVE per container holding a value
+that only changes when the image does. Both feed the `Cluster Vulnerabilities`
+dashboard. Nothing blocks deployments on the findings; scanning here is
+detection only.
 
 ---
 

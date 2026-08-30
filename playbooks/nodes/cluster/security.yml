@@ -2,10 +2,11 @@
 # ==============================================================================
 # Playbook: Cluster Security Hardening
 # ==============================================================================
-# Hardens the Kubernetes cluster in three plays: namespace-level hardening
+# Hardens the Kubernetes cluster in four plays: namespace-level hardening
 # (Pod Security Admission and ServiceAccount token automount), Falco
-# runtime security deployment, and Kyverno admission policy engine
-# deployment with a starter set of Enforce-mode ClusterPolicies.
+# runtime security deployment, Kyverno admission policy engine
+# deployment with a starter set of Enforce-mode ClusterPolicies, and Trivy
+# Operator image vulnerability scanning.
 #
 # Play 1 — Pod Security Admission Defaults and Namespace Hardening:
 #   Configures the built-in Pod Security Admission controller with cluster-wide
@@ -87,7 +88,64 @@
 #   psa_exempt_namespaces in Play 1) because the admission, reports, and
 #   cleanup controllers cannot run under the cluster's restricted default.
 #
-# Run this playbook after observability.yml (Falcosidekick requires Alertmanager).
+# Play 4 — Trivy Operator Image Vulnerability Scanning:
+#   Deploys Trivy Operator via Helm. It watches workload resources, scans the
+#   images they run against Trivy's vulnerability database, and writes a
+#   VulnerabilityReport CR per workload container. Reports are owned by the
+#   workload, so a workload's removal takes its reports with it, and findings
+#   describe the images the cluster runs rather than what a registry holds.
+#
+#   Scanning is detection only. Nothing here blocks a deployment on its
+#   findings — that would be a Kyverno policy reading the reports, and is
+#   deliberately not configured until the baseline noise is known. A first
+#   scan reports hundreds of findings across upstream images, most of them in
+#   packages no workload calls, and a gate built before seeing that number
+#   blocks routine upgrades.
+#
+#   trivy-operator-values.yml.j2 selects ClientServer mode (one StatefulSet
+#   holds the vulnerability database instead of every scan job downloading
+#   its own copy), enables the vulnerability and exposed-secret scanners, and
+#   disables the rest. Two limits found on the first deployment shape it,
+#   with the measurements recorded at the settings themselves:
+#
+#   - The apiserver rejects report writes above 2MiB, and reports carrying
+#     every severity exceeded that for the largest images — rejected
+#     outright, not truncated, so those workloads had no report at all.
+#     trivy.severity is therefore narrowed to HIGH,CRITICAL, and it is global
+#     to the operator, so the largest image sets the level for every image.
+#   - Scan jobs hold the package inventory of the image they are unpacking
+#     in memory, so the job memory limit has to cover the largest image
+#     rather than the typical one. The chart's default OOMKilled the vLLM,
+#     Open WebUI, and Cilium scans.
+#
+#   The OTBR image is excluded from scanning (trivyOperator.excludeImages):
+#   service/thread.yml builds it on a node and imports it straight into
+#   containerd, so it exists in no registry and a scan job cannot pull it.
+#   It is the one workload with no report.
+#
+#   The trivy-system namespace is NOT added to psa_exempt_namespaces — image
+#   scanning needs no host access, so unlike Falco and Kyverno this namespace
+#   runs under the cluster's restricted default. The chart's own security
+#   contexts stop short of what 'restricted' requires, so the values template
+#   adds runAsNonRoot and seccompProfile to the operator, the Trivy server,
+#   and the scan job pod template.
+#
+#   Findings reach Grafana through two paths. Severity counts per workload
+#   are published by the operator as Prometheus metrics and scraped through
+#   a ServiceMonitor; the CVE identifiers behind those counts are printed as
+#   logfmt by a CronJob and shipped to Loki by the Alloy DaemonSet, which
+#   already collects every pod's stdout. The identifiers are kept out of
+#   Prometheus because a per-CVE metric is a series per CVE per container —
+#   trivy-report-export.yml.j2 holds the full reasoning. Both paths feed one
+#   'Cluster Vulnerabilities' dashboard, provisioned from a ConfigMap in the
+#   trivy-system namespace — the Grafana sidecar watches all namespaces, so
+#   the dashboard ships with the play that produces its data.
+#
+# Run this playbook after observability.yml. Falcosidekick requires
+# Alertmanager, and Play 4 requires Prometheus to scrape its ServiceMonitor,
+# Alloy to collect the export CronJob's output, and Loki to store it. Play 4
+# still installs cleanly without them — the reports are written either way —
+# but nothing reaches Grafana.
 # It is idempotent — re-running is a no-op when the cluster is already hardened.
 # Playbook order: bootstrap.yml → network.yml → storage.yml → database.yml →
 #                 observability.yml → authentication.yml → security.yml
@@ -129,6 +187,44 @@
 # any 'fail' entries with:
 #
 #   kubectl get policyreport -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.summary}{"\n"}{end}'
+#
+# Validation — Trivy Operator (reports appear within a few minutes of the
+# Helm install; the first pass scans every workload already running):
+#
+#   kubectl get vulnerabilityreports -A
+#
+# Expected: one report per workload container, with per-severity counts in
+# the printer columns. Inspect the findings for one workload, including the
+# fixed version that says whether a patch exists, with:
+#
+#   kubectl get vulnerabilityreport -n <ns> <name> -o json | \
+#     jq '.report.vulnerabilities[] | {vulnerabilityID, severity, resource,
+#         installedVersion, fixedVersion}'
+#
+# Validation — Loki export (the CronJob runs on trivy_export_schedule; force
+# a run rather than waiting for it):
+#
+#   kubectl -n trivy-system create job --from=cronjob/trivy-report-export \
+#     trivy-report-export-manual
+#   kubectl -n trivy-system logs job/trivy-report-export-manual | head
+#
+# Expected: logfmt lines, one per vulnerability, each carrying
+# workload_namespace, workload, workload_kind, workload_container, image,
+# tag, cve, severity, package, installed, and fixed.
+# The same lines are queryable in Grafana within a minute or so via
+# {namespace="trivy-system", container="export"}. Delete the manual Job
+# afterwards.
+#
+# Rollback — Trivy Operator: kubectl delete -f the export manifest (or
+# kubectl delete cronjob/trivy-report-export -n trivy-system,
+# clusterrolebinding/trivy-report-export, clusterrole/trivy-report-export),
+# 'kubectl delete configmap trivy-vulnerabilities-dashboard -n trivy-system',
+# then 'helm uninstall trivy-operator -n trivy-system' and
+# 'kubectl delete namespace trivy-system'. The report CRs live in the
+# scanned workloads' namespaces, and Helm leaves the CRDs in place (the chart
+# ships them in its crds/ directory, which 'helm uninstall' does not touch),
+# so the reports outlive the uninstall until the aquasecurity.github.io CRDs
+# are deleted — deleting a CRD deletes its CRs.
 #
 # Rollback — PSA: delete the --admission-control-config-file line, the
 # admission-config volumeMount, and the admission-config volume from
@@ -244,6 +340,30 @@
 #                              (default: disallow-latest-tag,
 #                              disallow-sa-token-override,
 #                              disallow-nodeport-externalname).
+#   kubectl_config_path:       Full path to the kubectl config file used on
+#                              the control plane
+#                              (default: /home/<ansible_user>/.kube/config).
+#
+# Variables — Play 4 (Trivy Operator):
+#   trivy_namespace:           Kubernetes namespace for the Trivy Operator,
+#                              its vulnerability database server, the report
+#                              export CronJob, and the dashboard ConfigMap
+#                              (default: trivy-system).
+#   trivy_chart_version:       Helm chart version of aqua/trivy-operator to
+#                              install (default: 0.36.0, which carries
+#                              Trivy Operator 0.34.0 and Trivy 0.74.0).
+#   trivy_export_schedule:     Cron schedule on which the export CronJob
+#                              prints the current VulnerabilityReport
+#                              contents for Alloy to ship to Loki. The
+#                              dashboard's default time range is one interval
+#                              wide, so changing this means changing that
+#                              range too (default: 0 */6 * * *).
+#   trivy_export_image:        Pinned kubectl image the export CronJob runs.
+#                              Tracks kube_version from cluster/kubernetes.yml
+#                              — kubectl supports one minor version of skew
+#                              either way, so this does not have to match the
+#                              cluster exactly (default:
+#                              registry.k8s.io/kubectl:v1.35.8).
 #   kubectl_config_path:       Full path to the kubectl config file used on
 #                              the control plane
 #                              (default: /home/<ansible_user>/.kube/config).
@@ -751,4 +871,172 @@
         path: '/tmp/kyverno-{{ item }}.yml'
         state: absent
       loop: '{{ kyverno_policies }}'
+      when: bootstrap_node | default(false)
+
+- name: Deploy Trivy Operator image vulnerability scanning
+  hosts: nodes
+  become: true
+  become_exe: sudo.ws
+  vars:
+    trivy_namespace: trivy-system
+    trivy_chart_version: 0.36.0
+    trivy_export_schedule: '0 */6 * * *'
+    trivy_export_image: registry.k8s.io/kubectl:v1.35.8
+    kubectl_config_path: '/home/{{ ansible_user }}/.kube/config'
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Namespace
+    # -------------------------------------------------------------------------
+    # Creates the trivy-system namespace before the Helm install. Unlike falco and
+    # kyverno, this namespace is NOT added to psa_exempt_namespaces in Play 1 —
+    # image scanning pulls through the registry and needs no host access, so it
+    # runs under the cluster's restricted default. The values template supplies
+    # the runAsNonRoot and seccompProfile settings the chart omits.
+    # -------------------------------------------------------------------------
+    - name: Create trivy-system namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          create namespace {{ trivy_namespace }}
+      register: trivy_ns_result
+      changed_when: "'created' in trivy_ns_result.stdout"
+      failed_when:
+        - trivy_ns_result.rc != 0
+        - "'already exists' not in trivy_ns_result.stderr"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # ServiceAccount Token Automount
+    # -------------------------------------------------------------------------
+    # Play 1 patches the default ServiceAccount only in the 'default' namespace
+    # and leaves each playbook to do the same in the namespaces it creates.
+    # Every workload here names its own ServiceAccount, so nothing needs the
+    # token the default one would otherwise mount.
+    # -------------------------------------------------------------------------
+    - name: Disable default ServiceAccount token automount in trivy-system namespace
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          patch serviceaccount default -n {{ trivy_namespace }}
+          --type=merge -p '{"automountServiceAccountToken": false}'
+      register: trivy_sa_patch_result
+      changed_when: "'patched' in trivy_sa_patch_result.stdout"
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Trivy Operator Installation
+    # -------------------------------------------------------------------------
+    # Installs Trivy Operator via the official aqua Helm chart. The chart
+    # brings the operator Deployment, the report CRDs, and — because
+    # operator.builtInTrivyServer is set in the values template — a StatefulSet
+    # holding the shared vulnerability database.
+    #
+    # The first reconcile scans every workload already running, so reports for
+    # the whole cluster appear without redeploying anything.
+    # -------------------------------------------------------------------------
+    - name: Add aqua Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add aqua https://aquasecurity.github.io/helm-charts/
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Update Helm repositories
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+      when: bootstrap_node | default(false)
+
+    - name: Write Trivy Operator values file
+      ansible.builtin.template:
+        src: trivy-operator-values.yml.j2
+        dest: /tmp/trivy-operator-values.yml
+        mode: '0600'
+      when: bootstrap_node | default(false)
+
+    - name: Install or upgrade Trivy Operator via Helm
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade --install trivy-operator
+          aqua/trivy-operator
+          --namespace {{ trivy_namespace }}
+          --kubeconfig {{ kubectl_config_path }}
+          --values /tmp/trivy-operator-values.yml
+          --version {{ trivy_chart_version }}
+          --timeout 10m
+      changed_when: true
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Trivy Operator values file
+      ansible.builtin.file:
+        path: /tmp/trivy-operator-values.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Report Export to Loki
+    # -------------------------------------------------------------------------
+    # Applies the ServiceAccount, read-only ClusterRole, binding, and CronJob
+    # that print the reports' CVE detail as logfmt on stdout. Nothing pushes to
+    # Loki: Alloy is already collecting every pod's logs, so the CronJob's
+    # output reaches Loki the same way any other container's does.
+    #
+    # This is what puts CVE identifiers in Grafana without putting them in
+    # Prometheus — see the values template for why they are kept out of the
+    # metrics.
+    # -------------------------------------------------------------------------
+    - name: Write Trivy report export manifest
+      ansible.builtin.template:
+        src: trivy-report-export.yml.j2
+        dest: /tmp/trivy-report-export.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply Trivy report export manifest
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/trivy-report-export.yml
+      register: trivy_export_apply_result
+      changed_when: >-
+        'created' in trivy_export_apply_result.stdout or
+        'configured' in trivy_export_apply_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Trivy report export manifest
+      ansible.builtin.file:
+        path: /tmp/trivy-report-export.yml
+        state: absent
+      when: bootstrap_node | default(false)
+
+    # -------------------------------------------------------------------------
+    # Grafana Dashboard
+    # -------------------------------------------------------------------------
+    # Applies the Cluster Vulnerabilities dashboard as a ConfigMap labeled
+    # grafana_dashboard: '1'. The Grafana sidecar watches every namespace for
+    # that label, so the dashboard is deployed here alongside the data it reads
+    # rather than from observability.yml.
+    # -------------------------------------------------------------------------
+    - name: Write Trivy vulnerabilities dashboard ConfigMap manifest
+      ansible.builtin.template:
+        src: trivy-vulnerabilities-dashboard-configmap.yml.j2
+        dest: /tmp/trivy-vulnerabilities-dashboard-configmap.yml
+        mode: '0644'
+      when: bootstrap_node | default(false)
+
+    - name: Apply Trivy vulnerabilities dashboard ConfigMap
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubectl_config_path }}
+          apply -f /tmp/trivy-vulnerabilities-dashboard-configmap.yml
+      register: trivy_dashboard_apply_result
+      changed_when: >-
+        'created' in trivy_dashboard_apply_result.stdout or
+        'configured' in trivy_dashboard_apply_result.stdout
+      when: bootstrap_node | default(false)
+
+    - name: Clean up Trivy vulnerabilities dashboard ConfigMap manifest
+      ansible.builtin.file:
+        path: /tmp/trivy-vulnerabilities-dashboard-configmap.yml
+        state: absent
       when: bootstrap_node | default(false)

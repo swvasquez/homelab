@@ -1,0 +1,249 @@
+# ==============================================================================
+# Trivy Operator Helm Values
+# ==============================================================================
+# Configures the aquasecurity/trivy-operator Helm chart for homelab deployment.
+# The operator watches workload resources, scans the images they run, and
+# writes a VulnerabilityReport CR per workload container. Reports are owned by
+# the workload, so they are garbage-collected when it goes away.
+#
+# Every report is an object in etcd, and every enabled scanner multiplies that
+# count. Only the two scanners that answer "what is wrong inside this image"
+# are enabled here — vulnerabilities and exposed secrets. The rest are off,
+# each for its own reason, spelled out at the settings below.
+#
+# The trivy-system namespace is NOT in psa_exempt_namespaces, so it inherits
+# the cluster's restricted PSA default. The chart's own security contexts stop
+# short of what 'restricted' requires — they set allowPrivilegeEscalation,
+# capability drops, and readOnlyRootFilesystem, but omit runAsNonRoot and
+# seccompProfile — so every pod the chart creates has both added below.
+# Nothing here needs host access: image scanning pulls through the registry,
+# unlike Falco's eBPF driver or the node-collector disabled below.
+#
+# Registries are moved off the chart's mirror.gcr.io default to docker.io, which
+# does two different things depending on what is being fetched.
+#
+# The operator and Trivy images are pod images, pulled by containerd, so they
+# traverse the registry mirrors written by cluster/registry.yml and land in the
+# Harbor proxy cache. mirror.gcr.io has no hosts.toml entry, so leaving the
+# default would pull them past the cache.
+#
+# The policies bundle is not a pod image. The operator fetches it as an OCI
+# artifact over HTTPS from inside its own pod, the same way Trivy fetches its
+# vulnerability database, and containerd's mirror configuration does not apply
+# to either, so moving them changes which host is contacted and caches nothing.
+# The databases are left on the chart's mirror.gcr.io default, which is set by
+# trivy.dbRegistry and javaDbRegistry rather than by the image registry keys
+# below. The bundle's registry is set anyway so it does not come from a
+# different upstream than everything else if configAuditScannerEnabled is ever
+# turned on; with that scanner off, nothing fetches it at all.
+
+# ------------------------------------------------------------------------------
+# Scanners
+# ------------------------------------------------------------------------------
+operator:
+  # The vulnerability database is a several-hundred-MB download. In Standalone
+  # mode every scan job fetches its own copy; builtInTrivyServer runs one
+  # StatefulSet that holds the database and turns the scan jobs into thin
+  # clients. Setting this also forces trivy.mode to ClientServer and points
+  # serverURL at the in-cluster Service, so neither is set by hand below.
+  builtInTrivyServer: true
+
+  vulnerabilityScannerEnabled: true
+  exposedSecretScannerEnabled: true
+
+  # SBOM generation is on by default and produces an SbomReport CR per
+  # container. Nothing in the cluster reads them, so they would be etcd objects
+  # written and never read. Vulnerability scanning does not need them: Trivy
+  # builds its package inventory while scanning and matches against that
+  # directly, and an SBOM is one of the formats it can print that inventory in
+  # rather than a step on the way to a finding.
+  sbomGenerationEnabled: false
+
+  # Config auditing overlaps Kyverno, which is deployed in Play 3 and already
+  # blocks non-compliant workloads at admission. Leaving this on would produce
+  # a second, weaker report of the same class of problem, found after the fact.
+  configAuditScannerEnabled: false
+  rbacAssessmentScannerEnabled: false
+
+  # Infra assessment and cluster compliance both run the node-collector, which
+  # mounts host paths to read kubelet and apiserver configuration off the node.
+  # That cannot run under the restricted PSA profile this namespace inherits,
+  # and exempting the namespace to accommodate it would give up the isolation
+  # the image scanners do not need.
+  infraAssessmentScannerEnabled: false
+  clusterComplianceEnabled: false
+
+  # Severity counts per workload. This is what the Grafana dashboard reads.
+  metricsFindingsEnabled: true
+
+  # One Prometheus series per CVE per container, which for upstream images runs
+  # to tens of thousands of series holding a value that does not change between
+  # image upgrades. The same detail reaches Grafana through Loki instead, via
+  # the export CronJob in trivy-report-export.yml.j2.
+  metricsVulnIdEnabled: false
+
+  # How long a report stands before the workload is rescanned. Images that
+  # never change still need rescanning, because the vulnerability database
+  # moves underneath them.
+  scannerReportTTL: 24h
+
+  # Lowered from the chart's 10. A scan job pulls and unpacks an image, and the
+  # first reconcile after install queues one per workload in the cluster at
+  # once — on nodes that are also running every service, ten of those at a time
+  # is enough to matter. Scans are background work with no deadline, so the
+  # only cost of a lower limit is that the first pass takes longer.
+  scanJobsConcurrentLimit: 3
+
+# The chart renders one ClusterComplianceReport CR per entry in compliance.specs
+# regardless of clusterComplianceEnabled, so emptying the list is what keeps the
+# four default specs from being created as objects nothing ever reconciles.
+compliance:
+  specs: []
+
+image:
+  registry: docker.io
+  repository: aquasec/trivy-operator
+
+trivy:
+  image:
+    registry: docker.io
+    repository: aquasec/trivy
+  # slow trades scan wall-clock for lower CPU and memory, which suits nodes
+  # that are also running the cluster's services. This is the chart default,
+  # restated because the trade is deliberate here.
+  slow: true
+
+  # Narrowed from the chart's UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL. This is a
+  # capacity limit, not a judgment about which findings matter.
+  #
+  # A VulnerabilityReport is a single API object per workload container, and
+  # the write path caps it three times over: etcd's --max-request-bytes
+  # (1.5MiB default), the apiserver's etcd client MaxCallSendMsgSize (2MiB,
+  # set in code with no flag), and the apiserver's request body limit (3MiB).
+  # The 2MiB one binds, and it is the one that cannot be raised. There is no
+  # truncation — an oversized report is rejected outright and the workload
+  # ends up with no report at all, which is indistinguishable from a clean
+  # workload unless you check the scanned count.
+  #
+  # Collecting every severity produced 2.2-2.9MB reports for the largest
+  # images. MEDIUM,HIGH,CRITICAL still produced 2.4MB for vLLM, whose Python
+  # dependency tree is the largest in the cluster. HIGH,CRITICAL is typically
+  # a tenth of the total and fits with room to spare.
+  #
+  # Severity is global to the operator — there is no per-image or
+  # per-namespace override, so the largest image sets the level for all of
+  # them. Scoping a second operator install to those namespaces would allow
+  # different levels, at the cost of a second vulnerability database, duplicate
+  # cluster RBAC, and two releases owning the same CRDs; and it would not help
+  # for the Cilium agent, which shares kube-system with everything else.
+  #
+  # Unfixed findings are deliberately kept. ignoreUnfixed would shrink reports
+  # further and every remaining row would be actionable, but a critical with no
+  # published patch would then be absent rather than merely unpatchable, and
+  # that is the case where knowing still changes what you would do with a
+  # service.
+  severity: HIGH,CRITICAL
+
+  # Scan job limits, raised from the chart's 500m CPU / 500M memory. Trivy
+  # holds the package inventory of the image it is unpacking in memory, so the
+  # ceiling has to cover the largest image in the cluster rather than the
+  # typical one. At the default, scan jobs for vLLM, Open WebUI, and the Cilium
+  # agent were OOMKilled while smaller images scanned fine. Limits are ceilings
+  # — the requests are what the scheduler reserves, and three of those at
+  # scanJobsConcurrentLimit is what a node actually commits to.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 200Mi
+    limits:
+      cpu: 1
+      memory: 2Gi
+  storageClassName: longhorn
+  storageSize: 5Gi
+  server:
+    podSecurityContext:
+      runAsUser: 65534
+      runAsNonRoot: true
+      fsGroup: 65534
+      seccompProfile:
+        type: RuntimeDefault
+    securityContext:
+      privileged: false
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+          - ALL
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 1Gi
+
+policiesBundle:
+  registry: docker.io
+  repository: aquasec/trivy-checks
+
+# ------------------------------------------------------------------------------
+# Scan Jobs
+# ------------------------------------------------------------------------------
+# Scan jobs are created by the operator rather than by Helm, so they inherit
+# none of the chart's own pod security settings — these two keys are the only
+# way to make them satisfy the restricted profile.
+trivyOperator:
+  # The OTBR image is built on a node and imported straight into containerd's
+  # k8s.io namespace by service/thread.yml — it is in no registry. A scan job
+  # is a separate pod with no containerd socket mounted, so Trivy cannot read
+  # the local image and falls back to pulling by name, which resolves to a
+  # Docker Hub repository that does not exist and fails on every scan. Mounting
+  # the socket would give scan jobs host access this namespace is specifically
+  # arranged not to need, so the image is excluded instead and is the one
+  # workload with no vulnerability report.
+  excludeImages: '*otbr-mdnsresponder*'
+
+  scanJobPodTemplatePodSecurityContext:
+    runAsUser: 65534
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  scanJobPodTemplateContainerSecurityContext:
+    allowPrivilegeEscalation: false
+    privileged: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+
+# ------------------------------------------------------------------------------
+# Operator Pod
+# ------------------------------------------------------------------------------
+podSecurityContext:
+  runAsUser: 65534
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  privileged: false
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+# ------------------------------------------------------------------------------
+# Metrics
+# ------------------------------------------------------------------------------
+# Prometheus discovers ServiceMonitors across all namespaces
+# (serviceMonitorSelectorNilUsesHelmValues is false in
+# prometheus-values.yml.j2), so no label is needed for this one to be picked up.
+serviceMonitor:
+  enabled: true

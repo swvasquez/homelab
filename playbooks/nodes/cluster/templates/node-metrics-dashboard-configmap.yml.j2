@@ -1,7 +1,8 @@
 {#
   ConfigMap containing the Node Metrics Grafana dashboard JSON. The Grafana
-  sidecar watches for ConfigMaps with the label grafana_dashboard: '1' in the
-  observability namespace and automatically provisions them as dashboards.
+  sidecar watches for ConfigMaps with the label grafana_dashboard: '1' in all
+  namespaces (searchNamespace: ALL in prometheus-values.yml.j2) and
+  automatically provisions them as dashboards.
 
   The temperature section uses the node_hwmon_temp_celsius metric from
   node-exporter, which exposes hardware sensor readings (CPU, motherboard, NVMe,
@@ -15,14 +16,19 @@
   series panel stacks per-mode rates (user, system, iowait, softirq, irq, nice)
   so the breakdown of CPU time is visible at a glance.
 
+  This is Grafana's home dashboard (grafana.ini's default_home_dashboard_path
+  in prometheus-values.yml.j2), so its "links" are the top-bar buttons every
+  other dashboard is reached from — without them, the Logs dashboard (uid
+  'logs', see loki-logs-dashboard-configmap.yml.j2) and the Cluster
+  Vulnerabilities dashboard are a manual Dashboards-browser search away from
+  wherever a visitor lands. The links are plain /d/<uid>/<slug> paths resolved
+  by Grafana at click time, not references the sidecar checks — a button whose
+  target dashboard has not been provisioned yet renders and 404s. The
+  Vulnerabilities button points at a dashboard cluster/security.yml provisions
+  rather than observability.yml, so it is dead until that playbook has run.
+
   The raw block below prevents Jinja2 from interpreting Grafana's legend format
   strings (e.g. {{chip}}) as template expressions.
-
-  This dashboard is set as the Grafana home page (see grafana.ini.dashboards
-  in prometheus-values.yml.j2), so it carries a top-level link to the Logs
-  dashboard (uid 'logs', see loki-logs-dashboard-configmap.yml.j2) — that's
-  otherwise a manual Dashboards-browser search away from wherever a visitor
-  lands.
 #}
 apiVersion: v1
 kind: ConfigMap
@@ -62,6 +68,18 @@ data:
           "tooltip": "",
           "type": "link",
           "url": "/d/logs/logs"
+        },
+        {
+          "asDropdown": false,
+          "icon": "external link",
+          "includeVars": false,
+          "keepTime": false,
+          "tags": [],
+          "targetBlank": false,
+          "title": "Vulnerabilities",
+          "tooltip": "",
+          "type": "link",
+          "url": "/d/vulnerabilities/cluster-vulnerabilities"
         }
       ],
       "panels": [

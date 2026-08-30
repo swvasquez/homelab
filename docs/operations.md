@@ -41,8 +41,10 @@ failure they produce doesn't point back at the ordering:
   running kube-apiserver; doing it before Authentik exists leaves services
   briefly unable to authenticate.
 - **`observability` before `security`.** Falcosidekick forwards alerts to
-  Alertmanager, which `observability.yml` provides. Deploy Falco first and it has
-  nowhere to send anything.
+  Alertmanager, and Trivy Operator's findings reach Grafana through Prometheus
+  and Loki — all provided by `observability.yml`. Deploy `security` first and
+  everything installs cleanly, but Falco has nowhere to send alerts and the
+  Cluster Vulnerabilities dashboard stays empty.
 - **`registry` after `kubernetes`.** `kubernetes.yml` writes the containerd
   `config_path` that makes the mirror files `registry.yml` drops on each node
   readable. Without it containerd ignores them and logs nothing, so every pull

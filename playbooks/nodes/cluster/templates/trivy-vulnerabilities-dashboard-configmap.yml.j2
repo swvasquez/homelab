@@ -1,0 +1,425 @@
+{#
+  ConfigMap containing the Cluster Vulnerabilities Grafana dashboard JSON. The
+  Grafana sidecar watches for ConfigMaps with the label grafana_dashboard: '1'
+  in all namespaces (searchNamespace: ALL in prometheus-values.yml.j2) and
+  provisions them automatically, so this lives in the trivy-system namespace
+  with the rest of Play 4 rather than in the observability namespace.
+
+  The dashboard reads two datasources because the two halves of the data live
+  in different places. Severity counts come from Prometheus, where
+  trivy-operator publishes them per workload; the CVE identifiers behind those
+  counts come from Loki, where the export CronJob in trivy-report-export.yml.j2
+  puts them. See that template for why the identifiers are not in Prometheus.
+
+  Severity is spelled differently in each source and the two cannot share one
+  variable: trivy-operator title-cases the value in its metric labels
+  ('Critical'), while the VulnerabilityReport field the export reads is
+  upper-case ('CRITICAL'). The Prometheus panels hard-code the title-case form
+  and the $severity variable applies only to the Loki panel.
+
+  Both stop at HIGH because that is where trivy.severity is set in
+  trivy-operator-values.yml.j2 — MEDIUM and below are not collected, so a panel
+  or a variable option for them would read as an all-clear rather than as
+  absence. Widening the collected range means widening both.
+
+  The findings panel is a logs panel rather than a table. A table would need
+  the logfmt fields lifted into columns by an extractFields transformation,
+  and the raw line is already one readable row per finding.
+
+  The operator log sits in a collapsed row rather than behind a link to
+  Explore. A link would have to carry the query in an encoded Explore URL,
+  whose shape has changed between Grafana major versions; a panel holds the
+  query as data the dashboard already owns. Collapsed, it costs one header row
+  until clicked.
+
+  That panel excludes container="export" because the export CronJob's findings
+  share the namespace with the operator's own output, and there are thousands
+  of them — an unfiltered namespace query is almost entirely findings. It also
+  reformats to level and message, since the operator logs JSON with a full Go
+  stacktrace on every error line.
+
+  The default time range is one export interval. A wider range spans more than
+  one snapshot and shows each finding repeated per export, since the export
+  re-emits whatever the reports currently hold rather than only what changed.
+
+  The datasources are referenced by the fixed uids 'prometheus' (created by the
+  kube-prometheus-stack chart) and 'loki' (pinned in prometheus-values.yml.j2),
+  not by name lookup, so this JSON does not break if either is renamed.
+
+  The raw block below prevents Jinja2 from interpreting Grafana's and LogQL's
+  own placeholders as template expressions.
+
+  Variables:
+    trivy_namespace: Namespace holding the Trivy Operator, the export CronJob,
+                     and this ConfigMap (e.g. trivy-system).
+#}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trivy-vulnerabilities-dashboard
+  namespace: '{{ trivy_namespace }}'
+  labels:
+    grafana_dashboard: '1'
+data:
+  vulnerabilities.json: |
+    {% raw %}{
+      "annotations": {
+        "list": [
+          {
+            "builtIn": 1,
+            "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+            "enable": true,
+            "hide": true,
+            "iconColor": "rgba(0, 211, 255, 1)",
+            "name": "Annotations & Alerts",
+            "type": "dashboard"
+          }
+        ]
+      },
+      "description": "Image vulnerabilities across every scanned workload, from Trivy Operator. Counts come from Prometheus; the CVE identifiers behind them come from Loki.",
+      "editable": true,
+      "graphTooltip": 1,
+      "links": [],
+      "panels": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {
+            "defaults": {
+              "color": {"fixedColor": "dark-red", "mode": "fixed"},
+              "mappings": [],
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+          "id": 1,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "auto"
+          },
+          "targets": [
+            {
+              "datasource": {"type": "prometheus", "uid": "prometheus"},
+              "editorMode": "code",
+              "expr": "sum(trivy_image_vulnerabilities{namespace=~\"$namespace\", severity=\"Critical\"})",
+              "instant": true,
+              "legendFormat": "Critical",
+              "range": false,
+              "refId": "A"
+            }
+          ],
+          "title": "Critical",
+          "type": "stat"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {
+            "defaults": {
+              "color": {"fixedColor": "red", "mode": "fixed"},
+              "mappings": [],
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+          "id": 2,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "auto"
+          },
+          "targets": [
+            {
+              "datasource": {"type": "prometheus", "uid": "prometheus"},
+              "editorMode": "code",
+              "expr": "sum(trivy_image_vulnerabilities{namespace=~\"$namespace\", severity=\"High\"})",
+              "instant": true,
+              "legendFormat": "High",
+              "range": false,
+              "refId": "A"
+            }
+          ],
+          "title": "High",
+          "type": "stat"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "description": "Workload containers with a report. A workload missing here is not a workload with no findings — it is one that was never scanned, which is what a failing scan job looks like from the dashboard. The OTBR image is excluded by configuration and never appears.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"fixedColor": "text", "mode": "fixed"},
+              "mappings": [],
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+          "id": 4,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "auto"
+          },
+          "targets": [
+            {
+              "datasource": {"type": "prometheus", "uid": "prometheus"},
+              "editorMode": "code",
+              "expr": "count(count by (namespace, resource_name, container_name) (trivy_image_vulnerabilities{namespace=~\"$namespace\"}))",
+              "instant": true,
+              "legendFormat": "Scanned",
+              "range": false,
+              "refId": "A"
+            }
+          ],
+          "title": "Workloads Scanned",
+          "type": "stat"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "description": "Credentials found inside scanned images by the exposed-secret scanner. Any non-zero value is worth acting on regardless of severity.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"fixedColor": "purple", "mode": "fixed"},
+              "mappings": [],
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+          "id": 5,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "auto"
+          },
+          "targets": [
+            {
+              "datasource": {"type": "prometheus", "uid": "prometheus"},
+              "editorMode": "code",
+              "expr": "sum(trivy_image_exposedsecrets{namespace=~\"$namespace\"})",
+              "instant": true,
+              "legendFormat": "Exposed secrets",
+              "range": false,
+              "refId": "A"
+            }
+          ],
+          "title": "Exposed Secrets",
+          "type": "stat"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "description": "Counts move when an image is upgraded or when Trivy's vulnerability database is updated and existing images are rescanned.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineWidth": 1,
+                "pointSize": 5,
+                "showPoints": "never"
+              },
+              "mappings": [],
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {"h": 7, "w": 24, "x": 0, "y": 4},
+          "id": 6,
+          "options": {
+            "legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true},
+            "tooltip": {"mode": "multi", "sort": "desc"}
+          },
+          "targets": [
+            {
+              "datasource": {"type": "prometheus", "uid": "prometheus"},
+              "editorMode": "code",
+              "expr": "sum by (severity) (trivy_image_vulnerabilities{namespace=~\"$namespace\"})",
+              "legendFormat": "{{severity}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Vulnerabilities Over Time",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "description": "One row per workload per severity. Sort by Count to find the images carrying the most.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "thresholds"},
+              "custom": {"align": "auto", "cellOptions": {"type": "auto"}, "filterable": true},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "text", "value": null}]},
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {"h": 9, "w": 24, "x": 0, "y": 11},
+          "id": 7,
+          "options": {
+            "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false},
+            "showHeader": true,
+            "sortBy": [{"desc": true, "displayName": "Count"}]
+          },
+          "targets": [
+            {
+              "datasource": {"type": "prometheus", "uid": "prometheus"},
+              "editorMode": "code",
+              "expr": "sum by (namespace, resource_name, image_repository, image_tag, severity) (trivy_image_vulnerabilities{namespace=~\"$namespace\", severity=~\"Critical|High\"})",
+              "format": "table",
+              "instant": true,
+              "range": false,
+              "refId": "A"
+            }
+          ],
+          "title": "Critical and High by Workload",
+          "transformations": [
+            {
+              "id": "organize",
+              "options": {
+                "excludeByName": {"Time": true},
+                "indexByName": {},
+                "renameByName": {
+                  "Value": "Count",
+                  "image_repository": "Image",
+                  "image_tag": "Tag",
+                  "namespace": "Namespace",
+                  "resource_name": "Workload",
+                  "severity": "Severity"
+                }
+              }
+            }
+          ],
+          "type": "table"
+        },
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "description": "Individual findings, exported from the VulnerabilityReports on a schedule. Set $cve to a CVE identifier to find every workload carrying it. 'fixed=none' means no patched version is published yet.",
+          "gridPos": {"h": 13, "w": 24, "x": 0, "y": 20},
+          "id": 8,
+          "options": {
+            "dedupStrategy": "none",
+            "enableLogDetails": true,
+            "prettifyLogMessage": false,
+            "showCommonLabels": false,
+            "showLabels": false,
+            "showTime": true,
+            "sortOrder": "Descending",
+            "wrapLogMessage": true
+          },
+          "targets": [
+            {
+              "datasource": {"type": "loki", "uid": "loki"},
+              "editorMode": "code",
+              "expr": "{namespace=\"{% endraw %}{{ trivy_namespace }}{% raw %}\", container=\"export\"} | logfmt | workload_namespace=~\"$namespace\" | severity=~\"$severity\" | cve=~\"(?i).*$cve.*\"",
+              "queryType": "range",
+              "refId": "A"
+            }
+          ],
+          "title": "Findings",
+          "type": "logs"
+        },
+        {
+          "collapsed": true,
+          "gridPos": {"h": 1, "w": 24, "x": 0, "y": 33},
+          "id": 9,
+          "panels": [
+            {
+              "datasource": {"type": "loki", "uid": "loki"},
+              "description": "The operator's own log, not findings. It is quiet in normal operation — it logs at startup and on failure, not once per scan, so an empty panel over a long range is the healthy state. Scan job pods are deleted after they run, but Alloy has already shipped their output, so a failed scan's detail survives here for Loki's retention period after the pod is gone.",
+              "gridPos": {"h": 11, "w": 24, "x": 0, "y": 34},
+              "id": 10,
+              "options": {
+                "dedupStrategy": "none",
+                "enableLogDetails": true,
+                "prettifyLogMessage": false,
+                "showCommonLabels": false,
+                "showLabels": false,
+                "showTime": true,
+                "sortOrder": "Descending",
+                "wrapLogMessage": true
+              },
+              "targets": [
+                {
+                  "datasource": {"type": "loki", "uid": "loki"},
+                  "editorMode": "code",
+                  "expr": "{namespace=\"{% endraw %}{{ trivy_namespace }}{% raw %}\", container!=\"export\"} | json | line_format \"{{.level}} {{.msg}}\"",
+                  "queryType": "range",
+                  "refId": "A"
+                }
+              ],
+              "title": "Operator and Server Log",
+              "type": "logs"
+            }
+          ],
+          "title": "Logs",
+          "type": "row"
+        }
+      ],
+      "refresh": "",
+      "schemaVersion": 38,
+      "tags": ["security", "trivy"],
+      "templating": {
+        "list": [
+          {
+            "current": {},
+            "datasource": {"type": "prometheus", "uid": "prometheus"},
+            "definition": "label_values(trivy_image_vulnerabilities, namespace)",
+            "hide": 0,
+            "includeAll": true,
+            "allValue": ".*",
+            "label": "Namespace",
+            "multi": true,
+            "name": "namespace",
+            "options": [],
+            "query": {"query": "label_values(trivy_image_vulnerabilities, namespace)", "refId": "StandardVariableQuery"},
+            "refresh": 2,
+            "regex": "",
+            "sort": 1,
+            "type": "query"
+          },
+          {
+            "current": {"selected": true, "text": ["CRITICAL", "HIGH"], "value": ["CRITICAL", "HIGH"]},
+            "hide": 0,
+            "includeAll": true,
+            "allValue": ".*",
+            "label": "Severity",
+            "multi": true,
+            "name": "severity",
+            "options": [],
+            "query": "CRITICAL,HIGH",
+            "type": "custom"
+          },
+          {
+            "current": {"text": "", "value": ""},
+            "hide": 0,
+            "label": "CVE",
+            "name": "cve",
+            "options": [],
+            "query": "",
+            "type": "textbox"
+          }
+        ]
+      },
+      "time": {"from": "now-6h", "to": "now"},
+      "timepicker": {},
+      "timezone": "browser",
+      "title": "Cluster Vulnerabilities",
+      "uid": "vulnerabilities",
+      "version": 1
+    }{% endraw %}

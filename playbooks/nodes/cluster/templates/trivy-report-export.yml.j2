@@ -1,0 +1,173 @@
+{#
+  Exports Trivy VulnerabilityReport contents to Loki, as the per-CVE half of
+  the vulnerability dashboard.
+
+  The reports already hold every CVE, but only severity counts reach Prometheus
+  — trivy-operator's per-CVE metric is left off in trivy-operator-values.yml.j2
+  because it creates a Prometheus series per CVE per container, tens of
+  thousands of them, each holding a value that stays constant until the image
+  is upgraded. Loki indexes only stream labels and leaves the line body
+  compressed and unindexed, so the CVE identifier costs nothing to store there
+  and is found by scanning at query time.
+
+  Nothing pushes to Loki here. The CronJob prints to stdout, and Alloy — a
+  DaemonSet already collecting every pod's logs through the Kubernetes API, see
+  alloy-values.yml.j2 — ships it like any other container output. That is why
+  the stream labels are namespace/pod/container: those are the labels Alloy's
+  relabel rules attach, and this data inherits them rather than defining its
+  own. Keeping the CVE out of a label is the whole point; putting it in one
+  would rebuild the cardinality problem Loki was chosen to avoid.
+
+  Output is logfmt, one line per vulnerability, which Grafana parses with
+  LogQL's `| logfmt`. Fields are chosen to have no spaces in their values, so
+  no quoting is needed: package names, versions, and CVE identifiers never
+  contain one. Report titles and descriptions do, and are left out — the CVE
+  identifier is the key to look the rest up.
+
+  The scanned workload's namespace and container are emitted as
+  workload_namespace and workload_container rather than the obvious names.
+  Alloy attaches namespace, pod, container, and job as stream labels, and when
+  `| logfmt` parses a field whose name already exists as a stream label, Loki
+  keeps the label and renames the parsed field with an '_extracted' suffix.
+  Queries would then have to know which of the two names to use, and the value
+  under the plain name would be this CronJob's own namespace rather than the
+  scanned workload's.
+
+  Absent fields are emitted as 'none' rather than omitted. A vulnerability with
+  no patch available has no fixedVersion, and an image referenced by digest has
+  no tag; go-template renders a missing map key as '<no value>', which would
+  put a space inside a logfmt value and split the field.
+
+  ttlSecondsAfterFinished is deliberately long. Alloy discovers pods and tails
+  their logs through the API, so a Job pod deleted promptly on completion can
+  disappear before Alloy has read it. Ten minutes is far longer than the export
+  takes and costs only a completed pod object sitting in the namespace.
+
+  The schedule is independent of the operator's own scan cadence — this reads
+  whatever the reports currently say, so a run between scans re-emits
+  unchanged data. That is the cost of a snapshot export, and it is small:
+  Loki stores the repeated lines compressed, and querying uses the most recent
+  ones.
+
+  Variables:
+    trivy_namespace:        Namespace holding the Trivy Operator and this
+                            CronJob (e.g. trivy-system).
+    trivy_export_schedule:  Cron schedule for the export
+                            (e.g. '0 */6 * * *').
+    trivy_export_image:     Pinned kubectl image used to read the reports
+                            (e.g. registry.k8s.io/kubectl:v1.35.8).
+#}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: trivy-report-export
+  namespace: '{{ trivy_namespace }}'
+---
+# Read-only, and only on the one report type this exports. The operator's other
+# report kinds are not granted here even though the scanners producing them are
+# disabled, so enabling one later does not silently widen what this can read.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: trivy-report-export
+rules:
+  - apiGroups:
+      - aquasecurity.github.io
+    resources:
+      - vulnerabilityreports
+    verbs:
+      - get
+      - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: trivy-report-export
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: trivy-report-export
+subjects:
+  - kind: ServiceAccount
+    name: trivy-report-export
+    namespace: '{{ trivy_namespace }}'
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: trivy-report-export
+  namespace: '{{ trivy_namespace }}'
+spec:
+  schedule: '{{ trivy_export_schedule }}'
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 600
+      backoffLimit: 2
+      template:
+        spec:
+          serviceAccountName: trivy-report-export
+          restartPolicy: OnFailure
+          securityContext:
+            runAsUser: 65534
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: export
+              image: '{{ trivy_export_image }}'
+              securityContext:
+                allowPrivilegeEscalation: false
+                privileged: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              command:
+                - kubectl
+              # --cache-dir is required: kubectl writes its API discovery cache
+              # under $HOME by default, which readOnlyRootFilesystem makes
+              # unwritable. The emptyDir below is the only writable path.
+              args:
+                - get
+                - vulnerabilityreports
+                - --all-namespaces
+                - --cache-dir=/tmp/kubectl-cache
+                - -o
+                # Folded scalar: each source line break becomes one space,
+                # which is exactly the logfmt field separator. Record breaks
+                # are emitted by an explicit newline action instead of literal
+                # newlines, which the folding would otherwise eat.
+                #
+                # The closing tag is '+%}' rather than '%}'. Ansible renders
+                # templates with trim_blocks enabled, which drops the newline
+                # after a block tag — here that would pull the next key up onto
+                # the end of this scalar and the manifest would not parse. The
+                # '+' keeps that newline.
+                - >-
+                  {% raw %}go-template={{range .items}}{{$m := .metadata}}{{$r := .report}}{{range $r.vulnerabilities}}workload_namespace={{$m.namespace}}
+                  workload={{index $m.labels "trivy-operator.resource.name"}}
+                  workload_kind={{index $m.labels "trivy-operator.resource.kind"}}
+                  workload_container={{index $m.labels "trivy-operator.container.name"}}
+                  image={{$r.artifact.repository}}
+                  tag={{if $r.artifact.tag}}{{$r.artifact.tag}}{{else}}none{{end}}
+                  cve={{.vulnerabilityID}}
+                  severity={{.severity}}
+                  package={{.resource}}
+                  installed={{.installedVersion}}
+                  fixed={{if .fixedVersion}}{{.fixedVersion}}{{else}}none{{end}}{{"\n"}}{{end}}{{end}}{% endraw +%}
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  memory: 256Mi
+              volumeMounts:
+                - name: cache
+                  mountPath: /tmp
+          volumes:
+            - name: cache
+              emptyDir: {}
