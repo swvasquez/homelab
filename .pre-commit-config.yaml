@@ -1,0 +1,46 @@
+repos:
+  # language: golang has pre-commit download its own isolated Go from
+  # dl.google.com when none is on PATH (since pre-commit 3.0.0) — the sandbox
+  # kit installs a system Go via apt instead, so hook setup skips that fetch.
+  - repo: local
+    hooks:
+      - id: gitleaks-staged
+        name: gitleaks (staged)
+        entry: gitleaks git --pre-commit --staged --redact --verbose --no-banner
+        language: golang
+        additional_dependencies: ["github.com/zricethezav/gitleaks/v8@v8.30.1"]
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      - id: gitleaks-history
+        name: gitleaks (history)
+        entry: gitleaks git --redact --verbose --no-banner
+        language: golang
+        additional_dependencies: ["github.com/zricethezav/gitleaks/v8@v8.30.1"]
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      # Not wired to a git hook stage — catches secrets in tracked-but-unstaged
+      # edits, which neither the pre-commit nor pre-push hook would see. Run by
+      # hand via `just check`.
+      - id: gitleaks-unstaged
+        name: gitleaks (unstaged)
+        entry: gitleaks git --pre-commit --redact --verbose --no-banner
+        language: golang
+        additional_dependencies: ["github.com/zricethezav/gitleaks/v8@v8.30.1"]
+        pass_filenames: false
+        always_run: true
+        stages: [manual]
+
+      # language: system rather than a managed env — ansible-lint is already
+      # installed into .venv by `just venv`, so this just reuses it instead of
+      # having pre-commit build a second, separate Python environment for it.
+      - id: ansible-lint
+        name: ansible-lint
+        entry: just lint
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

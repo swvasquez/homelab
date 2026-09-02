@@ -31,11 +31,17 @@ The following tools should be installed before deploying any of the Playbooks
     just venv
     ```
 
-2.  Define cluster configuration via a top-level `inventory.yml` file and `group_vars/{all,nodes,ipkvm}.yml` files. These configuration files provide the Playbooks with information about the local setup (router IP, desired local DNS zone, etc.) and assign roles to certain nodes. The specification for these configuration files can be found at [`docs/configuration.md`](docs/configuration.md).
+2.  Install the git hooks
 
-3. Ensure Ubuntu Server 24.04 LTS or newer is already installed on your compute nodes.
+    ```sh
+    just hooks
+    ```
 
-4. Ensure you can SSH into compute nodes from the machine that will run the Ansible Playbooks.
+3.  Define cluster configuration via a top-level `inventory.yml` file and `group_vars/{all,nodes,ipkvm}.yml` files. These configuration files provide the Playbooks with information about the local setup (router IP, desired local DNS zone, etc.) and assign roles to certain nodes. The specification for these configuration files can be found at [`docs/configuration.md`](docs/configuration.md).
+
+4. Ensure Ubuntu Server 24.04 LTS or newer is already installed on your compute nodes.
+
+5. Ensure you can SSH into compute nodes from the machine that will run the Ansible Playbooks.
 
 ## Deploy
 
@@ -90,6 +96,13 @@ For a high-level overview, refer to the documentation in `docs/`
 | [`home-automation.md`](docs/home-automation.md) | Working notes on the Home Assistant / Thread / Matter stack |
 
 ## Development
+
+Checks are declared as pre-commit and pre-push hooks in [`.pre-commit-config.yaml`](.pre-commit-config.yaml) and run by [`pre-commit`](https://github.com/pre-commit/pre-commit). To run the checks by hand:
+
+```bash
+just hooks  # wire the git hooks
+just check  # run the checks
+```
 
 ### Linting
 

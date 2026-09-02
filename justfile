@@ -11,7 +11,18 @@ set script-interpreter := ["bash", "-eu"]
 # Create a virtual environment and install dependencies
 venv path=env_var_or_default("VIRTUAL_ENV", ".venv"):
     uv venv "{{ path }}"
-    uv pip install --python "{{ path }}/bin/python" ansible-dev-tools
+    uv pip install --python "{{ path }}/bin/python" ansible-dev-tools pre-commit
+
+# First run builds gitleaks via Go — see the comment in .pre-commit-config.yaml
+# Wire the checks in .pre-commit-config.yaml into .git/hooks (once per clone)
+hooks:
+    uv run pre-commit install --hook-type pre-commit --hook-type pre-push
+
+# Run every check by hand: on commit, on push, and manual-only
+check:
+    uv run pre-commit run --all-files --hook-stage pre-commit
+    uv run pre-commit run --all-files --hook-stage pre-push
+    uv run pre-commit run --all-files --hook-stage manual
 
 # +----------------------------------------------------------------------------+
 # | Sandbox — run tooling inside a Docker Sandboxes microVM                  |
