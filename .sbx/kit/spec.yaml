@@ -72,6 +72,12 @@ setup:
     - command: >-
         curl -LsSf https://astral.sh/uv/0.12.3/install.sh
         | env UV_UNMANAGED_INSTALL=/usr/local/bin sh
+    # /home/agent/.local/share/claude is owned by agent, not root. Install
+    # commands default to user 0 (see the /etc/claude-code comment below); running
+    # this one as root would leave the updated version root-owned and the agent
+    # unable to update it again itself.
+    - command: claude update
+      user: agent
     # kubectl, pinned to the cluster's own minor — kubectl supports one minor
     # of skew either way, so this tracks whatever the apiserver reports rather
     # than kube_version in cluster/kubernetes.yml, which is only the install
